@@ -48,7 +48,7 @@ use crate::transport::TransportEvent;
 use crate::transport::acquire_app_server_startup_lock;
 use crate::transport::app_server_startup_lock_path;
 use crate::transport::route_outgoing_envelope;
-use crate::transport::start_control_socket_acceptor;
+use crate::transport::start_control_socket_acceptor_with_bound_hook;
 use crate::transport::start_remote_control;
 use crate::transport::start_stdio_connection;
 use crate::transport::start_websocket_acceptor;
@@ -121,6 +121,7 @@ mod config_layer;
 #[cfg(test)]
 mod core_auth_task_tests;
 mod managed_reset;
+mod managed_target_record;
 mod managed_transition;
 mod otel_reset_control;
 mod startup_config;
@@ -143,12 +144,12 @@ mod filters;
 mod fs_watch;
 mod fuzzy_file_search;
 mod gateway_oauth_notifications;
+mod hosted_mcp_endpoints;
 mod image_url;
 pub mod in_process;
 mod log_write_warning;
 #[cfg(unix)]
 mod managed_daemon;
-mod hosted_mcp_endpoints;
 mod mcp_config_identity;
 mod mcp_refresh;
 mod message_processor;
@@ -734,10 +735,10 @@ pub async fn run_main_with_transport_options(
     #[cfg(target_os = "windows")]
     let _registered_core = codex_windows_sandbox::registered_core_requested();
     let control_endpoint = mcp_control_endpoint_uri(&transport);
-    let managed_transition_control_socket_endpoint = match &transport {
-        AppServerTransport::UnixSocket { socket_path } => Some(socket_path.display().to_string()),
-        _ => None,
-    };
+    let mut managed_target_record =
+        managed_target_record::ManagedTargetRecordSetup::from_env(&transport)
+            .map_err(|_| std::io::Error::other("managed target record initialization failed"))?;
+    let managed_transition_control_socket_endpoint = managed_target_record.control_endpoint.clone();
     let managed_daemon = matches!(&transport, AppServerTransport::UnixSocket { .. })
         && runtime_options.managed_daemon;
     #[cfg(unix)]
@@ -1076,7 +1077,7 @@ pub async fn run_main_with_transport_options(
             transport_accept_handles.push(handle);
         }
         AppServerTransport::UnixSocket { socket_path } => {
-            let accept_handle = start_control_socket_acceptor(
+            let accept_handle = start_control_socket_acceptor_with_bound_hook(
                 socket_path.clone(),
                 transport_event_tx.clone(),
                 transport_shutdown_token.clone(),
@@ -1089,7 +1090,14 @@ pub async fn run_main_with_transport_options(
                     DaemonShutdownAccess::Disabled
                 },
                 websocket_compression,
-                &host_custody,
+                host_custody.expiry(),
+                || {
+                    managed_target_record
+                        .publish_after_socket_bound()
+                        .map_err(|_| {
+                            std::io::Error::other("managed target record publication failed")
+                        })
+                },
             )
             .await?;
             transport_accept_handles.push(accept_handle);
@@ -1133,7 +1141,7 @@ pub async fn run_main_with_transport_options(
         ));
     }
 
-    let (remote_control_accept_handle, remote_control_handle) = start_remote_control(
+    let remote_control_start = start_remote_control(
         RemoteControlStartConfig {
             runtime_auth: runtime_auth_slot
                 .clone()
@@ -1149,7 +1157,17 @@ pub async fn run_main_with_transport_options(
         app_server_client_name_rx,
         remote_control_startup_mode,
     )
-    .await?;
+    .await;
+    let (remote_control_accept_handle, remote_control_handle) = match remote_control_start {
+        Ok(started) => started,
+        Err(error) => {
+            transport_shutdown_token.cancel();
+            if let Err(rollback_error) = managed_target_record.remove_after_startup_failure() {
+                error!(kind = ?rollback_error.kind(), "failed to remove managed target record after startup failure");
+            }
+            return Err(error);
+        }
+    };
     if no_local_transport
         && remote_control_startup_mode == RemoteControlStartupMode::ResolvePersisted
     {
@@ -1308,7 +1326,9 @@ pub async fn run_main_with_transport_options(
         let mut processor = MessageProcessor::new(MessageProcessorArgs {
             telemetry_reset,
             managed_transition_control_socket_endpoint,
-            managed_transition_process_instance_id: None,
+            managed_transition_process_instance_id: managed_target_record
+                .process_instance_id
+                .clone(),
             control_endpoint,
             cloud_skill_provider,
             outgoing: outgoing_message_sender,
