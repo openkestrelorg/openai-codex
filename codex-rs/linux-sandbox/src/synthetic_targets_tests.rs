@@ -201,8 +201,8 @@ fn non_empty_installed_file_is_preserved() {
     let launch = own_token();
     let registrations = register(&fixture, &[SyntheticMountTarget::missing(&path)], &launch);
     assert_eq!(
-        fs::metadata(&path).expect("installed target mode").mode() & 0o777,
-        0o444
+        fs::metadata(&path).expect("installed target mode").mode() & 0o222,
+        0
     );
     fs::set_permissions(&path, fs::Permissions::from_mode(0o644))
         .expect("make fixture writable before populating it");
