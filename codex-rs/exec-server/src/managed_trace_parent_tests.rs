@@ -113,7 +113,18 @@ async fn request_and_detached_process_keep_managed_eager_parent_context() {
         drop(process);
     })
     .await;
-    let request = find_span(&spans, "codex.exec_server.request");
+    // The queued request has the explicit OTEL name "unknown" until dispatch.
+    let request = find_span(&spans, "unknown");
+    assert_eq!(request["kind"], 2);
+    assert!(
+        request["attributes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|attribute| {
+                attribute["key"] == "method" && attribute["value"]["stringValue"] == "process/start"
+            })
+    );
     let process = find_span(&spans, "codex.exec_server.process");
     assert_eq!(request["traceId"], TRACE_ID);
     assert_eq!(request["parentSpanId"], PARENT_ID);

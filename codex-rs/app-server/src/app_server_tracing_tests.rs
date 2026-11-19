@@ -111,7 +111,19 @@ async fn incoming_request_parent_is_selected_before_managed_eager_creation() {
         ));
     })
     .await;
-    let request = find_span(&spans, "app_server.request");
+    // OTEL exports otel.name (the RPC method), not the tracing callsite name.
+    let request = find_span(&spans, "thread/start");
+    assert_eq!(request["kind"], 2);
+    assert!(
+        request["attributes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|attribute| {
+                attribute["key"] == "rpc.method"
+                    && attribute["value"]["stringValue"] == "thread/start"
+            })
+    );
     assert_eq!(request["traceId"], TRACE_ID);
     assert_eq!(request["parentSpanId"], PARENT_ID);
     assert_ne!(find_span(&spans, "unrelated_ambient")["traceId"], TRACE_ID);
