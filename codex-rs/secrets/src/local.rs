@@ -588,7 +588,7 @@ mod tests {
             .unwrap_or_else(PoisonError::into_inner);
         let home = tempfile::tempdir()?;
         let keyring = Arc::new(MockKeyringStore::default());
-        let backend = LocalSecretsBackend::new(home.path().to_path_buf(), keyring.clone());
+        let backend = LocalSecretsBackend::new(home.path().to_path_buf(), keyring);
         let name = SecretName::new("TEST_SECRET")?;
         let (value, absent) = backend.get_existing_with_preimage(&SecretScope::Global, &name)?;
         assert_eq!(value, None);

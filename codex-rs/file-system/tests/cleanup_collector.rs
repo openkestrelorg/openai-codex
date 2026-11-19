@@ -59,8 +59,18 @@ impl ExecutorFileSystem for Backend {
         sandbox: Option<&'a FileSystemSandboxContext>,
     ) -> ExecutorFileSystemOutcomeFuture<'a, Vec<u8>> {
         Box::pin(async move {
-            self.observed_sandbox.lock().unwrap().push(sandbox.cloned());
-            let reply = self.replies.lock().unwrap().pop_front().unwrap();
+            self.observed_sandbox
+                .lock()
+                .unwrap_or_else(|_| panic!("fixture sandbox observations poisoned"))
+                .push(sandbox.cloned());
+            let Some(reply) = self
+                .replies
+                .lock()
+                .unwrap_or_else(|_| panic!("fixture scripted replies poisoned"))
+                .pop_front()
+            else {
+                panic!("fixture received more operations than scripted replies");
+            };
             match reply {
                 Reply::Complete => FileSystemOutcome::launched(Ok(vec![1]), Some(complete())),
                 Reply::Missing => FileSystemOutcome::launched(Ok(vec![1]), None),
@@ -87,7 +97,9 @@ impl ExecutorFileSystem for Backend {
     ) -> ExecutorFileSystemFuture<'_, Option<tokio::sync::oneshot::Receiver<()>>> {
         Box::pin(async {
             let (sender, receiver) = tokio::sync::oneshot::channel();
-            sender.send(()).unwrap();
+            let Ok(()) = sender.send(()) else {
+                panic!("fixture receiver unexpectedly closed");
+            };
             Ok(Some(receiver))
         })
     }
@@ -179,7 +191,8 @@ impl ExecutorFileSystem for Backend {
     }
 }
 fn path() -> PathUri {
-    PathUri::parse("file:///fixture").unwrap()
+    PathUri::parse("file:///fixture")
+        .unwrap_or_else(|error| panic!("fixture URI is invalid: {error}"))
 }
 
 #[test]

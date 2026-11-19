@@ -414,10 +414,6 @@ fn mcp_input_identity_survives_snapshots_without_changing_trusted_layers() {
         accepted.mcp_user_input_identity(),
         next.mcp_user_input_identity()
     );
-    assert_eq!(
-        accepted.clone().mcp_user_input_identity(),
-        next.mcp_user_input_identity()
-    );
     // A newly loaded user snapshot owns its own identity, never the previous
     // MCP-only marker. Copying a runtime snapshot preserves that snapshot's
     // accepted inputs instead.

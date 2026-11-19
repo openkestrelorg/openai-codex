@@ -888,6 +888,12 @@ impl ThreadStore for LocalThreadStore {
     }
 }
 
+// Construct the cold writer future in its own frame before erasing its type.
+#[inline(never)]
+fn box_resume_future<F: std::future::Future>(create: impl FnOnce() -> F) -> std::pin::Pin<Box<F>> {
+    Box::pin(create())
+}
+
 #[cfg(test)]
 mod tests {
     #[path = "acquisition_tests.rs"]
@@ -2456,10 +2462,4 @@ mod tests {
             )
         }));
     }
-}
-
-// Construct the cold writer future in its own frame before erasing its type.
-#[inline(never)]
-fn box_resume_future<F: std::future::Future>(create: impl FnOnce() -> F) -> std::pin::Pin<Box<F>> {
-    Box::pin(create())
 }

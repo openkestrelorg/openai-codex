@@ -97,10 +97,10 @@ impl OwnerPin {
     }
     pub(super) fn capture(&self) -> Result<Option<CodexAuth>, AuthOwnerChanged> {
         let (auth, _) = self.snapshot()?;
-        if let Some(source) = &self.source.command_source {
-            if !source.usable_auth(auth.as_ref()) {
-                return Err(AuthOwnerChanged);
-            }
+        if let Some(source) = &self.source.command_source
+            && !source.usable_auth(auth.as_ref())
+        {
+            return Err(AuthOwnerChanged);
         }
         Ok(auth)
     }
@@ -252,10 +252,10 @@ impl AuthManager {
     }
     pub(super) async fn pinned_auth(&self, pin: &OwnerPin) -> Option<CodexAuth> {
         let cached = pin.capture().ok().flatten()?;
-        if let Some(reason) = Self::proactive_refresh_reason(&cached) {
-            if let Err(error) = self.refresh_pinned_owner(pin, reason, None).await {
-                tracing::warn!("owner-pinned token refresh refused: {error}");
-            }
+        if let Some(reason) = Self::proactive_refresh_reason(&cached)
+            && let Err(error) = self.refresh_pinned_owner(pin, reason, None).await
+        {
+            tracing::warn!("owner-pinned token refresh refused: {error}");
         }
         self.sync_pinned_owner(pin).ok()?;
         pin.capture().ok().flatten()

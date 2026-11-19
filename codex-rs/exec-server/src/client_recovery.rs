@@ -144,7 +144,7 @@ impl SessionState {
             }) = ordered_events.pending.get_mut(&target_seq)
                 && pending.is_none()
             {
-                *pending = sandbox_cleanup.clone();
+                *pending = sandbox_cleanup;
             }
             let mut exit_known = ordered_events.exit_published || exit_pending;
             if closed
@@ -199,7 +199,7 @@ impl SessionState {
                 ordered_events
                     .insert_pending(ExecProcessEvent::Closed {
                         seq: target_seq,
-                        sandbox_cleanup: sandbox_cleanup.clone(),
+                        sandbox_cleanup,
                     })
                     .map_err(ExecServerError::Protocol)?;
             }

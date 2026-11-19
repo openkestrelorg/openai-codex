@@ -98,10 +98,10 @@ impl AccountOAuthGrant {
     }
 
     pub(super) fn owner_is_current(&self) -> bool {
-        if let Some(pin) = &self.owner_pin {
-            if pin.cached_auth().is_err() {
-                return false;
-            }
+        if let Some(pin) = &self.owner_pin
+            && pin.cached_auth().is_err()
+        {
+            return false;
         }
         let Ok(cached) = self.manager.inner.read() else {
             return false;

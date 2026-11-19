@@ -1020,6 +1020,10 @@ impl OpenAiModelsManager {
         }
     }
 
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "shared family reset fence spans TTL cache publication before invalidation"
+    )]
     async fn refresh_if_new_etag(&self, etag: String, http_client_factory: HttpClientFactory) {
         let publication_guard = self.reset_publication.read().await;
         let refresh_guard = self.catalog_source.refresh_lock().await;
@@ -1063,6 +1067,10 @@ impl OpenAiModelsManager {
         .await
     }
 
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "shared family reset fence spans complete fetch/cache publication before invalidation"
+    )]
     async fn load_catalog(
         &self,
         mode: CatalogLoadMode,
@@ -1250,7 +1258,7 @@ impl OpenAiModelsManager {
         self.endpoint_client.supports_gateway_catalog()
             || self.endpoint_client.uses_codex_backend().await
             || command
-            || (supports_api_key && !command && uses_api_key && enabled)
+            || (supports_api_key && uses_api_key && enabled)
     }
 
     async fn should_refresh_models(&self) -> bool {

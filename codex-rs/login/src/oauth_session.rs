@@ -253,6 +253,7 @@ impl OAuthSessionManager {
         OAuthSessionRequest::new(self.clone())
     }
     /// Restrict noninteractive work to its actual origin credential's grant ID.
+    #[cfg(test)]
     pub(super) fn begin_bound_request(
         &self,
         authorization_id: &str,

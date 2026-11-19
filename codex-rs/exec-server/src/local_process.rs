@@ -518,14 +518,15 @@ impl LocalProcess {
             Ok(spawned) => spawned,
             Err(err) => {
                 telemetry.log(ProcessTelemetryEvent::SpawnFailed, prepared.sandbox);
-                let mut process_map = self.inner.processes.lock().await;
-                if matches!(
-                    process_map.get(&process_id),
-                    Some(ProcessEntry::Starting(current)) if Arc::ptr_eq(current, &start)
-                ) {
-                    process_map.remove(&process_id);
+                {
+                    let mut process_map = self.inner.processes.lock().await;
+                    if matches!(
+                        process_map.get(&process_id),
+                        Some(ProcessEntry::Starting(current)) if Arc::ptr_eq(current, &start)
+                    ) {
+                        process_map.remove(&process_id);
+                    }
                 }
-                drop(process_map);
                 let cleanup = match sandbox_cleanup_custody {
                     Some(custody) => Some(custody.collect(SANDBOX_CLEANUP_GRACE).await),
                     None => None,

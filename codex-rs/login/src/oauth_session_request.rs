@@ -145,6 +145,7 @@ impl OAuthSessionRequest {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn new_bound(manager: OAuthSessionManager, authorization_id: String) -> Self {
         Self {
             manager,
@@ -184,15 +185,14 @@ impl OAuthSessionRequest {
             domain: Some((domain, epoch)),
             ..
         } = &self.policy
-        {
-            if !credentials.binding().is_some_and(|binding| {
+            && !credentials.binding().is_some_and(|binding| {
                 std::sync::Arc::ptr_eq(domain, &binding.domain) && *epoch == binding.epoch
-            }) {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "provider OAuth sign-in changed while selecting credentials",
-                ));
-            }
+            })
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "provider OAuth sign-in changed while selecting credentials",
+            ));
         }
         Ok(credentials)
     }
