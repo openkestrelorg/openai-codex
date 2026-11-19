@@ -150,7 +150,13 @@ async fn cancelled_refresh_owns_work_and_restores_the_claimed_invalidation() {
         let mut refresh = Box::pin(
             session.refresh_mcp_if_dirty_with_authority(McpAttemptAccess::Admitted(&root)),
         );
-        assert!(futures::poll!(&mut refresh).is_pending());
+        assert!(
+            std::future::Future::poll(
+                refresh.as_mut(),
+                &mut std::task::Context::from_waker(std::task::Waker::noop())
+            )
+            .is_pending()
+        );
         assert!(
             !session.mcp_refresh.is_pending(),
             "refresh reached the claimed-state await"
@@ -169,7 +175,13 @@ async fn cancelled_apps_refresh_releases_its_coalescing_token_and_work() {
     {
         let mut refresh =
             Box::pin(session.refresh_codex_apps_tools(McpAttemptAccess::Admitted(&root)));
-        assert!(futures::poll!(&mut refresh).is_pending());
+        assert!(
+            std::future::Future::poll(
+                refresh.as_mut(),
+                &mut std::task::Context::from_waker(std::task::Waker::noop())
+            )
+            .is_pending()
+        );
         assert_eq!(session.mcp_refresh.apps_refreshes.len(), 1);
         assert_eq!(counts.live.load(Ordering::SeqCst), 2);
         assert!(!session.mcp_refresh.is_pending());
@@ -209,13 +221,23 @@ async fn failed_publication_derivation_restores_pending_state_without_replacing_
     let root = Work::new(&counts);
     let before =
         codex_mcp::McpResourceClient::new(session.services.mcp_runtime.clone()).cache_key();
-    let state = session.state.lock().await;
-    let mut refresh =
-        Box::pin(session.refresh_mcp_if_dirty_with_authority(McpAttemptAccess::Admitted(&root)));
-    assert!(futures::poll!(&mut refresh).is_pending());
-    assert!(!session.mcp_refresh.is_pending());
-    counts.refuse.store(true, Ordering::SeqCst);
-    drop(state);
+    let refresh = {
+        let state = session.state.lock().await;
+        let mut refresh = Box::pin(
+            session.refresh_mcp_if_dirty_with_authority(McpAttemptAccess::Admitted(&root)),
+        );
+        assert!(
+            std::future::Future::poll(
+                refresh.as_mut(),
+                &mut std::task::Context::from_waker(std::task::Waker::noop())
+            )
+            .is_pending()
+        );
+        assert!(!session.mcp_refresh.is_pending());
+        counts.refuse.store(true, Ordering::SeqCst);
+        drop(state);
+        refresh
+    };
     assert!(refresh.await.is_err());
     assert!(session.mcp_refresh.is_pending());
     assert!(
@@ -273,7 +295,10 @@ async fn step_capture_refuses_missing_turn_and_unscoped_standalone_before_state_
     let _state = session.state.lock().await;
     let mut capture = Box::pin(session.capture_step_context(turn.clone(), &cancellation));
     assert!(matches!(
-        futures::poll!(&mut capture),
+        std::future::Future::poll(
+            capture.as_mut(),
+            &mut std::task::Context::from_waker(std::task::Waker::noop())
+        ),
         std::task::Poll::Ready(Err(_))
     ));
     let mut standalone = Box::pin(session.capture_step_context_with_authority(
@@ -282,7 +307,10 @@ async fn step_capture_refuses_missing_turn_and_unscoped_standalone_before_state_
         McpAttemptAccess::Unscoped,
     ));
     assert!(matches!(
-        futures::poll!(&mut standalone),
+        std::future::Future::poll(
+            standalone.as_mut(),
+            &mut std::task::Context::from_waker(std::task::Waker::noop())
+        ),
         std::task::Poll::Ready(Err(_))
     ));
     assert_eq!(counts.live.load(Ordering::SeqCst), 0);
@@ -297,7 +325,13 @@ async fn cancelled_step_capture_releases_work_despite_retained_turn_context() {
     let _state = session.state.lock().await;
     {
         let mut capture = Box::pin(session.capture_step_context(turn.clone(), &cancellation));
-        assert!(futures::poll!(&mut capture).is_pending());
+        assert!(
+            std::future::Future::poll(
+                capture.as_mut(),
+                &mut std::task::Context::from_waker(std::task::Waker::noop())
+            )
+            .is_pending()
+        );
         assert_eq!(counts.live.load(Ordering::SeqCst), 1);
     }
     assert_eq!(counts.live.load(Ordering::SeqCst), 0);
@@ -367,7 +401,10 @@ async fn required_step_binding_refuses_before_invalidating_or_waiting_on_state()
         McpAttemptAccess::Unscoped,
     ));
     assert!(matches!(
-        futures::poll!(&mut binding),
+        std::future::Future::poll(
+            binding.as_mut(),
+            &mut std::task::Context::from_waker(std::task::Waker::noop())
+        ),
         std::task::Poll::Ready(Err(_))
     ));
     assert!(!session.mcp_refresh.is_pending());
@@ -538,7 +575,10 @@ async fn extension_tool_refuses_exhausted_or_wrong_turn_before_history_wait() {
         let _state = session.state.lock().await;
         let mut call = adapter.handle(extension_invocation(session.clone(), Arc::new(turn)));
         assert!(matches!(
-            futures::poll!(&mut call),
+            std::future::Future::poll(
+                call.as_mut(),
+                &mut std::task::Context::from_waker(std::task::Waker::noop())
+            ),
             std::task::Poll::Ready(Err(_))
         ));
         assert_eq!(counts.live.load(Ordering::SeqCst), 0);
@@ -559,7 +599,13 @@ async fn cancelled_extension_tool_history_wait_releases_work_without_calling_exe
         crate::tools::handlers::extension_tools::ExtensionToolAdapter::new(executor.clone());
     let _state = session.state.lock().await;
     let mut call = adapter.handle(invocation);
-    assert!(futures::poll!(&mut call).is_pending());
+    assert!(
+        std::future::Future::poll(
+            call.as_mut(),
+            &mut std::task::Context::from_waker(std::task::Waker::noop())
+        )
+        .is_pending()
+    );
     assert_eq!(counts.live.load(Ordering::SeqCst), 1);
     drop(call);
     assert_eq!(counts.live.load(Ordering::SeqCst), 0);
@@ -771,7 +817,10 @@ async fn prewarm_refuses_missing_or_exhausted_work_before_configuration_waits() 
             access,
         ));
         assert!(matches!(
-            futures::poll!(&mut call),
+            std::future::Future::poll(
+                call.as_mut(),
+                &mut std::task::Context::from_waker(std::task::Waker::noop())
+            ),
             std::task::Poll::Ready(Err(_))
         ));
         assert_eq!(counts.live.load(Ordering::SeqCst), 1);
@@ -789,7 +838,13 @@ async fn cancelled_prewarm_scheduler_releases_its_work_before_dispatch() {
         super::startup_prewarm::PrewarmInput::History,
         McpAttemptAccess::Admitted(&root),
     ));
-    assert!(futures::poll!(&mut call).is_pending());
+    assert!(
+        std::future::Future::poll(
+            call.as_mut(),
+            &mut std::task::Context::from_waker(std::task::Waker::noop())
+        )
+        .is_pending()
+    );
     assert_eq!(counts.live.load(Ordering::SeqCst), 2);
     drop(call);
     assert_eq!(counts.live.load(Ordering::SeqCst), 1);
@@ -960,7 +1015,10 @@ async fn speculative_request_capture_refuses_unscoped_or_exhausted_before_state_
             access,
         ));
         assert!(matches!(
-            futures::poll!(&mut capture),
+            std::future::Future::poll(
+                capture.as_mut(),
+                &mut std::task::Context::from_waker(std::task::Waker::noop())
+            ),
             std::task::Poll::Ready(Err(_))
         ));
     }
@@ -980,7 +1038,13 @@ async fn speculative_request_capture_keeps_finite_work_until_cancelled_wait_drop
         &cancel,
         McpAttemptAccess::Admitted(&root),
     ));
-    assert!(futures::poll!(&mut capture).is_pending());
+    assert!(
+        std::future::Future::poll(
+            capture.as_mut(),
+            &mut std::task::Context::from_waker(std::task::Waker::noop())
+        )
+        .is_pending()
+    );
     assert_eq!(counts.live.load(Ordering::SeqCst), 2);
     assert_eq!(counts.turns.load(Ordering::SeqCst), 0);
     drop(capture);

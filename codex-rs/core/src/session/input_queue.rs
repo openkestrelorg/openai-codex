@@ -919,6 +919,10 @@ mod mailbox_commit_tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "holds the destination gate while cancellation restores the queued mailbox batch"
+    )]
     async fn cancelled_destination_lock_wait_restores_complete_mail_and_authority_before_retry() {
         let queue = InputQueue::new();
         let events = Arc::new(SyncMutex::new(Vec::new()));

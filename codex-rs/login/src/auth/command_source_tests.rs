@@ -128,7 +128,7 @@ fn command_source_accepts_only_its_selected_complete_principal() {
     let mut foreign = record.clone();
     foreign.source = "foreign-source".into();
     assert!(!source.accepts(Some(&auth), &Some(foreign)));
-    let mut foreign = record.clone();
+    let mut foreign = record;
     foreign.principal = "foreign-principal".into();
     assert!(!source.accepts(Some(&auth), &Some(foreign)));
     assert!(!source.accepts(Some(&auth), &None));
@@ -250,11 +250,7 @@ fn cache_guard_refuses_absent_mismatched_rejected_or_unprotected_credentials() {
             .cache_guard(Some(&CodexAuth::from_api_key("synthetic")))
             .is_err()
     );
-    source
-        .rejected
-        .lock()
-        .unwrap()
-        .insert(record.fingerprint.clone());
+    source.rejected.lock().unwrap().insert(record.fingerprint);
     assert!(source.cache_guard(Some(&auth)).is_err());
     source.rejected.lock().unwrap().clear();
     std::fs::set_permissions(

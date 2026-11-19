@@ -315,7 +315,7 @@ impl ProcessorBackgroundShutdown {
                 .runtimes
                 .reports
                 .iter()
-                .all(|report| report.is_complete())
+                .all(codex_core::connectors::AppDiscoveryTerminationReport::is_complete)
             && matches!(
                 self.skills,
                 crate::skills_watcher::SkillsWatcherShutdown::Joined
@@ -327,7 +327,10 @@ impl ProcessorBackgroundShutdown {
             && self.request_auth.is_clean()
             && self.auxiliary_tasks.is_clean()
             && self.workspace_routing.is_clean()
-            && self.login.as_ref().is_ok_and(|report| report.is_clean())
+            && self
+                .login
+                .as_ref()
+                .is_ok_and(crate::request_processors::AccountLoginReport::is_clean)
     }
 }
 
@@ -817,7 +820,7 @@ impl MessageProcessor {
             outgoing.clone(),
             analytics_events_client.clone(),
             config_manager.clone(),
-            applied_mcp_config_identity.clone(),
+            applied_mcp_config_identity,
             on_effective_plugins_changed,
         );
         let remote_control_processor = RemoteControlRequestProcessor::new(remote_control_handle);
@@ -1334,6 +1337,10 @@ impl MessageProcessor {
     }
 
     /// Serialize observation with managed reset's replacement of this exact worker.
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "serializes shutdown observation with managed reset replacement of the exact worker"
+    )]
     async fn shutdown_models_refresh_worker_until(
         &self,
         deadline: tokio::time::Instant,

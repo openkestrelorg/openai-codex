@@ -3547,7 +3547,7 @@ impl ThreadStateManager {
                 || state
                     .lifecycle
                     .get(&thread_id)
-                    .is_some_and(|record| record.is_retiring())
+                    .is_some_and(retirement::RetentionLifecycle::is_retiring)
             {
                 return Ok(None);
             }
@@ -3580,7 +3580,7 @@ impl ThreadStateManager {
                 state
                     .threads
                     .get_mut(&thread_id)
-                    .expect("installed entry")
+                    .unwrap_or_else(|| panic!("installed entry"))
                     .connection_ids
                     .insert(id);
                 if added
@@ -3592,7 +3592,10 @@ impl ThreadStateManager {
                     changes.push(state.add_interactive_subscription(thread_id));
                 }
             }
-            let entry = state.threads.get(&thread_id).expect("installed entry");
+            let entry = state
+                .threads
+                .get(&thread_id)
+                .unwrap_or_else(|| panic!("installed entry"));
             entry.update_has_connections();
             let watcher = entry.has_connections_watcher.subscribe();
             let retained = match retention {

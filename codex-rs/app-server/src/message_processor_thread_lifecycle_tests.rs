@@ -627,7 +627,7 @@ decision = "prompt-user"
             .await;
             let _: InitializeResponse =
                 read_response_from(&mut outgoing, id, /*request_id*/ 1).await;
-            processor.connection_initialized(id, &session).await;
+            processor.connection_initialized(id, session).await;
         }
         send_request(
             &processor,

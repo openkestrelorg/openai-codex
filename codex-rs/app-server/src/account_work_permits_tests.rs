@@ -158,7 +158,7 @@ async fn child_derives_before_parent_reply_and_keeps_custody_after_parent_termin
     descendant.retain_until_terminal();
     pending.retain_until_terminal();
     admission.turn_work_terminal(&parent, "parent-turn");
-    assert_eq!(permits.clone().admitted_count(), 1);
+    assert_eq!(permits.admitted_count(), 1);
     assert!(
         admission
             .derive_turn_work(
@@ -170,7 +170,7 @@ async fn child_derives_before_parent_reply_and_keeps_custody_after_parent_termin
             .is_err()
     );
     admission.turn_work_terminal(&child, "child-turn");
-    assert_eq!(permits.clone().admitted_count(), 0);
+    assert_eq!(permits.admitted_count(), 0);
 }
 
 #[test]

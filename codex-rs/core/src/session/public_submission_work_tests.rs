@@ -231,7 +231,7 @@ async fn fixture() -> (CodexThread, Arc<Session>, Arc<Account>) {
     let (tx, rx) = async_channel::bounded(8);
     let handle = tokio::spawn(handlers::submission_loop_with_dispatch(
         Arc::clone(&session),
-        context.config.clone(),
+        context.config,
         rx,
         None,
     ));

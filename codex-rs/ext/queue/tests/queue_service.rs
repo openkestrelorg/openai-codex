@@ -1345,7 +1345,12 @@ impl std::fmt::Debug for QueueTurnCustody {
 }
 impl codex_protocol::host_turn_work::HostTurnWork for QueueTurnCustody {
     fn bind_submission(&mut self, turn: &str) {
-        self.work.state.bound.lock().unwrap().push(turn.to_owned());
+        self.work
+            .state
+            .bound
+            .lock()
+            .unwrap_or_else(|error| panic!("queue bound-turn lock poisoned: {error:?}"))
+            .push(turn.to_owned());
     }
     fn retain_until_terminal(self: Box<Self>) {
         // This synthetic host deliberately uses the exact loop receipt. It does
@@ -1356,7 +1361,11 @@ impl codex_protocol::host_turn_work::HostTurnWork for QueueTurnCustody {
             termination.await;
             drop(work);
         });
-        state.joins.lock().unwrap().push(join);
+        state
+            .joins
+            .lock()
+            .unwrap_or_else(|error| panic!("queue join lock poisoned: {error:?}"))
+            .push(join);
     }
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1458,7 +1467,15 @@ impl TurnStartAdmission for ManualRequestGate {
                 self.state.live.fetch_add(1, Ordering::SeqCst);
                 Ok(Some(Box::new(QueueOperationWork {
                     state: self.state.clone(),
-                    thread: self.thread.lock().unwrap().unwrap(),
+                    thread: self
+                        .thread
+                        .lock()
+                        .unwrap_or_else(|error| {
+                            panic!("manual gate thread lock poisoned: {error:?}")
+                        })
+                        .unwrap_or_else(|| {
+                            panic!("manual gate thread is bound before work derivation")
+                        }),
                 })))
             }
         }

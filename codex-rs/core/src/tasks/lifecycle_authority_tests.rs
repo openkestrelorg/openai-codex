@@ -294,7 +294,13 @@ async fn idle_admission_precedes_active_turn_wait_and_cancel_releases_it() {
     let (gate, observer) = idle_fixture(&mut session, 0, false, false);
     let held = session.active_turn.lock().await;
     let mut idle = Box::pin(session.emit_thread_idle_lifecycle_if_idle(ThreadIdleCause::Completed));
-    assert!(futures::poll!(&mut idle).is_pending());
+    assert!(
+        std::future::Future::poll(
+            idle.as_mut(),
+            &mut std::task::Context::from_waker(std::task::Waker::noop())
+        )
+        .is_pending()
+    );
     assert_eq!(gate.calls.load(Ordering::SeqCst), 1);
     assert_eq!(gate.live.load(Ordering::SeqCst), 1);
     assert_eq!(observer.entered.load(Ordering::SeqCst), 0);
@@ -349,12 +355,21 @@ async fn hook_free_idle_does_not_admit_or_wait_and_ungated_metadata_still_runs()
     let (gate, observer) = idle_fixture(&mut session, 2, false, false);
     session.services.extensions =
         Arc::new(codex_extension_api::ExtensionRegistryBuilder::new().build());
-    let held = session.active_turn.lock().await;
-    let mut idle = Box::pin(session.emit_thread_idle_lifecycle_if_idle(ThreadIdleCause::Completed));
-    assert!(futures::poll!(&mut idle).is_ready());
-    assert_eq!(gate.calls.load(Ordering::SeqCst), 0);
-    drop(idle);
-    drop(held);
+    {
+        let held = session.active_turn.lock().await;
+        let mut idle =
+            Box::pin(session.emit_thread_idle_lifecycle_if_idle(ThreadIdleCause::Completed));
+        assert!(
+            std::future::Future::poll(
+                idle.as_mut(),
+                &mut std::task::Context::from_waker(std::task::Waker::noop())
+            )
+            .is_ready()
+        );
+        assert_eq!(gate.calls.load(Ordering::SeqCst), 0);
+        drop(idle);
+        drop(held);
+    }
     let mut builder = codex_extension_api::ExtensionRegistryBuilder::new();
     builder.thread_lifecycle_contributor(observer.clone());
     session.services.extensions = Arc::new(builder.build());

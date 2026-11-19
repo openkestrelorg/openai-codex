@@ -678,14 +678,29 @@ async fn closing_admission_cancels_registration_created_while_closer_waits_for_a
         )
         .await;
     // The real reservation owns active_turn while waiting for previous options.
-    let state = session.state.lock().await;
-    let mut reserve = Box::pin(session.reserve_pending_work_turn("closing-race"));
-    assert!(futures::poll!(reserve.as_mut()).is_pending());
-    // This closer has performed its optimistic cancellation before registration
-    // exists; it is now waiting for that actual reservation's active_turn lock.
-    let mut close = Box::pin(session.close_task_admission());
-    assert!(futures::poll!(close.as_mut()).is_pending());
-    drop(state);
+    let (reserve, close) = {
+        let state = session.state.lock().await;
+        let mut reserve = Box::pin(session.reserve_pending_work_turn("closing-race"));
+        assert!(
+            std::future::Future::poll(
+                reserve.as_mut(),
+                &mut std::task::Context::from_waker(std::task::Waker::noop())
+            )
+            .is_pending()
+        );
+        // This closer has performed its optimistic cancellation before registration
+        // exists; it is now waiting for that actual reservation's active_turn lock.
+        let mut close = Box::pin(session.close_task_admission());
+        assert!(
+            std::future::Future::poll(
+                close.as_mut(),
+                &mut std::task::Context::from_waker(std::task::Waker::noop())
+            )
+            .is_pending()
+        );
+        drop(state);
+        (reserve, close)
+    };
     let (_, _, mailbox, work, registration) = tokio::time::timeout(Duration::from_secs(5), reserve)
         .await
         .unwrap()

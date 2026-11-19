@@ -357,13 +357,14 @@ async fn start_idle_unload(
         &thread.config_snapshot().await,
     );
     let (drained_tx, drained_rx) = tokio::sync::watch::channel(false);
+    let history_mode = thread.config_snapshot().await.history_mode;
     let (commands, generation) = entry.lock().await.set_listener(
         cancel_tx,
         drained_rx,
         &thread,
         codex_file_watcher::WatchRegistration::default(),
         settings,
-        thread.config_snapshot().await.history_mode,
+        history_mode,
     );
     let retention = state
         .subscribe_to_retention(thread_id)

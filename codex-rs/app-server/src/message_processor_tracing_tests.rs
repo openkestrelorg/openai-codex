@@ -1017,7 +1017,6 @@ async fn production_reset_inventory_revokes_hosted_declaration_authority() -> Re
     // cleanup directly. Later account-dependent stages may refuse this fixture;
     // hosted authority must already be revoked before either return outcome.
     let reset = processor.reset_inventory.reset_all().await;
-    eprintln!("production reset inventory result: {reset:?}");
     assert_eq!(custody.census().declared, 0, "reset result: {reset:?}");
     for connection in [ConnectionId(1), ConnectionId(2)] {
         assert_eq!(

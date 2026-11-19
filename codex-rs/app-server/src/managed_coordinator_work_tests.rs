@@ -1,4 +1,5 @@
 use super::*;
+use anyhow::Context;
 use futures::FutureExt;
 use pretty_assertions::assert_eq;
 
@@ -48,7 +49,7 @@ async fn detached_operation_constructs_and_starts_child_after_request_and_parent
             .await
     })
     .await
-    .inspect_err(|error| eprintln!("detached child fixture returned: {error:#}"))?;
+    .context("detached child fixture returned")?;
     // Construction schedules finite auth prewarm before returning; observe
     // actual work release rather than assume publication means quiescence.
     tokio::time::timeout(DRAIN_DEADLINE, async {
@@ -77,7 +78,7 @@ async fn detached_operation_constructs_and_starts_child_after_request_and_parent
     let retry = test
         .codex
         .admit_mcp_event_stream_retry()
-        .inspect_err(|error| eprintln!("fresh retry fixture returned: {error:#}"))?
+        .context("fresh retry fixture returned")?
         .unwrap();
     drop(retry);
     crate::account_turn_admission::within_request(permits.try_acquire(), async {
@@ -109,7 +110,7 @@ async fn detached_operation_constructs_and_starts_child_after_request_and_parent
         .thread_manager
         .start_thread(options)
         .await
-        .inspect_err(|error| eprintln!("detached child fixture returned: {error:#}"))?;
+        .context("detached child fixture returned")?;
     let input = || {
         codex_core::TurnInputRequest::user_input(vec![UserInput::Text {
             text: "consolidate".to_owned(),
@@ -121,7 +122,7 @@ async fn detached_operation_constructs_and_starts_child_after_request_and_parent
             .thread
             .start_turn_if_idle(input())
             .await
-            .inspect_err(|error| eprintln!("detached child fixture returned: {error:#}"))?,
+            .context("detached child fixture returned")?,
         codex_core::StartIfIdleSubmission::NotSubmitted { .. }
     ));
     assert!(matches!(
@@ -129,7 +130,7 @@ async fn detached_operation_constructs_and_starts_child_after_request_and_parent
             .thread
             .start_turn_if_idle_from_operation(input(), operation.as_ref())
             .await
-            .inspect_err(|error| eprintln!("detached child fixture returned: {error:#}"))?,
+            .context("detached child fixture returned")?,
         codex_core::StartIfIdleSubmission::Started { .. }
     ));
     wait_for_event(&child.thread, |event| {
@@ -150,7 +151,7 @@ async fn detached_operation_constructs_and_starts_child_after_request_and_parent
             .thread
             .start_turn_if_idle(input())
             .await
-            .inspect_err(|error| eprintln!("detached child fixture returned: {error:#}"))?,
+            .context("detached child fixture returned")?,
         codex_core::StartIfIdleSubmission::Started { .. }
     ));
     wait_for_event(&child.thread, |event| {

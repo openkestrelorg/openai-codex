@@ -100,7 +100,7 @@ pub(crate) fn effective_plugins_changed_callback(
         } else {
             match work
                 .as_deref()
-                .map(|work| work.derive_operation())
+                .map(codex_extension_api::HostOperationWork::derive_operation)
                 .transpose()
             {
                 Ok(work) => work,

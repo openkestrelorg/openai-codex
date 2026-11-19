@@ -564,13 +564,15 @@ async fn private_delegate_registers_runtime_identity_with_its_parent_host() {
         &host_listener
     ));
     assert!(session.services.runtime_config_membership.is_some());
-    let members = listener.members.lock().unwrap();
-    assert_eq!(
-        members.len(),
-        1,
-        "the direct Session::spawn path must register once"
-    );
-    assert!(members[0].upgrade().is_some());
-    drop(members);
+    {
+        let members = listener.members.lock().unwrap();
+        assert_eq!(
+            members.len(),
+            1,
+            "the direct Session::spawn path must register once"
+        );
+        assert!(members[0].upgrade().is_some());
+        drop(members);
+    }
     io.shutdown_and_wait().await.expect("delegate shuts down");
 }

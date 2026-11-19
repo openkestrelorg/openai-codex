@@ -80,14 +80,18 @@ pub(crate) fn retain_watch<T: Send + 'static>(
                 .push(OwnedWatch {
                     id,
                     sender,
-                    _custody: Box::new(custody.take().unwrap()),
+                    _custody: Box::new(
+                        custody
+                            .take()
+                            .unwrap_or_else(|| panic!("watch custody is retained until transfer")),
+                    ),
                 });
         })
         .is_ok();
     if retained {
         Ok(())
     } else {
-        Err(custody.unwrap())
+        Err(custody.unwrap_or_else(|| panic!("unretained watch custody remains available")))
     }
 }
 

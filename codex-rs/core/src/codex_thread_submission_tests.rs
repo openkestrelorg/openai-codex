@@ -658,6 +658,10 @@ async fn history_preparation_uses_request_work_for_initial_and_existing_context(
 }
 
 #[tokio::test]
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "blocks real history preparation while waiting for captured request work and cancelling its owner"
+)]
 async fn cancelled_history_preparation_releases_request_work_without_recording() {
     let (thread, counts) = history_fixture().await;
     // Initial capture retains its context only after acquiring this lock.
@@ -908,7 +912,10 @@ async fn recorded_review_refuses_request_work_before_waiting_for_active_turn() {
     let cancel = CancellationToken::new();
     let mut review = Box::pin(thread.guardian_review(&cancel));
     assert!(matches!(
-        futures::poll!(&mut review),
+        std::future::Future::poll(
+            review.as_mut(),
+            &mut std::task::Context::from_waker(std::task::Waker::noop())
+        ),
         std::task::Poll::Ready(Err(_))
     ));
     assert_eq!(gate.0.load(Ordering::SeqCst), 1);
@@ -920,7 +927,13 @@ async fn recorded_review_cancellation_releases_root_captured_before_history() {
     let held = thread.session.active_turn.lock().await;
     let cancel = CancellationToken::new();
     let mut review = Box::pin(thread.guardian_review(&cancel));
-    assert!(futures::poll!(&mut review).is_pending());
+    assert!(
+        std::future::Future::poll(
+            review.as_mut(),
+            &mut std::task::Context::from_waker(std::task::Waker::noop())
+        )
+        .is_pending()
+    );
     assert_eq!(counts.requests.load(Ordering::SeqCst), 1);
     assert_eq!(counts.live.load(Ordering::SeqCst), 1);
     drop(review);
@@ -947,6 +960,10 @@ async fn recorded_builtin_preparation_uses_request_work_not_an_installed_turn() 
 }
 
 #[tokio::test]
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "keeps public history access blocked while cancellation must release its captured authority"
+)]
 async fn recorded_review_token_cancellation_releases_root_while_public_wait_is_blocked() {
     let (thread, counts) = history_fixture().await;
     let _held = thread.session.active_turn.lock().await;
@@ -973,7 +990,7 @@ async fn already_cancelled_recorded_review_never_captures_request_authority() {
     cancel.cancel();
     let mut review = Box::pin(thread.guardian_review(&cancel));
     assert!(matches!(
-        futures::poll!(&mut review),
+        std::future::Future::poll(review.as_mut(), &mut std::task::Context::from_waker(std::task::Waker::noop())),
         std::task::Poll::Ready(Err(error)) if matches!(error.details(), codex_protocol::error::CodexErrorDetails::TurnAborted)
     ));
     assert_eq!(counts.requests.load(Ordering::SeqCst), 0);

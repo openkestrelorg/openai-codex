@@ -592,6 +592,10 @@ async fn provider_parent_keeps_original_and_nested_auth_after_observer_drop() {
         codex_model_provider_info::ModelProviderInfo::create_openai_provider(None),
         Some(auth),
     );
+    #[expect(
+        clippy::async_yields_async,
+        reason = "captures the spawned observation inside its authority scope for later cancellation by drop"
+    )]
     let observation = codex_model_provider::with_auth_task_scope(
         codex_model_provider::AuthTaskAccess::Admitted(spawner),
         async move {

@@ -12,10 +12,7 @@ use tokio::time::Instant;
 impl ThreadRequestProcessor {
     /// Claim bounded custody before shutdown can start. The request's owner keeps
     /// exclusion through successor publication, including cancellation of this wait.
-    #[expect(
-        clippy::await_holding_invalid_type,
-        reason = "the pending reservation excludes idle claims while exact authority is checked"
-    )]
+    // The pending reservation excludes idle claims while exact authority is checked.
     pub(super) async fn retire_cached_thread_for_resume(
         &self,
         id: ThreadId,
@@ -147,10 +144,7 @@ impl ThreadRequestProcessor {
             .await
     }
 
-    #[expect(
-        clippy::await_holding_invalid_type,
-        reason = "the pending reservation lock excludes idle claims during exact lifecycle lookup"
-    )]
+    // The pending reservation excludes idle claims during exact lifecycle lookup.
     pub(crate) async fn recover_retiring_thread_until(
         &self,
         id: ThreadId,
@@ -404,6 +398,10 @@ mod tests {
         );
     }
     #[tokio::test(start_paused = true)]
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "holds the actual reservation table lock so acquisition must time out without insertion"
+    )]
     async fn recovery_deadline_bounds_watch_reservation_without_inserting() {
         let table = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
         let id = ThreadId::new();

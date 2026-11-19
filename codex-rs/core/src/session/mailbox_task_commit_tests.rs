@@ -154,6 +154,10 @@ async fn cancelled_actual_task_preparation_restores_mail_then_only_retry_commits
 }
 
 #[tokio::test]
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "keeps the final destination locked while verifying cancellation leaves metadata and work uncommitted"
+)]
 async fn cancelled_final_destination_lock_wait_keeps_metadata_and_work_uncommitted() {
     let (session, ctx, gate, events) = fixture().await;
     let before = session.state.lock().await.last_started_turn_id.clone();
