@@ -126,7 +126,10 @@ impl TightenState {
         if !self.pending() || self.failure.is_some() {
             return;
         }
-        let frame = self.frame_ns.expect("pending deadline").to_le_bytes();
+        let frame = self
+            .frame_ns
+            .unwrap_or_else(|| panic!("pending deadline"))
+            .to_le_bytes();
         count_io_call();
         match self.channel.write(&frame) {
             Ok(8) => self.delivered_ns = self.frame_ns,
