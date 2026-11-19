@@ -192,7 +192,6 @@ impl EnterpriseLoginState {
             })
         };
         if let Some((login_id, mut completion)) = previous {
-            eprintln!("enterprise overflow diagnostic: H1 waiting for previous");
             // An abandoned setup request drops its flow and closes this channel.
             let _ = tokio::select! {
                 biased;
@@ -203,7 +202,6 @@ impl EnterpriseLoginState {
                 ) => result.map_err(|_| internal_error("previous enterprise sign-in did not close"))?,
             };
             self.clear(&login_id).await;
-            eprintln!("enterprise overflow diagnostic: H2 previous cleared");
         }
         let login_generation = self
             .auth_manager
@@ -262,13 +260,11 @@ impl EnterpriseLoginState {
         let lifecycle = Arc::clone(self);
         let completion_id = login_id.clone();
         let worker = async move {
-            eprintln!("enterprise overflow diagnostic: W1 worker entered");
             let result = tokio::select! {
                 biased;
                 _ = cancel.cancelled() =>
                     Err(EmaErrorDetail::new("Enterprise sign-in was cancelled.").into()),
                 result = async {
-                    eprintln!("enterprise overflow diagnostic: W2 before handle.wait");
                     let credentials = handle.wait().await.context(EmaErrorDetail::new(
                         "Enterprise sign-in authorization failed.",
                     ))?;
@@ -307,11 +303,9 @@ impl EnterpriseLoginState {
                     Ok(())
                 } => result,
             };
-            eprintln!("enterprise overflow diagnostic: W3 select completed");
             // The canceled wait future has dropped its listener guard. Also wait
             // for the blocking callback worker before allowing a fixed-port retry.
             callback_closed.await;
-            eprintln!("enterprise overflow diagnostic: W4 callback closed");
             if result.is_err() {
                 lifecycle.clear(&completion_id).await;
             }
