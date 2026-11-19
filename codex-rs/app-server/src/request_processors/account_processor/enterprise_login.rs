@@ -319,7 +319,7 @@ impl EnterpriseLoginState {
         if self
             .login_tasks
             .spawn(async move {
-                if crate::auth_task_work::scope_with_ticket(ticket, work, originator.scope(worker))
+                if crate::auth_task_work::scope_with_ticket(ticket, work, originator.scope(Box::pin(worker)))
                     .await
                     .is_err()
                 {
