@@ -30,6 +30,9 @@ codex-utils-home-dir = { workspace = true }
 bytes = { workspace = true }
 futures = { workspace = true, default-features = false, features = ["std"] }
 http = { workspace = true }
+http-body-util = "0.1.3"
+hyper = { version = "1.8.1", features = ["http1", "server"] }
+hyper-util = { workspace = true, features = ["tokio"] }
 keyring = { workspace = true, features = ["crypto-rust"] }
 memchr = { workspace = true }
 oauth2 = "5"
@@ -51,7 +54,6 @@ sha2 = { workspace = true }
 sse-stream = "0.2.5"
 tempfile = { workspace = true }
 thiserror = { workspace = true }
-tiny_http = { workspace = true }
 tokio = { workspace = true, features = [
     "io-util",
     "macros",
