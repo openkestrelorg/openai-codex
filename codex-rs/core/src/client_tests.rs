@@ -18,6 +18,9 @@ use crate::GenerateAttestationFuture;
 use crate::responses_metadata::CodexResponsesMetadata;
 use crate::responses_metadata::MAX_MCP_ATTRIBUTION_BYTES;
 use crate::responses_metadata::MCP_ATTRIBUTION_CLIENT_METADATA_KEY;
+use crate::session::turn_context::ACCOUNT_CHANGED_SINCE_ORIGIN;
+use crate::session::turn_context::AUTH_MANAGER_CHANGED_SINCE_ORIGIN;
+use crate::session::turn_context::OriginatingAccountRecord;
 use crate::test_support::TestCodexResponsesRequestKind;
 use crate::test_support::responses_metadata as test_responses_metadata;
 use base64::Engine;
@@ -2952,4 +2955,107 @@ async fn inference_tools_changes_follow_full_specs_across_turns() {
             "step {index}"
         );
     }
+}
+
+fn fenced_setup_token(user: &str, revision: &str) -> String {
+    let claims = json!({"jti": revision, "https://api.openai.com/auth": {"chatgpt_user_id": user}});
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims.to_string());
+    format!("header.{payload}.signature")
+}
+
+fn fenced_setup_fixture() -> (
+    TempDir,
+    Arc<AuthManager>,
+    Arc<SetupRefreshProvider>,
+    ModelClient,
+) {
+    let home = TempDir::new().unwrap();
+    let initial = CodexAuth::from_external_chatgpt_tokens(
+        &fenced_setup_token("user-a", "initial"),
+        "workspace-a",
+        None,
+    )
+    .unwrap();
+    let manager = AuthManager::from_auth_for_testing_with_home(initial, home.path().to_path_buf());
+    let mut info = test_model_provider().info().clone();
+    info.requires_openai_auth = true;
+    assert!(
+        info.auth.is_none(),
+        "exercise the account fence, not provider auth bypass"
+    );
+    let provider = Arc::new(SetupRefreshProvider {
+        inner: create_model_provider(info, Some(manager.clone())),
+        refresh: SetupRefresh::ChatGpt {
+            home: home.path().to_path_buf(),
+            token: fenced_setup_token("user-a", "refreshed"),
+            workspace: "workspace-a".into(),
+        },
+        setup_calls: AtomicUsize::new(0),
+    });
+    let mut client = test_model_client(SessionSource::Exec);
+    Arc::get_mut(&mut client.state).unwrap().provider = provider.clone();
+    client.set_account_fence(Some(Arc::new(OriginatingAccountRecord::capture(&manager))));
+    (home, manager, provider, client)
+}
+
+#[tokio::test]
+async fn fenced_client_setup_allows_same_owner_credential_refresh() {
+    let (_home, _manager, provider, client) = fenced_setup_fixture();
+    let setup = client
+        .current_client_setup(super::ClientRouting::ConfiguredProvider)
+        .await
+        .unwrap();
+    let mut headers = http::HeaderMap::new();
+    setup.api_auth.add_auth_headers(&mut headers).unwrap();
+    assert_eq!(
+        headers.get(http::header::AUTHORIZATION).unwrap(),
+        &format!("Bearer {}", fenced_setup_token("user-a", "refreshed"))
+    );
+    assert_eq!(provider.setup_calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn fenced_client_setup_refuses_owner_change_before_any_provider_resolution() {
+    for (user, workspace) in [("user-b", "workspace-a"), ("user-a", "workspace-b")] {
+        let (home, manager, provider, client) = fenced_setup_fixture();
+        codex_login::auth::login_with_chatgpt_auth_tokens(
+            home.path(),
+            &fenced_setup_token(user, "replacement"),
+            workspace,
+            None,
+        )
+        .unwrap();
+        manager.reload().await;
+        let error = client
+            .current_client_setup(super::ClientRouting::ConfiguredProvider)
+            .await
+            .err()
+            .expect("changed owner must be refused");
+        assert!(
+            error.to_string().contains(ACCOUNT_CHANGED_SINCE_ORIGIN),
+            "{error}"
+        );
+        assert_eq!(provider.setup_calls.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
+async fn fenced_client_setup_refuses_a_different_auth_manager() {
+    let (_home, _manager, provider, client) = fenced_setup_fixture();
+    let (_other_home, other_manager, _other_provider, _other_client) = fenced_setup_fixture();
+    client.set_account_fence(Some(Arc::new(OriginatingAccountRecord::capture(
+        &other_manager,
+    ))));
+    let error = client
+        .current_client_setup(super::ClientRouting::ConfiguredProvider)
+        .await
+        .err()
+        .expect("a different auth manager must be refused");
+    assert!(
+        error
+            .to_string()
+            .contains(AUTH_MANAGER_CHANGED_SINCE_ORIGIN),
+        "{error}"
+    );
+    assert_eq!(provider.setup_calls.load(Ordering::SeqCst), 0);
 }
