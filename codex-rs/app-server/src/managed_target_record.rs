@@ -277,6 +277,49 @@ mod tests {
     }
 
     #[test]
+    fn from_env_without_opt_in_publishes_nothing() {
+        // Never mutate the process environment; opt-in-present coverage uses
+        // disposable parent processes instead of racing this unit test.
+        assert!(std::env::var_os(MANAGED_TARGET_RECORD_ENV_VAR).is_none());
+        let directory = tempfile::tempdir().unwrap();
+        let socket_path = directory.path().join("control.sock");
+        let mut setup = ManagedTargetRecordSetup::from_env(&AppServerTransport::UnixSocket {
+            socket_path: socket_path.clone(),
+        })
+        .unwrap();
+        assert!(setup.process_instance_id.is_none());
+        assert_eq!(
+            setup.control_endpoint,
+            Some(socket_path.display().to_string())
+        );
+        assert!(setup.publication.is_none());
+        setup.publish_after_socket_bound().unwrap();
+        setup.remove_after_startup_failure().unwrap();
+        assert!(setup.published.is_none());
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publication_refuses_a_preexisting_symlink_without_following_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let artifact = directory.path().join("codex");
+        std::fs::write(&artifact, b"synthetic artifact").unwrap();
+        let sentinel = directory.path().join("sentinel.json");
+        let preimage = b"sentinel must not change";
+        std::fs::write(&sentinel, preimage).unwrap();
+        let record_path = directory.path().join("target.json");
+        std::os::unix::fs::symlink(&sentinel, &record_path).unwrap();
+        let error = publication(record_path.clone(), &artifact)
+            .publish()
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&sentinel).unwrap(), preimage);
+        assert!(record_path.is_symlink());
+        assert_eq!(std::fs::read_link(&record_path).unwrap(), sentinel);
+    }
+
+    #[test]
     fn publication_writes_complete_expected_record_without_overwrite() {
         let directory = tempfile::tempdir().unwrap();
         let artifact = directory.path().join("codex");
