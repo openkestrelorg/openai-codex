@@ -1880,7 +1880,9 @@ impl MessageProcessor {
         managed_transition_caller_authorized: bool,
     ) -> Result<(), JSONRPCErrorError> {
         match codex_request {
-            request @ (ClientRequest::ThreadResume { .. } | ClientRequest::ThreadFork { .. }) => {
+            request @ (ClientRequest::ThreadResume { .. }
+            | ClientRequest::ThreadFork { .. }
+            | ClientRequest::ThreadRevert { .. }) => {
                 box_dispatch_future(|| {
                     self.handle_thread_session_request(connection_request_id, request, session)
                 })
@@ -1949,6 +1951,16 @@ impl MessageProcessor {
                         app_server_client_name.clone(),
                         client_version.clone(),
                         client_mcp_extensions.clone(),
+                    )
+                    .await
+            }
+            ClientRequest::ThreadRevert { params, .. } => {
+                self.thread_processor
+                    .thread_revert(
+                        request_id.clone(),
+                        params,
+                        app_server_client_name.clone(),
+                        client_version.clone(),
                     )
                     .await
             }
@@ -2221,7 +2233,9 @@ impl MessageProcessor {
                 }
                 Ok(response)
             }
-            ClientRequest::ThreadResume { .. } | ClientRequest::ThreadFork { .. } => {
+            ClientRequest::ThreadResume { .. }
+            | ClientRequest::ThreadFork { .. }
+            | ClientRequest::ThreadRevert { .. } => {
                 unreachable!("thread session requests use the small dispatch path")
             }
             ClientRequest::ThreadSample { params, .. } => self
@@ -2386,17 +2400,6 @@ impl MessageProcessor {
             ClientRequest::ThreadBackgroundTerminalsTerminate { params, .. } => {
                 self.thread_processor
                     .thread_background_terminals_terminate(params)
-                    .await
-            }
-            ClientRequest::ThreadRevert { params, .. } => {
-                eprintln!("revert phase diagnostic: R0 dispatch");
-                self.thread_processor
-                    .thread_revert(
-                        request_id.clone(),
-                        params,
-                        app_server_client_name.clone(),
-                        client_version.clone(),
-                    )
                     .await
             }
             ClientRequest::ThreadList { params, .. } => {

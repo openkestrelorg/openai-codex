@@ -754,7 +754,6 @@ impl ThreadRequestProcessor {
         app_server_client_name: Option<String>,
         app_server_client_version: Option<String>,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
-        eprintln!("revert phase diagnostic: R1 public entry");
         let (response, thread_id) = self
             .thread_revert_response(
                 &request_id,
@@ -763,7 +762,6 @@ impl ThreadRequestProcessor {
                 app_server_client_version,
             )
             .await?;
-        eprintln!("revert phase diagnostic: R16 response returned");
         self.outgoing.send_response(request_id, response).await;
         self.outgoing
             .send_server_notification(ServerNotification::ThreadReverted(
@@ -2609,7 +2607,6 @@ impl ThreadRequestProcessor {
         app_server_client_name: Option<String>,
         app_server_client_version: Option<String>,
     ) -> Result<(ThreadRevertResponse, String), JSONRPCErrorError> {
-        eprintln!("revert phase diagnostic: R2 response entry");
         let _thread_list_state_permit = self.acquire_thread_list_state_permit().await?;
         let ThreadRevertParams {
             thread_id,
@@ -2659,7 +2656,6 @@ impl ThreadRequestProcessor {
                 "connection closed before thread {thread_id} could be reverted"
             )));
         }
-        eprintln!("revert phase diagnostic: R3 listener ensured");
         let thread_state = self.thread_state_manager.thread_state(thread_id).await;
         let mut shutdown_drain = thread_state
             .lock()
@@ -2672,7 +2668,6 @@ impl ThreadRequestProcessor {
                 ))
             })?;
 
-        eprintln!("revert phase diagnostic: R4 shutdown begin");
         match wait_for_thread_shutdown(&thread).await {
             ThreadShutdownResult::Complete => {}
             ThreadShutdownResult::SubmitFailed => {
@@ -2686,7 +2681,6 @@ impl ThreadRequestProcessor {
                 )));
             }
         }
-        eprintln!("revert phase diagnostic: R5 shutdown returned");
         tokio::time::timeout(
             Duration::from_secs(10),
             shutdown_drain.wait_for(|drained| *drained),
@@ -2702,7 +2696,6 @@ impl ThreadRequestProcessor {
                 "thread {thread_id} listener stopped before draining shutdown events"
             ))
         })?;
-        eprintln!("revert phase diagnostic: R6 drain returned");
         // The listener is drained: even an interrupted turn is durable now. Inspect only the
         // suffix being reverted and remember the revision, not a collection of turn IDs.
         let receipt_to_retire = async {
@@ -2750,7 +2743,6 @@ impl ThreadRequestProcessor {
             }
         }
         .await;
-        eprintln!("revert phase diagnostic: R7 receipt lookup returned");
         if self
             .thread_manager
             .remove_thread(&thread_id)
@@ -2761,14 +2753,12 @@ impl ThreadRequestProcessor {
                 "thread {thread_id} disappeared before revert"
             )));
         }
-        eprintln!("revert phase diagnostic: R8 thread removed");
         // Keep thread state and subscriptions across the internal reload. Full teardown would
         // force clients to call thread/resume after a successful revert.
         self.outgoing
             .cancel_requests_for_thread(thread_id, /*error*/ None)
             .await;
 
-        eprintln!("revert phase diagnostic: R9 store revert begin");
         let revert_result = self
             .thread_store
             .revert_thread(codex_thread_store::RevertThreadParams {
@@ -2778,7 +2768,6 @@ impl ThreadRequestProcessor {
             })
             .await
             .map_err(|err| thread_store_mutation_error("revert", err));
-        eprintln!("revert phase diagnostic: R10 store revert returned");
         // Receipt lookup or update errors cannot prevent reload or misreport a committed revert.
         // A concurrent mark wins over this cleanup, even while the thread was being truncated.
         if revert_result.is_ok()
@@ -2812,7 +2801,6 @@ impl ThreadRequestProcessor {
                 }
             }
         }
-        eprintln!("revert phase diagnostic: R11 read-state retired");
         let response = self
             .reload_paginated_thread(
                 request_id,
@@ -2834,7 +2822,6 @@ impl ThreadRequestProcessor {
         app_server_client_name: Option<String>,
         app_server_client_version: Option<String>,
     ) -> Result<ThreadRevertResponse, JSONRPCErrorError> {
-        eprintln!("revert phase diagnostic: R12 reload entry");
         let ThreadRevertRuntimeSnapshot {
             mut config,
             settings,
@@ -2861,7 +2848,6 @@ impl ThreadRequestProcessor {
                 /*prepared_model_context*/ None,
             )
             .await?;
-        eprintln!("revert phase diagnostic: R13 history loaded");
         let response_history = thread_history.clone();
         let NewThread {
             thread_id: resumed_thread_id,
@@ -2880,7 +2866,6 @@ impl ThreadRequestProcessor {
             )
             .await
             .map_err(|err| internal_error(format!("error reloading thread after revert: {err}")))?;
-        eprintln!("revert phase diagnostic: R14 resume returned");
         if resumed_thread_id != thread_id {
             return Err(internal_error(format!(
                 "thread {thread_id} reloaded as {resumed_thread_id} after revert"
@@ -2921,7 +2906,6 @@ impl ThreadRequestProcessor {
         let thread_state = self.thread_state_manager.thread_state(thread_id).await;
         self.ensure_listener_task_running(thread_id, Arc::clone(&codex_thread), thread_state)
             .await?;
-        eprintln!("revert phase diagnostic: R15 replacement listener ensured");
         let mut thread = self
             .load_thread_from_resume_source_or_send_internal(
                 thread_id,
