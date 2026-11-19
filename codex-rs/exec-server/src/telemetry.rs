@@ -273,20 +273,17 @@ impl ExecServerTelemetry {
             inner.adjust_process_count(/*delta*/ 1);
         });
         let parent = codex_otel::current_span_w3c_trace_context();
-        // `parent:` accepts a local tracing span/ID, not a W3C context. A local
-        // parent would keep the request span alive until process exit and delay
-        // its export. Use `parent: None`, then set the W3C parent below to link
-        // the spans without retaining the request span.
-        let span = tracing::info_span!(
-            parent: None,
-            "codex.exec_server.process",
-            otel.kind = "internal",
-            process.id = process_id,
-            result = tracing::field::Empty,
-        );
-        if let Some(parent) = parent {
-            codex_otel::set_parent_from_w3c_trace_context(&span, &parent);
-        }
+        // Keep this a tracing root so process lifetime does not retain the
+        // request span; select its W3C parent before eager managed construction.
+        let span = codex_otel::root_span_with_w3c_parent(parent.as_ref(), || {
+            tracing::info_span!(
+                parent: None,
+                "codex.exec_server.process",
+                otel.kind = "internal",
+                process.id = process_id,
+                result = tracing::field::Empty,
+            )
+        });
         ProcessMetricGuard {
             telemetry: self.clone(),
             span,
@@ -460,3 +457,7 @@ fn register_active_gauge(
         warn!(metric = name, "failed to register exec-server gauge");
     }
 }
+
+#[cfg(test)]
+#[path = "managed_trace_parent_tests.rs"]
+mod managed_trace_parent_tests;
