@@ -469,6 +469,7 @@ oauth = {{ client_id = "mcp-client", client_secret = "resource-secret", token_en
     config.cli_auth_credentials_store_mode = AuthCredentialsStoreMode::Auto;
     let state_db = codex_rollout::state_db::try_init(&config).await?;
     let config = Arc::new(config);
+    eprintln!("enterprise overflow diagnostic: before in_process::start");
     let mut client = in_process::start(InProcessStartArgs {
         arg0_paths: Arg0DispatchPaths::default(),
         config,
@@ -499,8 +500,10 @@ oauth = {{ client_id = "mcp-client", client_secret = "resource-secret", token_en
         channel_capacity: in_process::DEFAULT_IN_PROCESS_CHANNEL_CAPACITY,
     })
     .await?;
+    eprintln!("enterprise overflow diagnostic: initialized, before thread/start");
     drop(listener);
     let thread = enterprise_rpc(&client, "thread/start", json!({})).await?;
+    eprintln!("enterprise overflow diagnostic: thread/start completed");
     let thread_id = thread["thread"]["id"].as_str().context("thread ID")?;
 
     assert_eq!(
@@ -514,13 +517,16 @@ oauth = {{ client_id = "mcp-client", client_secret = "resource-secret", token_en
         .to_string(),
         "mcpServer/oauth/login: MCP server 'disabled-enterprise' is disabled."
     );
+    eprintln!("enterprise overflow diagnostic: before first enabled MCP OAuth login");
     let first = enterprise_rpc(
         &client,
         "mcpServer/oauth/login",
         json!({"name":"enterprise","threadId":thread_id}),
     )
     .await?;
+    eprintln!("enterprise overflow diagnostic: first enabled MCP OAuth login returned");
     enterprise_callback(&first, &issuer, callback_port)?;
+    eprintln!("enterprise overflow diagnostic: T6 before replacement");
     let replacement = enterprise_rpc(
         &client,
         "mcpServer/oauth/login",
@@ -528,11 +534,13 @@ oauth = {{ client_id = "mcp-client", client_secret = "resource-secret", token_en
     )
     .await?;
     assert_ne!(replacement["loginId"], first["loginId"]);
+    eprintln!("enterprise overflow diagnostic: T7 replacement returned");
     enterprise_callback(&replacement, &issuer, callback_port)?;
     assert_eq!(
         enterprise_completion(&mut client).await?,
         json!({"name":"enterprise","threadId":thread_id,"loginId":first["loginId"],"success":false,"error":"Enterprise sign-in was cancelled."})
     );
+    eprintln!("enterprise overflow diagnostic: T8 first completion received");
     assert_eq!(
         enterprise_rpc(
             &client,
@@ -542,6 +550,7 @@ oauth = {{ client_id = "mcp-client", client_secret = "resource-secret", token_en
         .await?,
         json!({"status":"canceled"})
     );
+    eprintln!("enterprise overflow diagnostic: T9 cancel returned");
     assert_eq!(
         enterprise_completion(&mut client).await?,
         json!({"name":"enterprise","threadId":thread_id,"loginId":replacement["loginId"],"success":false,"error":"Enterprise sign-in was cancelled."})
