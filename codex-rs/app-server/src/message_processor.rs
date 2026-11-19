@@ -2389,6 +2389,7 @@ impl MessageProcessor {
                     .await
             }
             ClientRequest::ThreadRevert { params, .. } => {
+                eprintln!("revert phase diagnostic: R0 dispatch");
                 self.thread_processor
                     .thread_revert(
                         request_id.clone(),
