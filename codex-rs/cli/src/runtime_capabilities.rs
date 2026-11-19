@@ -43,8 +43,13 @@ pub(super) fn report(args: Vec<OsString>) -> Result<serde_json::Value, clap::Err
     }
     let commands: Vec<_> = command.get_subcommands().map(|subcommand| serde_json::json!({"name":subcommand.get_name(), "aliases":subcommand.get_all_aliases().collect::<Vec<_>>()})).collect();
     let options: Vec<_> = command.get_arguments().map(|argument| serde_json::json!({"long":argument.get_long(),"short":argument.get_short(),"value":argument.get_action().takes_values()})).collect();
+    let mut capabilities = vec!["cache-auth-observation"];
+    if codex_login::COMMAND_AUTH_COMPILED_SUPPORTED {
+        capabilities.push("command-chatgpt-auth");
+    }
+    capabilities.push("same-image-unix-peer");
     Ok(
-        serde_json::json!({"version":1,"capabilities":["cache-auth-observation","command-chatgpt-auth","same-image-unix-peer"],"commands":commands,"options":options,"features":codex_features::FEATURES.iter().map(|feature|feature.key).collect::<Vec<_>>(),"parsedCommand":parsed_command,"hasRemoteOverride":has_remote_override,"unsafeOverrides":unsafe_overrides}),
+        serde_json::json!({"version":1,"capabilities":capabilities,"commands":commands,"options":options,"features":codex_features::FEATURES.iter().map(|feature|feature.key).collect::<Vec<_>>(),"parsedCommand":parsed_command,"hasRemoteOverride":has_remote_override,"unsafeOverrides":unsafe_overrides}),
     )
 }
 
@@ -58,13 +63,26 @@ mod tests {
     fn inventory_is_closed_metadata_and_includes_managed_command() {
         let value = inventory(&["codex", "--runtime-capabilities"]);
         assert_eq!(value["version"], 1);
+        let capabilities = value["capabilities"].as_array().unwrap();
         assert_eq!(
-            value["capabilities"],
-            serde_json::json!([
-                "cache-auth-observation",
-                "command-chatgpt-auth",
-                "same-image-unix-peer"
-            ])
+            capabilities
+                .iter()
+                .any(|name| name == "command-chatgpt-auth"),
+            codex_login::COMMAND_AUTH_COMPILED_SUPPORTED
+        );
+        assert!(
+            capabilities
+                .iter()
+                .any(|name| name == "cache-auth-observation")
+        );
+        assert!(
+            capabilities
+                .iter()
+                .any(|name| name == "same-image-unix-peer")
+        );
+        assert_eq!(
+            capabilities.len(),
+            2 + usize::from(codex_login::COMMAND_AUTH_COMPILED_SUPPORTED)
         );
         assert!(
             value["commands"]

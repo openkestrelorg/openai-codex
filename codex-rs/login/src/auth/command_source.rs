@@ -127,7 +127,7 @@ impl CommandSource {
             return Ok(None);
         };
         Self::require_allowed_mode(allowed_auth_modes)?;
-        if !cfg!(target_os = "macos")
+        if !crate::COMMAND_AUTH_COMPILED_SUPPORTED
             || config.auth_credentials_store_mode != AuthCredentialsStoreMode::File
         {
             return Err(io::Error::other("command auth requires macOS File storage"));

@@ -1,3 +1,6 @@
+/// Whether command-source ChatGPT authentication has a compiled platform implementation.
+pub const COMMAND_AUTH_COMPILED_SUPPORTED: bool = cfg!(target_os = "macos");
+
 pub mod auth;
 pub mod auth_env_telemetry;
 pub mod test_support;
