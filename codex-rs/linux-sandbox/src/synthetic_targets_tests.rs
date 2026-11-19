@@ -154,10 +154,12 @@ impl LiveHolder {
     }
 
     fn finish(mut self) {
-        let mut child = self.child.take().expect("owned child");
+        let child = self.child.as_mut().expect("owned child");
         drop(child.stdin.take());
-        assert!(child.wait().expect("reap holder").success());
+        let status = child.wait().expect("reap holder");
+        self.child.take();
         // The child is reaped and disarmed before any further assertion.
+        assert!(status.success());
         assert_eq!(liveness(&self.token), Liveness::Terminated);
     }
 }
