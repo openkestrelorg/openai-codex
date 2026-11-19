@@ -184,14 +184,13 @@ impl SandboxCleanupCustody {
     /// Like [`Self::spawned`], with the launcher already pinned by the spawn
     /// itself (`codex_utils_pty` opens a pidfd before its wait task can reap
     /// the child), so a fast-exiting launcher cannot race the pin.
+    #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
     pub fn spawned_with_pin(&mut self, launcher: Option<codex_utils_pty::ProcessPin>) {
         #[cfg(target_os = "linux")]
         match launcher {
             Some(pin) => self.inner.spawned_pinned(pin.into_pidfd()),
             None => self.inner.spawned(None),
         }
-        #[cfg(not(target_os = "linux"))]
-        drop(launcher);
     }
 
     pub fn tightener(&self) -> SandboxCleanupTightener {

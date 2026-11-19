@@ -34,7 +34,7 @@ async fn assert_single_take_pin(spawned: SpawnedProcess) -> anyhow::Result<()> {
         assert_eq!(unsafe { libc::poll(&mut poll, 1, 0) }, 1);
     }
     #[cfg(not(target_os = "linux"))]
-    drop(pin); // An opaque stub off Linux, not native Linux exit proof.
+    let _ = pin; // An opaque stub off Linux, not native Linux exit proof.
     Ok(())
 }
 

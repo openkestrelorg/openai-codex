@@ -115,11 +115,11 @@ pub(crate) async fn with_fs_helper_cleanup_receipt<F: Future>(
 fn record_fs_helper_launch() {
     let _ = FS_HELPER_CLEANUP_RECEIPT.try_with(|receipt| {
         let current = receipt.get();
+        let Some(launched) = current.launched.checked_add(1) else {
+            panic!("filesystem launch count overflow");
+        };
         receipt.set(FsHelperReceipt {
-            launched: current
-                .launched
-                .checked_add(1)
-                .expect("filesystem launch count overflow"),
+            launched,
             ..current
         });
     });
@@ -130,12 +130,12 @@ fn record_fs_helper_launch() {
 fn record_fs_helper_cleanup(summary: SandboxCleanupSummary) {
     let _ = FS_HELPER_CLEANUP_RECEIPT.try_with(|receipt| {
         let current = receipt.get();
+        let Some(collected) = current.collected.checked_add(1) else {
+            panic!("filesystem receipt count overflow");
+        };
         receipt.set(FsHelperReceipt {
             sandbox_cleanup: merge_optional_sandbox_cleanup(current.sandbox_cleanup, Some(summary)),
-            collected: current
-                .collected
-                .checked_add(1)
-                .expect("filesystem receipt count overflow"),
+            collected,
             ..current
         });
     });

@@ -50,10 +50,11 @@ impl<'a> SandboxCleanupReceiptCollector<'a> {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.pending = state
-            .pending
-            .checked_add(1)
-            .expect("filesystem operation count overflow");
+        let Some(pending) = state.pending.checked_add(1) else {
+            // Overflow must fail closed while the state guard is still held.
+            panic!("filesystem operation count overflow");
+        };
+        state.pending = pending;
         PendingOperation {
             state: &self.state,
             completed: false,

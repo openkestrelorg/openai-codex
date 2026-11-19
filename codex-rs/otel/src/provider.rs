@@ -38,7 +38,6 @@ use opentelemetry_sdk::trace::Tracer;
 use opentelemetry_sdk::trace::TracerProviderBuilder;
 use opentelemetry_sdk::trace::span_processor_with_async_runtime::BatchSpanProcessor as TokioBatchSpanProcessor;
 use opentelemetry_semantic_conventions as semconv;
-use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::error::Error;
 use std::io;
@@ -795,6 +794,7 @@ mod tests {
     use opentelemetry::trace::Tracer as _;
     use opentelemetry_sdk::metrics::InMemoryMetricExporter;
     use pretty_assertions::assert_eq;
+    use std::collections::BTreeMap;
     use std::path::PathBuf;
 
     #[test]
