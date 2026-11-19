@@ -1495,6 +1495,7 @@ async fn enterprise_rpc(
 }
 
 async fn enterprise_completion(client: &mut InProcessClientHandle) -> Result<Value> {
+    eprintln!("enterprise RPC diagnostic: completion begin");
     timeout(DEFAULT_READ_TIMEOUT, async {
         loop {
             match client
@@ -1506,6 +1507,7 @@ async fn enterprise_completion(client: &mut InProcessClientHandle) -> Result<Val
                     if let ServerNotification::McpServerOauthLoginCompleted(notification) =
                         *notification
                     {
+                        eprintln!("enterprise RPC diagnostic: completion end");
                         return Ok(serde_json::to_value(notification)?);
                     }
                 }
