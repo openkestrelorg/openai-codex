@@ -140,7 +140,7 @@ async fn required_prepared_calls_refuse_before_catalog_waits_or_preparation() {
     let mut first = Box::pin(prepared.call_with_preparation_and_authority(
         None,
         McpAttemptAccess::Admitted(&root),
-        || std::future::pending(),
+        std::future::pending,
     ));
     assert!(futures::poll!(&mut first).is_pending());
     let mut refresh = Box::pin(step.tool_catalog.refresh(
@@ -186,7 +186,7 @@ async fn cancelled_catalog_waiter_releases_only_its_invocation_work() {
     let mut first = Box::pin(prepared.call_with_preparation_and_authority(
         None,
         McpAttemptAccess::Admitted(&root),
-        || std::future::pending(),
+        std::future::pending,
     ));
     assert!(futures::poll!(&mut first).is_pending());
     let mut refresh = Box::pin(step.tool_catalog.refresh(

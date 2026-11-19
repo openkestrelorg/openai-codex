@@ -143,6 +143,8 @@ const UNTRUSTED_CONNECTOR_META_KEYS: &[&str] = &[
 
 pub(crate) type ManagedClientFuture =
     Shared<BoxFuture<'static, Result<ManagedClient, StartupOutcomeError>>>;
+type ManagedClientWorkFactory =
+    Arc<dyn Fn(Option<Box<dyn crate::McpAttemptWork>>) -> ManagedClientFuture + Send + Sync>;
 type StartupShutdown = Shared<BoxFuture<'static, Result<(), String>>>;
 
 #[derive(Default)]
@@ -164,8 +166,7 @@ struct CodexAppsStartupStatusContext {
 pub(crate) struct CodexAppsStartupReconnect {
     workers: crate::McpWorkerOwner,
     requirement: McpAttemptRequirement,
-    factory:
-        Arc<dyn Fn(Option<Box<dyn crate::McpAttemptWork>>) -> ManagedClientFuture + Send + Sync>,
+    factory: ManagedClientWorkFactory,
     state: StdMutex<CodexAppsStartupReconnectState>,
     startup_status_context: Option<CodexAppsStartupStatusContext>,
 }
@@ -201,9 +202,7 @@ impl CodexAppsStartupReconnect {
     }
 
     fn with_work_factory(
-        factory: Arc<
-            dyn Fn(Option<Box<dyn crate::McpAttemptWork>>) -> ManagedClientFuture + Send + Sync,
-        >,
+        factory: ManagedClientWorkFactory,
         workers: crate::McpWorkerOwner,
         requirement: McpAttemptRequirement,
     ) -> Self {
@@ -705,7 +704,8 @@ impl AsyncManagedClient {
         });
         let (client, connection_slot) = if let Some((pool, mut key)) = connection_pool {
             key.attempt_requirement = attempt_requirement;
-            let slot = reserved_slot.expect("pooled startup reserves its slot before construction");
+            let slot = reserved_slot
+                .unwrap_or_else(|| panic!("pooled startup reserves its slot before construction"));
             let connection_slot = Arc::clone(&slot);
             let startup = Arc::clone(&startup);
             let cancel_token = cancel_token.clone();

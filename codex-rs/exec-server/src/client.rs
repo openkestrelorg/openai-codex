@@ -2775,7 +2775,7 @@ mod tests {
                 method: EXEC_CLOSED_METHOD.to_string(),
                 params: Some(
                     serde_json::to_value(ExecClosedNotification {
-                        sandbox_cleanup: Some(cleanup.clone()),
+                        sandbox_cleanup: Some(cleanup),
                         process_id: process_id.clone(),
                         seq: 4,
                     })

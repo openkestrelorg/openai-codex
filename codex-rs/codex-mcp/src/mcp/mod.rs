@@ -623,7 +623,7 @@ pub async fn collect_mcp_server_status_snapshot_with_detail(
         crate::McpAttemptAccess::Unscoped,
     )
     .await
-    .expect("threadless status manager is explicitly Ungated");
+    .unwrap_or_else(|error| panic!("threadless status manager is explicitly Ungated: {error:?}"));
 
     cancel_token.cancel();
 

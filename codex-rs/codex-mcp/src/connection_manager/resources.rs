@@ -42,15 +42,6 @@ impl McpConnectionSet {
             })
     }
 
-    /// Returns resources from servers selected by `include_server`.
-    pub async fn list_all_resources(
-        &self,
-        include_server: impl Fn(&str) -> bool,
-    ) -> HashMap<String, Vec<Resource>> {
-        self.list_all_resources_with_authority(include_server, crate::McpAttemptAccess::Unscoped)
-            .await
-    }
-
     pub async fn list_all_resources_with_authority(
         &self,
         include_server: impl Fn(&str) -> bool,
@@ -101,18 +92,6 @@ impl McpConnectionSet {
             }
         }
         resources
-    }
-
-    /// Returns resource templates from servers selected by `include_server`.
-    pub async fn list_all_resource_templates(
-        &self,
-        include_server: impl Fn(&str) -> bool,
-    ) -> HashMap<String, Vec<ResourceTemplate>> {
-        self.list_all_resource_templates_with_authority(
-            include_server,
-            crate::McpAttemptAccess::Unscoped,
-        )
-        .await
     }
 
     pub async fn list_all_resource_templates_with_authority(
@@ -281,7 +260,6 @@ impl McpConnectionSet {
 impl McpServerConnection {
     /// Borrows the authenticated transport while startup owns its inventory. Discard the page
     /// if startup fails or the runtime replaces its connection, auth scope, or resource generation.
-
     pub(crate) async fn with_early_apps_client_with_authority(
         self: &Arc<Self>,
         runtime: &McpRuntime,

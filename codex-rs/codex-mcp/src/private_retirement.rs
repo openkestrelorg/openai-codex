@@ -181,6 +181,7 @@ impl PrivateClientRetirement {
     }
 
     /// Only a previously observed positive report permits owner compaction.
+    #[cfg(test)]
     pub fn is_retired(&self) -> bool {
         self.registry
             .state
@@ -253,6 +254,7 @@ impl ConnectionRetirementOwner {
         false
     }
 
+    #[cfg(test)]
     pub(crate) fn id(&self) -> usize {
         self.id
     }
@@ -288,6 +290,7 @@ impl PrivateRetirementRegistry {
     }
 
     /// Includes runtime-wide startup-summary work, not just one connection.
+    #[cfg(test)]
     pub(crate) fn task_ticket(&self) -> PrivateTaskTicket {
         PrivateTaskTicket {
             registry: Arc::downgrade(&self.state),

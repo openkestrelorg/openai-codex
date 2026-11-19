@@ -279,18 +279,18 @@ async fn recovery_carries_cleanup_without_overwriting_an_existing_closed_receipt
     };
     let existing = SandboxCleanupSummary {
         host_owned: 9,
-        ..recovered.clone()
+        ..recovered
     };
     // New recovery Closed, a pending legacy Closed, and a pending receipt
     // already observed from a live notification are all distinct cases.
-    for pending in [None, Some(None), Some(Some(existing.clone()))] {
+    for pending in [None, Some(None), Some(Some(existing))] {
         let state = SessionState::new(true);
         if let Some(summary) = &pending {
             assert!(
                 !state
                     .publish_ordered_event(ExecProcessEvent::Closed {
                         seq: 3,
-                        sandbox_cleanup: summary.clone()
+                        sandbox_cleanup: *summary
                     })
                     .expect("queue Closed")
             );
@@ -309,7 +309,7 @@ async fn recovery_carries_cleanup_without_overwriting_an_existing_closed_receipt
                     closed: true,
                     failure: None,
                     sandbox_denied: false,
-                    sandbox_cleanup: Some(recovered.clone()),
+                    sandbox_cleanup: Some(recovered),
                 })
                 .expect("recover")
         );
@@ -324,7 +324,7 @@ async fn recovery_carries_cleanup_without_overwriting_an_existing_closed_receipt
             .await
             .expect("bounded Closed")
             .expect("Closed");
-        let expected = pending.flatten().unwrap_or_else(|| recovered.clone());
+        let expected = pending.flatten().unwrap_or(recovered);
         assert_eq!(
             closed,
             ExecProcessEvent::Closed {

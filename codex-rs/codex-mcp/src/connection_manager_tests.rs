@@ -6307,7 +6307,7 @@ async fn reconciliation_reuses_an_unchanged_pending_server_without_waiting() -> 
             .connection,
     )
     .expect("test server should have one connection owner");
-    connection.client = pending_client.into();
+    connection.client = pending_client;
     config.enabled_tools = Some(vec!["search".to_string()]);
     config.startup_timeout_sec = Some(DEFAULT_STARTUP_TIMEOUT);
 
@@ -6354,7 +6354,7 @@ async fn reconciliation_cancels_a_reused_pending_server_when_disabled() -> anyho
             .connection,
     )
     .expect("test server should have one connection owner");
-    connection.client = pending_client.into();
+    connection.client = pending_client;
 
     let reused =
         reconcile_reusable_server(&previous, config.clone(), runtime_context.clone()).await;

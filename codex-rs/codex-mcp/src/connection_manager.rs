@@ -792,7 +792,8 @@ impl McpConnectionSet {
                         Ok(None)
                     };
                     if authority_is_current() && (pending || ready) && driver_work.is_ok() {
-                        let driver_work = driver_work.expect("checked startup admission");
+                        let driver_work = driver_work
+                            .unwrap_or_else(|error| panic!("checked startup admission: {error:?}"));
                         servers.insert(
                             server_name.clone(),
                             McpServerView {
@@ -879,7 +880,8 @@ impl McpConnectionSet {
                             })
                         }))
                 {
-                    let driver_work = driver_work.expect("checked startup admission");
+                    let driver_work = driver_work
+                        .unwrap_or_else(|error| panic!("checked startup admission: {error:?}"));
                     let pending_client =
                         reusable_pending_startup.then(|| connection.client.clone());
                     servers.insert(
@@ -1257,7 +1259,7 @@ impl McpConnectionSet {
                 let Some(outcomes) = deferred_owner
                     .join_eager_batch(eager_workers)
                     .await
-                    .expect("MCP eager startup worker failed")
+                    .unwrap_or_else(|error| panic!("MCP eager startup worker failed: {error:?}"))
                 else {
                     return;
                 };
@@ -1653,6 +1655,7 @@ impl McpConnectionSet {
     /// Returns presentation metadata from the current connection.
     /// Codex Apps metadata may come from its existing cache; regular MCP server information is
     /// connection-specific, so pending regular clients are awaited.
+    #[cfg(test)]
     pub(crate) async fn list_available_server_infos(
         &self,
         include_server: impl Fn(&str) -> bool,

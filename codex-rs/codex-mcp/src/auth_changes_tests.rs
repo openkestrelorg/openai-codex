@@ -15,8 +15,8 @@ use tokio::time::timeout;
 struct NotificationServer(mpsc::Sender<serde_json::Value>);
 
 impl rmcp::ServerHandler for NotificationServer {
-    fn get_info(&self) -> rmcp::model::ServerInfo {
-        let mut info = rmcp::model::ServerInfo::default();
+    fn get_info(&self) -> rmcp::model::ServerConfig {
+        let mut info = rmcp::model::ServerConfig::default();
         info.capabilities.experimental = Some([(CAPABILITY.to_owned(), Default::default())].into());
         info
     }

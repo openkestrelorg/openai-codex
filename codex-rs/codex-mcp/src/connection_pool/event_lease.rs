@@ -43,11 +43,18 @@ impl McpConnectionPool {
 
 impl EventConnectionLease {
     pub(crate) fn retirement(&self) -> RmcpClientRetirement {
-        self.owner.as_ref().expect("live event lease").lower.clone()
+        self.owner
+            .as_ref()
+            .unwrap_or_else(|| panic!("live event lease"))
+            .lower
+            .clone()
     }
 
     pub(crate) fn bind(&self, client: &RmcpClient) -> bool {
-        let owner = self.owner.as_ref().expect("live event lease");
+        let owner = self
+            .owner
+            .as_ref()
+            .unwrap_or_else(|| panic!("live event lease"));
         let accepted = owner.accepts(client);
         owner.settle_startup(Some(client));
         accepted
@@ -56,7 +63,10 @@ impl EventConnectionLease {
     /// Keep the existing cancellation grace, then drop the client and drive
     /// bounded physical closure. The process ledger owns the original join.
     pub(crate) fn release_after(mut self, before_close: impl Future<Output = ()> + Send + 'static) {
-        let owner = self.owner.take().expect("live event lease");
+        let owner = self
+            .owner
+            .take()
+            .unwrap_or_else(|| panic!("live event lease"));
         owner.mark_released();
         owner.settle_startup(None);
         drop(

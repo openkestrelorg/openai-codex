@@ -22,7 +22,7 @@ fn export(owner: &Arc<AuthManager>, counter: &Path) -> GatewayExport {
                 "gateway-test".into(),
                 counter.to_string_lossy().into_owned().into(),
             ],
-            timeout_ms: NonZeroU64::new(2000).unwrap(),
+            timeout_ms: NonZeroU64::new(2000).unwrap_or_else(|| panic!("2000 is non-zero")),
         },
         NetworkPolicy::default(),
         owner,

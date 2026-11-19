@@ -393,7 +393,7 @@ impl McpRuntime {
         });
         retirement.register_shutdown(Arc::clone(&shutdown));
         Self {
-            retirement: retirement.clone(),
+            retirement,
             workers,
             shutdown,
             current,

@@ -11,6 +11,7 @@ use codex_config::McpStartupReadiness;
 use codex_connectors::ConnectorRuntimeFetchSource;
 use futures::future::join_all;
 use tracing::Instrument;
+#[cfg(test)]
 use tracing::instrument;
 use tracing::trace;
 use tracing::trace_span;
@@ -222,6 +223,7 @@ impl McpConnectionSet {
         (tools, errors)
     }
 
+    #[cfg(test)]
     pub(crate) async fn list_catalogs_with_errors(
         &self,
         include_server: impl Fn(&str) -> bool,
