@@ -231,6 +231,7 @@ async fn build_test_config(codex_home: &Path, server_uri: &str) -> Result<Config
 
     Ok(ConfigBuilder::default()
         .codex_home(codex_home.to_path_buf())
+        .cli_overrides(vec![("features.plugins".to_string(), false.into())])
         .build()
         .await?)
 }
