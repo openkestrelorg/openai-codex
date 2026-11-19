@@ -420,6 +420,7 @@ async fn provider_exchange_timeout_reaps_the_process_group_before_returning() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
+    cleanup.0 = 0;
     assert!(source.state.lock().unwrap().as_ref() == Some(&record));
     assert_eq!(source.retry_after.load(Ordering::Acquire), backoff);
     assert_eq!(
