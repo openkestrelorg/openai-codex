@@ -251,7 +251,7 @@ impl App {
         let task = tokio::spawn(async move {
             let result = start_temporary_thread(&request_handle, options)
                 .await
-                .map(|thread| thread.into_thread())
+                .map(crate::temporary_structured_request::StartedTemporaryThread::into_thread)
                 .map_err(|error| error.to_string());
 
             event_sender.send(AppEvent::RecapStarted {

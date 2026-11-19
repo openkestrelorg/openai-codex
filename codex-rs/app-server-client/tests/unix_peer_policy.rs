@@ -27,7 +27,8 @@ const READY_ENV: &str = "KCF_TEST_UNIX_PEER_READY";
 const OBSERVED_ENV: &str = "KCF_TEST_UNIX_PEER_OBSERVED";
 
 fn case(name: &str, policy: Option<&str>) {
-    let executable = std::env::current_exe().unwrap();
+    let executable = std::env::current_exe()
+        .unwrap_or_else(|error| panic!("Unix peer fixture invariant failed: {error:?}"));
     let mut command = std::process::Command::new(executable);
     command
         .env_clear()
@@ -46,15 +47,25 @@ fn case(name: &str, policy: Option<&str>) {
     if let Some(policy) = policy {
         command.env("CODEX_UNIX_PEER_POLICY", policy);
     }
-    let mut child = command.spawn().unwrap();
+    let mut child = command
+        .spawn()
+        .unwrap_or_else(|error| panic!("Unix peer fixture invariant failed: {error:?}"));
     let deadline = Instant::now() + Duration::from_secs(25);
     loop {
-        if child.try_wait().unwrap().is_some() {
+        if child
+            .try_wait()
+            .unwrap_or_else(|error| panic!("Unix peer fixture invariant failed: {error:?}"))
+            .is_some()
+        {
             break;
         }
         if Instant::now() >= deadline {
-            child.kill().expect("kill exact fixture child");
-            let output = child.wait_with_output().unwrap();
+            child
+                .kill()
+                .unwrap_or_else(|error| panic!("kill exact fixture child: {error:?}"));
+            let output = child
+                .wait_with_output()
+                .unwrap_or_else(|error| panic!("Unix peer fixture invariant failed: {error:?}"));
             panic!(
                 "peer fixture timed out: {}",
                 String::from_utf8_lossy(&output.stderr)
@@ -62,7 +73,9 @@ fn case(name: &str, policy: Option<&str>) {
         }
         std::thread::sleep(Duration::from_millis(10));
     }
-    let output = child.wait_with_output().unwrap();
+    let output = child
+        .wait_with_output()
+        .unwrap_or_else(|error| panic!("Unix peer fixture invariant failed: {error:?}"));
     assert!(
         output.status.success(),
         "case {name}: stdout={} stderr={}",
@@ -221,25 +234,32 @@ async fn connect_once(
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    let mut server = command.spawn().unwrap();
+    let mut server = command
+        .spawn()
+        .unwrap_or_else(|error| panic!("Unix peer fixture invariant failed: {error:?}"));
     tokio::time::timeout(Duration::from_secs(3), async {
         while !ready.exists() {
             assert!(
-                server.try_wait().unwrap().is_none(),
+                server
+                    .try_wait()
+                    .unwrap_or_else(|error| panic!("Unix peer fixture invariant failed: {error:?}"))
+                    .is_none(),
                 "fixture server exited before binding"
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
-    .expect("bounded fixture bind");
+    .unwrap_or_else(|error| panic!("bounded fixture bind: {error:?}"));
     let result = tokio::time::timeout(
         Duration::from_secs(10),
         RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
             interactive_client: false,
             required_human_approval: false,
             endpoint: RemoteAppServerEndpoint::UnixSocket {
-                socket_path: AbsolutePathBuf::from_absolute_path(socket).unwrap(),
+                socket_path: AbsolutePathBuf::from_absolute_path(socket).unwrap_or_else(|error| {
+                    panic!("Unix peer fixture invariant failed: {error:?}")
+                }),
             },
             client_name: "unix-peer-fixture".into(),
             client_version: "source-test".into(),
@@ -250,30 +270,36 @@ async fn connect_once(
         }),
     )
     .await
-    .expect("bounded real client connection");
+    .unwrap_or_else(|error| panic!("bounded real client connection: {error:?}"));
     match refusal {
         Some(expected) => match result {
             Ok(_) => panic!("wrong/invalid peer was admitted"),
             Err(error) => assert_eq!(error.kind(), expected),
         },
         None => {
-            let client = result.expect("eligible or ordinary connection initializes");
+            let client = result.unwrap_or_else(|error| {
+                panic!("eligible or ordinary connection initializes: {error:?}")
+            });
             tokio::time::timeout(Duration::from_secs(3), client.shutdown())
                 .await
-                .unwrap()
-                .unwrap();
+                .unwrap_or_else(|error| panic!("Unix peer fixture invariant failed: {error:?}"))
+                .unwrap_or_else(|error| panic!("Unix peer fixture invariant failed: {error:?}"));
         }
     }
     let output = tokio::time::timeout(Duration::from_secs(3), server.wait_with_output())
         .await
-        .unwrap()
-        .unwrap();
+        .unwrap_or_else(|error| panic!("Unix peer fixture invariant failed: {error:?}"))
+        .unwrap_or_else(|error| panic!("Unix peer fixture invariant failed: {error:?}"));
     assert!(
         output.status.success(),
         "fixture server: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let evidence: Value = serde_json::from_slice(&std::fs::read(observed).unwrap()).unwrap();
+    let evidence: Value = serde_json::from_slice(
+        &std::fs::read(observed)
+            .unwrap_or_else(|error| panic!("Unix peer fixture invariant failed: {error:?}")),
+    )
+    .unwrap_or_else(|error| panic!("Unix peer fixture invariant failed: {error:?}"));
     if refusal.is_some() {
         assert_eq!(
             evidence,
@@ -316,9 +342,9 @@ fn peer_server_helper() {
             std::fs::write(observed, json!({"initialize": true, "initialized": true}).to_string()).unwrap();
             // Let the client own shutdown; do not generate a spurious transport
             // error while it is completing the initialization handshake.
-            while let Some(message) = websocket.next().await {
+            if let Some(message) = websocket.next().await {
                 match message.unwrap() {
-                    Message::Close(_) => { let _ = websocket.flush().await; break; }
+                    Message::Close(_) => { let _ = websocket.flush().await; }
                     other => panic!("unexpected post-initialize frame {other:?}"),
                 }
             }
