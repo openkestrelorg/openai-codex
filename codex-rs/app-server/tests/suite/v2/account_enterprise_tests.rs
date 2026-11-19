@@ -417,6 +417,7 @@ async fn enterprise_login_attempt_lifecycle() -> Result<()> {
         .enable_feature(Feature::UseXaa)
         .disable_feature(Feature::SecretAuthStorage)
         .disable_feature(Feature::Apps)
+        .disable_feature(Feature::Plugins)
         .with_root_config(&format!(
             r#"cli_auth_credentials_store = "file"
 chatgpt_base_url = "{origin}/backend-api"
@@ -1675,6 +1676,7 @@ async fn enterprise_login_setup_is_cancelled_by_account_changes() -> Result<()> 
             .enable_feature(Feature::UseXaa)
             .disable_feature(Feature::SecretAuthStorage)
             .disable_feature(Feature::Apps)
+            .disable_feature(Feature::Plugins)
             .with_root_config(&format!(
                 r#"cli_auth_credentials_store = "file"
 chatgpt_base_url = "{origin}/backend-api"
