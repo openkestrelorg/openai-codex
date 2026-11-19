@@ -1486,16 +1486,13 @@ async fn enterprise_rpc(
     let request = serde_json::from_value(
         json!({"id":uuid::Uuid::new_v4().to_string(),"method":method,"params":params}),
     )?;
-    eprintln!("enterprise RPC diagnostic: begin {method}");
     let response = timeout(DEFAULT_READ_TIMEOUT, client.request(request))
         .await
         .with_context(|| format!("timed out waiting for {method}"))??;
-    eprintln!("enterprise RPC diagnostic: end {method}");
     response.map_err(|error| anyhow::anyhow!("{method}: {}", error.message))
 }
 
 async fn enterprise_completion(client: &mut InProcessClientHandle) -> Result<Value> {
-    eprintln!("enterprise RPC diagnostic: completion begin");
     timeout(DEFAULT_READ_TIMEOUT, async {
         loop {
             match client
@@ -1507,7 +1504,6 @@ async fn enterprise_completion(client: &mut InProcessClientHandle) -> Result<Val
                     if let ServerNotification::McpServerOauthLoginCompleted(notification) =
                         *notification
                     {
-                        eprintln!("enterprise RPC diagnostic: completion end");
                         return Ok(serde_json::to_value(notification)?);
                     }
                 }

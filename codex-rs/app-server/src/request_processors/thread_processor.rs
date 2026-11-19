@@ -754,14 +754,15 @@ impl ThreadRequestProcessor {
         app_server_client_name: Option<String>,
         app_server_client_version: Option<String>,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
-        let (response, thread_id) = self
-            .thread_revert_response(
+        let (response, thread_id) = box_thread_start_future(|| {
+            self.thread_revert_response(
                 &request_id,
                 params,
                 app_server_client_name,
                 app_server_client_version,
             )
-            .await?;
+        })
+        .await?;
         self.outgoing.send_response(request_id, response).await;
         self.outgoing
             .send_server_notification(ServerNotification::ThreadReverted(
