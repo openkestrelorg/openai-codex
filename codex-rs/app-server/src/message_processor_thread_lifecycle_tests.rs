@@ -593,6 +593,7 @@ decision = "prompt-user"
     let config = Arc::new(
         ConfigBuilder::default()
             .codex_home(home.path().to_path_buf())
+            .cli_overrides(vec![("features.plugins".to_string(), false.into())])
             .build()
             .await?,
     );
