@@ -1013,7 +1013,9 @@ async fn exec(
         .as_ref()
         .map(SandboxCleanupCustody::inherited_fds)
         .unwrap_or_default();
-    let (program, args) = command.split_first().expect("validated nonempty command");
+    let (program, args) = command
+        .split_first()
+        .unwrap_or_else(|| panic!("validated nonempty command"));
     let arg0_ref = arg0.as_deref();
     let spawned = spawn_child_async(SpawnChildRequest {
         program: PathBuf::from(program),

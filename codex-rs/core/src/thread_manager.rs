@@ -2435,7 +2435,7 @@ impl ThreadManagerState {
                 .session
                 .services
                 .local_agent_runtime
-                .pin_v2_residency(&thread)
+                .pin_v2_residency(thread)
                 .await?
         } else {
             None
@@ -2829,7 +2829,7 @@ impl ThreadManagerState {
         {
             account_work
                 .as_deref()
-                .map(|work| work.derive_operation())
+                .map(codex_extension_api::HostOperationWork::derive_operation)
                 .transpose()
                 .map_err(|_| {
                     CodexErr::Fatal(

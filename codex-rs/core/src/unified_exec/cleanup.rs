@@ -132,7 +132,7 @@ impl SandboxCleanup {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .custody
             .as_ref()
-            .expect("custody precedes spawn")
+            .unwrap_or_else(|| panic!("custody precedes spawn"))
             .attach_to_launcher_argv(command)
     }
 
@@ -142,7 +142,7 @@ impl SandboxCleanup {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .custody
             .as_ref()
-            .expect("custody precedes spawn")
+            .unwrap_or_else(|| panic!("custody precedes spawn"))
             .inherited_fds()
     }
 
@@ -152,7 +152,7 @@ impl SandboxCleanup {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .custody
             .as_mut()
-            .expect("custody precedes collection")
+            .unwrap_or_else(|| panic!("custody precedes collection"))
             .spawned_with_pin(pin);
     }
 
@@ -190,7 +190,10 @@ impl SandboxCleanup {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if state.result.is_none() {
-                let custody = state.custody.take().expect("one original custody");
+                let custody = state
+                    .custody
+                    .take()
+                    .unwrap_or_else(|| panic!("one original custody"));
                 state.result = Some(retained_collection(
                     custody.collect(RETIRE_GRACE),
                     Arc::clone(&self.operation),
@@ -199,7 +202,7 @@ impl SandboxCleanup {
             state
                 .result
                 .as_ref()
-                .expect("initialized original collection")
+                .unwrap_or_else(|| panic!("initialized original collection"))
                 .clone()
         };
         result.await

@@ -154,6 +154,7 @@ impl Mailbox {
         self.state.lock().expect("mailbox poisoned").eviction_fenced
     }
 
+    #[cfg(test)]
     pub(super) fn drain_for_eviction(
         &self,
     ) -> Result<Vec<PendingMailboxCommunication>, (Vec<PendingMailboxCommunication>, &'static str)>

@@ -70,7 +70,7 @@ impl CapturedConstructionWork {
     pub(crate) fn derive(&self) -> Result<Self, codex_extension_api::TurnWorkRefused> {
         self.0
             .as_deref()
-            .map(|work| work.derive_operation())
+            .map(codex_extension_api::HostOperationWork::derive_operation)
             .transpose()
             .map(Self)
     }

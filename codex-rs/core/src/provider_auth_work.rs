@@ -32,7 +32,9 @@ pub(crate) fn require_initial_work(
     work: Option<&dyn McpAttemptWork>,
     host: Option<&dyn codex_extension_api::TurnStartAdmission>,
 ) -> Result<()> {
-    if work.is_none() && host.is_some_and(|host| host.requires_account_work()) {
+    if work.is_none()
+        && host.is_some_and(codex_extension_api::TurnStartAdmission::requires_account_work)
+    {
         return Err(AuthTaskFailure::Refused.error());
     }
     Ok(())

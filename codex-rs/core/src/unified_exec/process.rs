@@ -445,6 +445,7 @@ impl UnifiedExecProcess {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(super) async fn from_spawned(
         spawned: SpawnedPty,
         sandbox_type: SandboxType,
@@ -514,6 +515,7 @@ impl UnifiedExecProcess {
         Ok(managed)
     }
 
+    #[cfg(test)]
     pub(super) async fn from_exec_server_started(
         started: StartedExecProcess,
         output_drain_policy: OutputDrainPolicy,

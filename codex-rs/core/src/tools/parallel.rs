@@ -207,7 +207,7 @@ impl ToolCallRuntime {
         // custody. Dropping one waiter cannot release another task's operation.
         let dispatch_work = match operation_work
             .as_deref()
-            .map(|work| work.derive_operation())
+            .map(codex_extension_api::HostOperationWork::derive_operation)
             .transpose()
         {
             Ok(work) => work,

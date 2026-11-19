@@ -100,7 +100,7 @@ pub(crate) async fn review_tool_call(
     }
     let preparation_work = work
         .as_deref()
-        .map(|work| work.derive_operation())
+        .map(codex_extension_api::HostOperationWork::derive_operation)
         .transpose()
         .map_err(|_| CodexErr::Fatal("Guardian request preparation work refused".into()))?
         .map(|work| {

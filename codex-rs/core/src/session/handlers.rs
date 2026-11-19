@@ -655,7 +655,7 @@ pub(super) async fn submission_loop_with_dispatch(
                 if update.is_err() {
                     catalog_updates = None;
                 } else {
-                    let _work = match submissions.as_ref().map(|control| control.begin_work()) {
+                    let _work = match submissions.as_ref().map(super::submission::SubmissionDispatch::begin_work) {
                         Some(Some(work)) => Some(work),
                         Some(None) => continue,
                         None => None,
@@ -676,7 +676,7 @@ pub(super) async fn submission_loop_with_dispatch(
             } => {
                 match update {
                     Ok(true) => {
-                    let _work = match submissions.as_ref().map(|control| control.begin_work()) {
+                    let _work = match submissions.as_ref().map(super::submission::SubmissionDispatch::begin_work) {
                         Some(Some(work)) => Some(work),
                         Some(None) => continue,
                         None => None,
@@ -699,7 +699,7 @@ pub(super) async fn submission_loop_with_dispatch(
                 continue;
             }
             _ = sess.input_queue.completion_wake.notified(), if mailbox_start.is_none() => {
-                let work = match submissions.as_ref().map(|control| control.begin_work()) {
+                let work = match submissions.as_ref().map(super::submission::SubmissionDispatch::begin_work) {
                     Some(Some(work)) => Some(work),
                     Some(None) => continue,
                     None => None,
@@ -711,7 +711,7 @@ pub(super) async fn submission_loop_with_dispatch(
                 }));
                 continue;
             }
-            _ = async { mailbox_start.as_mut().expect("guarded mailbox start").await }, if mailbox_start.is_some() => {
+            _ = async { mailbox_start.as_mut().unwrap_or_else(|| panic!("guarded mailbox start")).await }, if mailbox_start.is_some() => {
                 mailbox_start = None;
                 continue;
             }
@@ -719,7 +719,9 @@ pub(super) async fn submission_loop_with_dispatch(
         if matches!(&sub.op, Op::Shutdown) {
             drop(mailbox_start.take());
         }
-        let _dispatch = submissions.as_ref().map(|submissions| submissions.begin());
+        let _dispatch = submissions
+            .as_ref()
+            .map(super::submission::SubmissionDispatch::begin);
         debug!(
             thread_id = %sess.thread_id(),
             submission_id = %sub.id,
@@ -1050,7 +1052,7 @@ pub(super) async fn submission_loop_with_dispatch(
                     mailbox_retry = Box::pin(sess.input_queue.work_retry.wait());
                     sess.input_queue.completion_wake.notify_one();
                 }
-                _ = async { mailbox_start.as_mut().expect("guarded mailbox start").await }, if mailbox_start.is_some() => {
+                _ = async { mailbox_start.as_mut().unwrap_or_else(|| panic!("guarded mailbox start")).await }, if mailbox_start.is_some() => {
                     mailbox_start = None;
                 }
             }

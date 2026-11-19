@@ -136,6 +136,7 @@ impl SandboxCleanupCensus {
 
     /// Records a receipt-bearing operation's cleanup and hands back its
     /// result unchanged: an error is the operation's, the receipt cleanup's.
+    #[cfg(test)]
     pub(crate) fn record_outcome<T>(
         &self,
         may_have_launched: bool,

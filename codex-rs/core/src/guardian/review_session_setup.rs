@@ -90,7 +90,7 @@ impl GuardianInvocationSetup {
         let work = self
             .work
             .as_deref()
-            .map(|work| work.derive_operation())
+            .map(codex_extension_api::HostOperationWork::derive_operation)
             .transpose()
             .map_err(|_| {
                 anyhow::anyhow!("Guardian invocation cannot admit reviewer construction")
@@ -287,7 +287,7 @@ impl PreparedGuardianContext {
                 .get_or_init(|| self.parent.get_tx_event());
         }
         let io = SessionIo {
-            tx_sub: (thread.io.tx_sub.clone()).into(),
+            tx_sub: thread.io.tx_sub.clone(),
             rx_event: thread.io.rx_event.clone(),
             agent_status: thread.io.agent_status.clone(),
             session_loop_termination: thread.io.session_loop_termination.clone(),
@@ -656,7 +656,7 @@ async fn prepare_review_with_authority(
     }
     let preparation_work = work
         .as_deref()
-        .map(|work| work.derive_operation())
+        .map(codex_extension_api::HostOperationWork::derive_operation)
         .transpose()
         .map_err(|_| anyhow::anyhow!("Guardian preparation work refused"))?
         .map(|work| {
@@ -716,7 +716,7 @@ pub async fn prepare_review_prewarm_invocation(
     );
     let preparation_work = work
         .as_deref()
-        .map(|work| work.derive_operation())
+        .map(codex_extension_api::HostOperationWork::derive_operation)
         .transpose()
         .map_err(|_| anyhow::anyhow!("Guardian prewarm work refused"))?
         .map(|work| {

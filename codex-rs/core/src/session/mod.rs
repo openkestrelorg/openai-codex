@@ -1354,7 +1354,7 @@ impl Session {
             ));
         termination.cleanup_owner = Some(cleanup_owner);
         let io = SessionIo {
-            tx_sub: tx_sub.into(),
+            tx_sub,
             rx_event,
             agent_status: agent_status_rx,
             session_loop_termination: termination,

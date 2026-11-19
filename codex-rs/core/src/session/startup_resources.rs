@@ -234,7 +234,11 @@ impl StartupResources {
                     .shared(),
                 );
             }
-            state.completion.as_ref().unwrap().clone()
+            state
+                .completion
+                .as_ref()
+                .unwrap_or_else(|| panic!("startup completion initialized"))
+                .clone()
         };
         let mut changes = self.deadline_changed.subscribe();
         loop {

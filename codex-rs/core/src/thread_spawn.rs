@@ -197,7 +197,7 @@ pub(crate) async fn prepare(
             config,
             source: spawn_source,
             options: SpawnAgentOptions {
-                parent_authority: Some(crate::ParentTurnAuthority::capture(&session, &turn.sub_id)),
+                parent_authority: Some(crate::ParentTurnAuthority::capture(session, &turn.sub_id)),
                 fork_parent_spawn_call_id: fork_mode.as_ref().map(|_| call_id.to_string()),
                 fork_mode,
                 parent_thread_id: Some(session.thread_id),

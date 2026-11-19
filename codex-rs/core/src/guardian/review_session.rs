@@ -430,7 +430,7 @@ async fn run_review_on_session(
             Ok(Err(error)) => {
                 return ReviewSessionResult {
                     outcome: GuardianReviewSessionOutcome::SessionFailed {
-                        error: error.into(),
+                        error,
                         error_info: None,
                         retry_at: None,
                     },

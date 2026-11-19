@@ -1,6 +1,5 @@
 //! New recovery observations never rewrite the original retirement transaction.
 use super::CodexThread;
-use super::ThreadCleanupOutcome;
 use super::ThreadLoopOutcome;
 use super::ThreadShutdownOutcome;
 use crate::session::SessionLoopOutcome;

@@ -181,6 +181,7 @@ impl InputQueue {
         (activity_rx, pending_activity)
     }
 
+    #[cfg(test)]
     pub(crate) async fn enqueue_mailbox_communication(
         &self,
         communication: crate::PendingAgentMessage,
