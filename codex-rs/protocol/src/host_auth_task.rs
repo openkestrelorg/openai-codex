@@ -109,7 +109,7 @@ fn dispatch_provider_task(
         // its caller's still-live spawner or fall back to unmanaged auth work.
         let refusal = Context {
             spawner: Arc::new(RefusedDeferredAuthTask),
-            failure: context.failure.clone(),
+            failure: context.failure,
         };
         AUTH_TASK_CONTEXT.sync_scope(refusal, || drop(future));
         return Err(reason);
