@@ -2973,7 +2973,7 @@ fn fenced_setup_fixture() -> (
     let initial = CodexAuth::from_external_chatgpt_tokens(
         &fenced_setup_token("user-a", "initial"),
         "workspace-a",
-        None,
+        /*chatgpt_plan_type*/ None,
     )
     .unwrap();
     let manager = AuthManager::from_auth_for_testing_with_home(initial, home.path().to_path_buf());
@@ -2990,7 +2990,7 @@ fn fenced_setup_fixture() -> (
             token: fenced_setup_token("user-a", "refreshed"),
             workspace: "workspace-a".into(),
         },
-        setup_calls: AtomicUsize::new(0),
+        setup_calls: AtomicUsize::new(/*v*/ 0),
     });
     let mut client = test_model_client(SessionSource::Exec);
     Arc::get_mut(&mut client.state).unwrap().provider = provider.clone();
@@ -3022,7 +3022,7 @@ async fn fenced_client_setup_refuses_owner_change_before_any_provider_resolution
             home.path(),
             &fenced_setup_token(user, "replacement"),
             workspace,
-            None,
+            /*chatgpt_plan_type*/ None,
         )
         .unwrap();
         manager.reload().await;
