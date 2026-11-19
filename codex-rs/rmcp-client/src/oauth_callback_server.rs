@@ -353,24 +353,22 @@ mod tests {
             .expect("bind callback listener");
         let address = listener.local_addr().expect("listener address");
         let closed = CancellationToken::new();
-        let owner = ListenerOwner {
-            listener,
-            _closed: closed.clone().drop_guard(),
-        };
-        let (requests, _receiver) = mpsc::channel(1);
-        let handle = tokio::spawn(accept(
-            owner,
-            requests,
-            Weak::new(),
-            CancellationToken::new(),
-        ));
-        handle.abort();
-        assert!(
-            handle
-                .await
-                .expect_err("unpolled acceptor cancelled")
-                .is_cancelled()
-        );
+        let (server, _requests) =
+            Server::start(listener, closed.clone()).expect("start callback server");
+        // The current-thread runtime cannot poll the production acceptor before
+        // this abort. Exercise Server::start rather than rebuilding its owner.
+        server.close();
+        server
+            .state
+            .lock()
+            .expect("callback state")
+            .acceptor
+            .as_ref()
+            .expect("owned acceptor")
+            .abort
+            .abort();
+        let report = server.wait().await;
+        assert_eq!(report.acceptor, WorkerOutcome::Cancelled);
         assert!(closed.is_cancelled());
         let _rebound = TcpListener::bind(address)
             .await
