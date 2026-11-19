@@ -2958,7 +2958,14 @@ async fn inference_tools_changes_follow_full_specs_across_turns() {
 }
 
 fn fenced_setup_token(user: &str, revision: &str) -> String {
-    let claims = json!({"jti": revision, "https://api.openai.com/auth": {"chatgpt_user_id": user}});
+    let claims = json!({
+        "iss": "https://issuer.invalid",
+        "session_id": "fenced-setup-session",
+        "sub": user,
+        "client_id": "fenced-setup-test",
+        "jti": revision,
+        "https://api.openai.com/auth": {"chatgpt_user_id": user}
+    });
     let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims.to_string());
     format!("header.{payload}.signature")
 }
@@ -3000,7 +3007,8 @@ fn fenced_setup_fixture() -> (
 
 #[tokio::test]
 async fn fenced_client_setup_allows_same_owner_credential_refresh() {
-    let (_home, _manager, provider, client) = fenced_setup_fixture();
+    let (_home, manager, provider, client) = fenced_setup_fixture();
+    let before = *manager.auth_change_state_receiver().borrow();
     let setup = client
         .current_client_setup(super::ClientRouting::ConfiguredProvider)
         .await
@@ -3012,6 +3020,20 @@ async fn fenced_client_setup_allows_same_owner_credential_refresh() {
         &format!("Bearer {}", fenced_setup_token("user-a", "refreshed"))
     );
     assert_eq!(provider.setup_calls.load(Ordering::SeqCst), 2);
+    let after = *manager.auth_change_state_receiver().borrow();
+    assert!(after.generation > before.generation);
+    assert_eq!(
+        (
+            after.owner_generation,
+            after.source_generation,
+            after.login_generation
+        ),
+        (
+            before.owner_generation,
+            before.source_generation,
+            before.login_generation
+        )
+    );
 }
 
 #[tokio::test]
