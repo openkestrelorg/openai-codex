@@ -325,3 +325,105 @@ fn expired_envelope_retains_valid_ownership_but_never_constructs_usable_auth() {
     invalid.principal = "different-principal".into();
     assert!(invalid.validate().is_err());
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn command_gate_timeout_refuses_without_invoking_the_provider() {
+    let home = TempDir::new().unwrap();
+    let record = envelope(1);
+    command_store::commit(home.path(), &record, &record.auth().unwrap()).unwrap();
+    let before = std::fs::read(home.path().join("auth.json")).unwrap();
+    let source = session_with_state(home.path(), record.clone());
+    let backoff = source.retry_after.load(Ordering::Acquire);
+    let _held = source.gate.acquire().await.unwrap();
+    let error = source.obtain(None).await.err().expect("gate must time out");
+    assert_eq!(error.to_string(), "command gate timeout");
+    assert!(source.state.lock().unwrap().as_ref() == Some(&record));
+    assert_eq!(source.retry_after.load(Ordering::Acquire), backoff);
+    assert!(source.rejected.lock().unwrap().is_empty());
+    assert_eq!(
+        std::fs::read(home.path().join("auth.json")).unwrap(),
+        before
+    );
+    assert!(!source.selection.command.exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn provider_exchange_timeout_reaps_the_process_group_before_returning() {
+    use std::os::unix::fs::PermissionsExt;
+
+    unsafe extern "C" {
+        fn kill(pid: i32, signal: i32) -> i32;
+    }
+    // Keep a failed assertion from leaving the synthetic provider group alive.
+    struct FixtureGroup(i32);
+    impl Drop for FixtureGroup {
+        fn drop(&mut self) {
+            // SAFETY: the PID comes from this test's private provider fixture.
+            if self.0 > 1 {
+                unsafe { kill(-self.0, 9) };
+            }
+        }
+    }
+
+    let home = TempDir::new().unwrap();
+    let record = envelope(1);
+    command_store::commit(home.path(), &record, &record.auth().unwrap()).unwrap();
+    let before = std::fs::read(home.path().join("auth.json")).unwrap();
+    let source = session_with_state(home.path(), record.clone());
+    let backoff = source.retry_after.load(Ordering::Acquire);
+    std::fs::write(
+        &source.selection.command,
+        "#!/bin/sh\ntrap '' TERM\nfixture_dir=${0%/*}\nprintf '%s\\n' \"$$\" > \"$fixture_dir/provider.pid\"\n/bin/sleep 60 &\nprintf '%s\\n' \"$!\" > \"$fixture_dir/child.pid\"\nexec /bin/sleep 60\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(
+        &source.selection.command,
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    // invoke exposes the timeout; obtain may intentionally return cached auth.
+    let error = source
+        .invoke(None)
+        .await
+        .err()
+        .expect("provider must time out");
+    assert_eq!(error.to_string(), "provider timeout");
+    let read_pid = |name| -> i32 {
+        std::fs::read_to_string(home.path().join(name))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    };
+    let provider = read_pid("provider.pid");
+    let child = read_pid("child.pid");
+    assert!(provider > 1 && child > 1 && provider != child);
+    let mut cleanup = FixtureGroup(provider);
+    for pid in [provider, child] {
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            // SAFETY: signal zero only observes the synthetic fixture PID.
+            let result = unsafe { kill(pid, 0) };
+            if result == -1 {
+                assert_eq!(
+                    std::io::Error::last_os_error().raw_os_error(),
+                    Some(libc::ESRCH)
+                );
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < until,
+                "provider process outlived timeout: {pid}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+    assert!(source.state.lock().unwrap().as_ref() == Some(&record));
+    assert_eq!(source.retry_after.load(Ordering::Acquire), backoff);
+    assert_eq!(
+        std::fs::read(home.path().join("auth.json")).unwrap(),
+        before
+    );
+}
