@@ -131,7 +131,7 @@ pub(super) async fn create_spawn(
     } else {
         captured_account_work
             .as_ref()
-            .map(crate::thread_manager::account_work::CapturedConstructionWork::derive)
+            .map(crate::thread_manager::CapturedConstructionWork::derive)
             .transpose()
             .map_err(|_| {
                 CodexErr::Fatal(
