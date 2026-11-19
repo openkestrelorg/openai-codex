@@ -123,6 +123,207 @@ fn killed_launch_leftover(fixture: &Fixture, path: &Path) -> String {
     key
 }
 
+/// A real second holder stays alive until its owned stdin is closed.
+struct LiveHolder {
+    child: Option<std::process::Child>,
+    token: ProcessToken,
+}
+
+impl LiveHolder {
+    fn new() -> Self {
+        let mut child = std::process::Command::new("cat")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn live holder");
+        let pid = libc::pid_t::try_from(child.id()).expect("pid fits pid_t");
+        let token = match ProcessToken::for_pid(pid) {
+            Ok(token) => token,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("capture live holder: {error}");
+            }
+        };
+        let holder = Self {
+            child: Some(child),
+            token,
+        };
+        assert_eq!(liveness(&holder.token), Liveness::Alive);
+        holder
+    }
+
+    fn finish(mut self) {
+        let mut child = self.child.take().expect("owned child");
+        drop(child.stdin.take());
+        assert!(child.wait().expect("reap holder").success());
+        // The child is reaped and disarmed before any further assertion.
+        assert_eq!(liveness(&self.token), Liveness::Terminated);
+    }
+}
+
+impl Drop for LiveHolder {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            drop(child.stdin.take());
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+#[test]
+fn missing_empty_file_target_is_installed_and_reaped() {
+    let fixture = fixture();
+    let path = fixture.work.path().join(".git");
+    let launch = own_token();
+    let registrations = register(&fixture, &[SyntheticMountTarget::missing(&path)], &launch);
+    assert!(path.is_file());
+    assert_eq!(fs::metadata(&path).expect("target metadata").len(), 0);
+    let census = release(
+        &fixture,
+        &registrations,
+        &launch,
+        SandboxProof::Gone,
+        &mut NamespaceScan::default(),
+    );
+    assert_eq!(census, vec![(path.clone(), TargetOutcome::Reaped)]);
+    assert!(!path.exists());
+    assert!(!fixture.registry.at(&registrations[0].key).exists());
+}
+
+#[test]
+fn non_empty_installed_file_is_preserved() {
+    let fixture = fixture();
+    let path = fixture.work.path().join(".git");
+    let launch = own_token();
+    let registrations = register(&fixture, &[SyntheticMountTarget::missing(&path)], &launch);
+    fs::write(&path, "keep").expect("populate target");
+    let census = release(
+        &fixture,
+        &registrations,
+        &launch,
+        SandboxProof::Gone,
+        &mut NamespaceScan::default(),
+    );
+    assert_eq!(
+        census,
+        vec![(
+            path.clone(),
+            TargetOutcome::Incomplete(IncompleteReason::NotEmpty)
+        )]
+    );
+    assert_eq!(fs::read_to_string(&path).expect("preserved target"), "keep");
+    assert_eq!(
+        fixture
+            .registry
+            .records(&registrations[0].key)
+            .expect("preserved record")
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn installed_target_gone_before_release_is_absent() {
+    let fixture = fixture();
+    let path = fixture.work.path().join(".git");
+    let launch = own_token();
+    let registrations = register(&fixture, &[SyntheticMountTarget::missing(&path)], &launch);
+    fs::remove_file(&path).expect("remove target before cleanup");
+    let census = release(
+        &fixture,
+        &registrations,
+        &launch,
+        SandboxProof::Gone,
+        &mut NamespaceScan::default(),
+    );
+    assert_eq!(census, vec![(path.clone(), TargetOutcome::Absent)]);
+    assert!(!path.exists());
+    assert!(!fixture.registry.at(&registrations[0].key).exists());
+}
+
+#[test]
+fn a_live_second_holder_receives_the_target_and_the_last_holder_reaps_it() {
+    let fixture = fixture();
+    let path = fixture.work.path().join(".git");
+    let launch = own_token();
+    let registrations = register(&fixture, &[dir_target(&path)], &launch);
+    let child = LiveHolder::new();
+    let other = child.token.clone();
+    let joined = register(&fixture, &[dir_target(&path)], &other);
+    assert_eq!(joined[0].key, registrations[0].key);
+    assert_eq!(
+        joined[0].holder.as_ref().map(|holder| holder.role),
+        Some(HolderRole::Join)
+    );
+    assert!(joined[0].held.is_some());
+    let census = release(
+        &fixture,
+        &registrations,
+        &launch,
+        SandboxProof::Gone,
+        &mut NamespaceScan::default(),
+    );
+    assert_eq!(census, vec![(path.clone(), TargetOutcome::HandedOff)]);
+    assert!(path.is_dir());
+    assert!(fixture.registry.at(&registrations[0].key).exists());
+    child.finish();
+    let census = release(
+        &fixture,
+        &joined,
+        &other,
+        SandboxProof::Gone,
+        &mut NamespaceScan::default(),
+    );
+    assert_eq!(census, vec![(path.clone(), TargetOutcome::Reaped)]);
+    assert!(!path.exists());
+    assert!(!fixture.registry.at(&joined[0].key).exists());
+}
+
+#[test]
+fn a_codex_created_file_joined_by_a_live_owner_outlives_its_creator() {
+    let fixture = fixture();
+    let path = fixture.work.path().join(".git");
+    let launch = own_token();
+    let registrations = register(&fixture, &[SyntheticMountTarget::missing(&path)], &launch);
+    let child = LiveHolder::new();
+    let other = child.token.clone();
+    let metadata = fs::symlink_metadata(&path).expect("created target metadata");
+    let joined = register(
+        &fixture,
+        &[SyntheticMountTarget::existing_empty_file(&path, &metadata)],
+        &other,
+    );
+    assert_eq!(joined[0].key, registrations[0].key);
+    assert_eq!(
+        joined[0].holder.as_ref().map(|holder| holder.role),
+        Some(HolderRole::Join)
+    );
+    assert!(joined[0].held.is_some());
+    let census = release(
+        &fixture,
+        &registrations,
+        &launch,
+        SandboxProof::Gone,
+        &mut NamespaceScan::default(),
+    );
+    assert_eq!(census, vec![(path.clone(), TargetOutcome::HandedOff)]);
+    assert!(path.is_file());
+    assert_eq!(fs::metadata(&path).expect("held target metadata").len(), 0);
+    child.finish();
+    let census = release(
+        &fixture,
+        &joined,
+        &other,
+        SandboxProof::Gone,
+        &mut NamespaceScan::default(),
+    );
+    assert_eq!(census, vec![(path.clone(), TargetOutcome::Reaped)]);
+    assert!(!path.exists());
+    assert!(!fixture.registry.at(&joined[0].key).exists());
+}
+
 #[test]
 fn creation_evidence_and_running_receipt_precede_bubblewrap() {
     let fixture = fixture();
