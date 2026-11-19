@@ -259,6 +259,7 @@ fn sha256_file(path: &Path) -> io::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codex_utils_absolute_path::AbsolutePathBuf;
     use pretty_assertions::assert_eq;
 
     fn publication(path: PathBuf, artifact: &Path) -> ManagedTargetRecordPublication {
@@ -282,7 +283,8 @@ mod tests {
         // disposable parent processes instead of racing this unit test.
         assert!(std::env::var_os(MANAGED_TARGET_RECORD_ENV_VAR).is_none());
         let directory = tempfile::tempdir().unwrap();
-        let socket_path = directory.path().join("control.sock");
+        let socket_path =
+            AbsolutePathBuf::from_absolute_path(directory.path().join("control.sock")).unwrap();
         let mut setup = ManagedTargetRecordSetup::from_env(&AppServerTransport::UnixSocket {
             socket_path: socket_path.clone(),
         })
