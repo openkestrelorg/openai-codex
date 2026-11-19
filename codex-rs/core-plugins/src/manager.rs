@@ -335,9 +335,11 @@ impl Drop for AsyncPluginWorkerReset {
                     state.in_flight = false;
                     std::mem::take(&mut state.requests)
                 };
-                abandoned.iter().fold(false, |managed, request| {
-                    request.mark_unavailable() || managed
-                })
+                let mut managed = false;
+                for request in &abandoned {
+                    managed |= request.mark_unavailable();
+                }
+                managed
             }
         };
         if managed {
@@ -427,7 +429,9 @@ struct RuntimePluginCallback {
 }
 impl RuntimePluginCallback {
     fn call(&self, change: EffectivePluginsChange) {
-        self.callback.as_ref().expect("callback capture is live")(change);
+        self.callback
+            .as_ref()
+            .unwrap_or_else(|| panic!("callback capture is live"))(change);
     }
 }
 
@@ -3762,7 +3766,7 @@ impl PluginsManager {
                 let mut previous = state
                     .requests
                     .remove(index)
-                    .expect("selected pending catalog request");
+                    .unwrap_or_else(|| panic!("selected pending catalog request"));
                 request
                     .request
                     .scopes

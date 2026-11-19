@@ -337,7 +337,10 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     fn probe_command(name: &str, mode: &str) -> Command {
-        let mut command = Command::new(std::env::current_exe().unwrap());
+        let mut command = Command::new(
+            std::env::current_exe()
+                .unwrap_or_else(|error| panic!("current test executable: {error:?}")),
+        );
         command
             .args(["--exact", name, "--nocapture"])
             .env("K169_OWNED_PROCESS_PROBE", mode);

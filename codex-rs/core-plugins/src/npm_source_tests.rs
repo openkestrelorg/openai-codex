@@ -135,10 +135,10 @@ async fn managed_npm_pack_preserves_arguments_and_reaps_on_late_deadline() {
         .unwrap();
     let pid: i32 = tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
-            if let Ok(raw) = fs::read_to_string(&ready) {
-                if let Ok(pid) = raw.parse() {
-                    break pid;
-                }
+            if let Ok(raw) = fs::read_to_string(&ready)
+                && let Ok(pid) = raw.parse()
+            {
+                break pid;
             }
             tokio::task::yield_now().await;
         }

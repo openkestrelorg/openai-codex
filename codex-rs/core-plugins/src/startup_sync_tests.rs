@@ -1558,10 +1558,10 @@ async fn late_shutdown_reaps_the_actual_in_flight_git_child() {
         .unwrap();
     let pid = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            if let Ok(raw) = tokio::fs::read_to_string(&marker).await {
-                if let Ok(pid) = raw.trim().parse::<libc::pid_t>() {
-                    break pid;
-                }
+            if let Ok(raw) = tokio::fs::read_to_string(&marker).await
+                && let Ok(pid) = raw.trim().parse::<libc::pid_t>()
+            {
+                break pid;
             }
             tokio::task::yield_now().await;
         }

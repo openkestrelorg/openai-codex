@@ -820,10 +820,15 @@ async fn cloud_reads_require_live_invocation_work_even_for_cached_contents() {
     };
     counts.refuse.store(true, Ordering::SeqCst);
     {
+        // Deliberately keep the catalog lock held across exactly one synchronous poll:
+        // invocation-work refusal must complete before any catalog access.
         let _catalog = state.catalog_state.lock().unwrap();
         let mut read = Box::pin(state.read_skill(&providers, request.clone()));
         assert!(matches!(
-            futures::poll!(&mut read),
+            std::future::Future::poll(
+                read.as_mut(),
+                &mut std::task::Context::from_waker(std::task::Waker::noop()),
+            ),
             std::task::Poll::Ready(Err(_))
         ));
         assert_eq!(provider.reads.load(Ordering::SeqCst), 0);

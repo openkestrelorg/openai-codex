@@ -8112,15 +8112,17 @@ async fn closed_plugin_owner_refuses_all_async_worker_births_and_clears_queue_fl
         None,
         InstalledPluginSyncSource::PluginList,
     );
-    let installed = manager
-        .remote_installed_plugins_cache_refresh_state
-        .read()
-        .unwrap();
-    assert!(!installed.in_flight && installed.requested.is_none());
-    drop(installed);
-    let catalog = manager.remote_catalog_cache_refresh_state.read().unwrap();
-    assert!(!catalog.in_flight && catalog.requests.is_empty());
-    drop(catalog);
+    {
+        let installed = manager
+            .remote_installed_plugins_cache_refresh_state
+            .read()
+            .unwrap();
+        assert!(!installed.in_flight && installed.requested.is_none());
+    }
+    {
+        let catalog = manager.remote_catalog_cache_refresh_state.read().unwrap();
+        assert!(!catalog.in_flight && catalog.requests.is_empty());
+    }
     assert!(
         manager
             .remote_installed_plugin_bundle_sync_gate
@@ -8693,9 +8695,10 @@ async fn closed_owner_refuses_blocking_plugin_workers_and_releases_queue_flags()
         mode: NonCuratedCacheRefreshMode::IfVersionChanged,
         git_mode: PluginGitMode::Automatic,
     });
-    let state = manager.non_curated_cache_refresh_state.read().unwrap();
-    assert!(!state.in_flight && state.requested.is_none() && state.last_refreshed.is_none());
-    drop(state);
+    {
+        let state = manager.non_curated_cache_refresh_state.read().unwrap();
+        assert!(!state.in_flight && state.requested.is_none() && state.last_refreshed.is_none());
+    }
     assert!(
         !crate::installed_marketplaces::marketplace_install_root(home.path())
             .join(".staging")
@@ -8742,9 +8745,10 @@ async fn blocking_plugin_panic_resets_pending_cache_request_without_clean_join()
         })
         .unwrap();
     assert_eq!(receipt.await, crate::retirement::JoinOutcome::Panicked);
-    let state = manager.non_curated_cache_refresh_state.read().unwrap();
-    assert!(!state.in_flight && state.requested.is_none() && state.last_refreshed.is_none());
-    drop(state);
+    {
+        let state = manager.non_curated_cache_refresh_state.read().unwrap();
+        assert!(!state.in_flight && state.requested.is_none() && state.last_refreshed.is_none());
+    }
     let report = manager.shutdown_until(tokio::time::Instant::now()).await;
     assert!(report.terminal && report.panicked && !report.is_clean());
 }
@@ -8916,10 +8920,12 @@ impl codex_model_provider::AuthTaskSpawner for QueuedTestHost {
     }
 }
 
+type BackendRecords = Arc<std::sync::Mutex<Vec<(String, Option<u64>)>>>;
+
 #[derive(Debug)]
 struct QueuedOriginSelector {
     delegate: Arc<dyn crate::http_client_selector::HttpClientSelector>,
-    records: Arc<std::sync::Mutex<Vec<(String, Option<u64>)>>>,
+    records: BackendRecords,
 }
 impl QueuedOriginSelector {
     fn record(&self, url: &str) {
@@ -8953,12 +8959,7 @@ impl crate::http_client_selector::HttpClientSelector for QueuedOriginSelector {
         self.delegate.outbound_proxy_policy()
     }
 }
-fn queued_recording_config(
-    base: &str,
-) -> (
-    RemotePluginServiceConfig,
-    Arc<std::sync::Mutex<Vec<(String, Option<u64>)>>>,
-) {
+fn queued_recording_config(base: &str) -> (RemotePluginServiceConfig, BackendRecords) {
     let mut config =
         RemotePluginServiceConfig::new(base.to_owned(), test_http_client_factory(), None);
     let records = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -9036,12 +9037,14 @@ async fn catalog_queue_coalesces_scopes_under_latest_request_original_and_auth()
     );
     a.joined().await;
     b.joined().await;
-    let records = records.lock().unwrap();
-    assert_eq!(records.len(), 2);
-    assert!(
-        records.iter().all(|(_, origin)| *origin == Some(2)),
-        "actual HTTP must execute in B, not an unscoped worker: {records:?}"
-    );
+    {
+        let records = records.lock().unwrap();
+        assert_eq!(records.len(), 2);
+        assert!(
+            records.iter().all(|(_, origin)| *origin == Some(2)),
+            "actual HTTP must execute in B, not an unscoped worker: {records:?}"
+        );
+    }
     server.verify().await;
 }
 
@@ -9210,14 +9213,16 @@ async fn installed_queue_keeps_prior_callback_original_and_latest_backend(indepe
             .is_clean()
     );
     a.joined().await;
-    let records = records.lock().unwrap();
-    assert_eq!(records.len(), 2);
-    assert!(
-        records
-            .iter()
-            .all(|(_, origin)| *origin == Some(if independent { 1 } else { 2 })),
-        "actual backend lineage: {records:?}"
-    );
+    {
+        let records = records.lock().unwrap();
+        assert_eq!(records.len(), 2);
+        assert!(
+            records
+                .iter()
+                .all(|(_, origin)| *origin == Some(if independent { 1 } else { 2 })),
+            "actual backend lineage: {records:?}"
+        );
+    }
     server.verify().await;
 }
 

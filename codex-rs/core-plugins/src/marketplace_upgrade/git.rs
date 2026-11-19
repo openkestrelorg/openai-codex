@@ -442,10 +442,10 @@ mod tests {
             .unwrap();
         let pid: i32 = tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
-                if let Ok(raw) = std::fs::read_to_string(&ready) {
-                    if let Ok(pid) = raw.parse() {
-                        break pid;
-                    }
+                if let Ok(raw) = std::fs::read_to_string(&ready)
+                    && let Ok(pid) = raw.parse()
+                {
+                    break pid;
                 }
                 tokio::task::yield_now().await;
             }
