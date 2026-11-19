@@ -754,15 +754,14 @@ impl ThreadRequestProcessor {
         app_server_client_name: Option<String>,
         app_server_client_version: Option<String>,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
-        let (response, thread_id) = box_thread_start_future(|| {
-            self.thread_revert_response(
+        let (response, thread_id) = self
+            .thread_revert_response(
                 &request_id,
                 params,
                 app_server_client_name,
                 app_server_client_version,
             )
-        })
-        .await?;
+            .await?;
         self.outgoing.send_response(request_id, response).await;
         self.outgoing
             .send_server_notification(ServerNotification::ThreadReverted(
@@ -2850,23 +2849,24 @@ impl ThreadRequestProcessor {
             )
             .await?;
         let response_history = thread_history.clone();
+        let parent_trace = self.request_trace_context(request_id).await;
         let NewThread {
             thread_id: resumed_thread_id,
             thread: codex_thread,
             session_configured,
             ..
-        } = self
-            .thread_manager
-            .resume_thread_with_history(
+        } = box_thread_start_future(|| {
+            self.thread_manager.resume_thread_with_history(
                 config,
                 thread_history,
                 self.auth_manager.clone(),
-                self.request_trace_context(request_id).await,
+                parent_trace,
                 client_mcp_extensions,
                 self.control_endpoint.clone(),
             )
-            .await
-            .map_err(|err| internal_error(format!("error reloading thread after revert: {err}")))?;
+        })
+        .await
+        .map_err(|err| internal_error(format!("error reloading thread after revert: {err}")))?;
         if resumed_thread_id != thread_id {
             return Err(internal_error(format!(
                 "thread {thread_id} reloaded as {resumed_thread_id} after revert"
