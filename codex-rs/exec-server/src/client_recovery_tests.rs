@@ -266,7 +266,8 @@ async fn recovery_adds_sandbox_denial_to_pending_exit_event() {
 
 #[tokio::test]
 async fn recovery_carries_cleanup_without_overwriting_an_existing_closed_receipt() {
-    use crate::protocol::{SandboxCleanupState, SandboxCleanupSummary};
+    use crate::protocol::SandboxCleanupState;
+    use crate::protocol::SandboxCleanupSummary;
     let recovered = SandboxCleanupSummary {
         state: SandboxCleanupState::TimedOut,
         reaped: 1,

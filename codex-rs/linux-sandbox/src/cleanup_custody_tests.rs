@@ -1,6 +1,7 @@
 use super::*;
 use pretty_assertions::assert_eq;
-use std::io::{Read, Write};
+use std::io::Read;
+use std::io::Write;
 use std::os::fd::FromRawFd;
 use std::time::Duration;
 use std::time::Instant;

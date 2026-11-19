@@ -328,12 +328,15 @@ async fn rejects_oversized_assistant_message() {
 /// the idle window, then release before turn completion, or on failed startup.
 #[tokio::test]
 async fn temporary_grant_covers_only_the_start_to_turn_window() {
-    use super::{TemporaryThread, run_temporary_structured_turn};
-    use codex_app_server_client::{CloudClient, CloudOperation};
-    use codex_app_server_protocol::{
-        ClientRequest, ThreadRetentionAcquireResponse, ThreadRetentionReleaseResponse,
-        ThreadUnsubscribeResponse, TurnStartResponse,
-    };
+    use super::TemporaryThread;
+    use super::run_temporary_structured_turn;
+    use codex_app_server_client::CloudClient;
+    use codex_app_server_client::CloudOperation;
+    use codex_app_server_protocol::ClientRequest;
+    use codex_app_server_protocol::ThreadRetentionAcquireResponse;
+    use codex_app_server_protocol::ThreadRetentionReleaseResponse;
+    use codex_app_server_protocol::ThreadUnsubscribeResponse;
+    use codex_app_server_protocol::TurnStartResponse;
     use tokio_util::sync::CancellationToken;
 
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -480,7 +483,8 @@ async fn temporary_grant_covers_only_the_start_to_turn_window() {
 #[tokio::test]
 async fn temporary_helpers_do_not_reacquire_or_release_missing_or_existing_grants() {
     use codex_app_server_client::CloudClient;
-    use codex_app_server_protocol::{ThreadRetentionAcquireResponse, ThreadRetentionRefusalReason};
+    use codex_app_server_protocol::ThreadRetentionAcquireResponse;
+    use codex_app_server_protocol::ThreadRetentionRefusalReason;
     let (cloud, mut commands, _events) = CloudClient::channel(8);
     let client = AppServerClient::Cloud(cloud);
     for evidence in [

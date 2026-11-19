@@ -820,9 +820,12 @@ async fn production_reconnect_adopts_only_the_installed_writable_view() -> Resul
 }
 
 async fn production_reconnect_retention_scenario() -> Result<()> {
-    use crate::app::reconnect::{ReconnectAttachment, reconnect_with_adoption};
-    use codex_app_server_protocol::{JSONRPCMessage, JSONRPCRequest};
-    use futures::{SinkExt, StreamExt};
+    use crate::app::reconnect::ReconnectAttachment;
+    use crate::app::reconnect::reconnect_with_adoption;
+    use codex_app_server_protocol::JSONRPCMessage;
+    use codex_app_server_protocol::JSONRPCRequest;
+    use futures::SinkExt;
+    use futures::StreamExt;
     use tokio_tungstenite::tungstenite::Message;
     for external in [false, true] {
         let (mut app, mut events, _ops) = make_test_app_with_channels().await;
