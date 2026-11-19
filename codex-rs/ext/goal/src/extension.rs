@@ -217,13 +217,13 @@ where
             }
             // Local interrupted-turn accounting above remains valid on refusal;
             // automatic account-bound continuation does not.
-            if let Ok(work) = work {
-                if let Err(err) = runtime.continue_if_idle_with_work(work.as_deref()).await {
-                    tracing::warn!(
-                        "failed to continue active goal for idle thread {}: {err}",
-                        runtime.thread_id()
-                    );
-                }
+            if let Ok(work) = work
+                && let Err(err) = runtime.continue_if_idle_with_work(work.as_deref()).await
+            {
+                tracing::warn!(
+                    "failed to continue active goal for idle thread {}: {err}",
+                    runtime.thread_id()
+                );
             }
         })
     }

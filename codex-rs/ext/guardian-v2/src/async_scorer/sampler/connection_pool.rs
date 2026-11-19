@@ -235,7 +235,7 @@ impl ConnectionPool {
                     };
                     let child_work = match work
                         .as_deref()
-                        .map(|work| work.derive_attempt())
+                        .map(codex_protocol::mcp_work::McpAttemptWork::derive_attempt)
                         .transpose()
                     {
                         Ok(work) => work,
@@ -296,6 +296,7 @@ impl ConnectionPool {
         self.lease_with_work(None).await
     }
 
+    #[cfg(test)]
     pub(super) async fn lease_with_work(
         self: &Arc<Self>,
         work: Option<&dyn codex_protocol::mcp_work::McpAttemptWork>,
@@ -745,7 +746,7 @@ impl ConnectionLease {
     pub(super) fn take_cleanup(&mut self) -> super::super::tasks::Continuation {
         self.cleanup
             .take()
-            .expect("lease cleanup transferred only once")
+            .unwrap_or_else(|| panic!("lease cleanup transferred only once"))
     }
 
     pub(super) async fn stream_request(
