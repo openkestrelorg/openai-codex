@@ -295,6 +295,22 @@ mod tests {
     }
 
     #[test]
+    fn plugin_backend_mutations_require_account_work() {
+        // Managed reset drains counted requests before retiring plugin caches.
+        // Both backend mutations must stay behind that barrier.
+        for (method, params) in [
+            ("plugin/install", serde_json::json!({"pluginName":"fixture"})),
+            ("plugin/uninstall", serde_json::json!({"pluginId":"fixture"})),
+        ] {
+            assert_eq!(
+                classify(&request(method, params)),
+                AccountDependency::Permit,
+                "{method}"
+            );
+        }
+    }
+
+    #[test]
     fn hosted_declaration_is_account_work_but_retirement_stays_independent() {
         let params = serde_json::json!({
             "url":"http://127.0.0.1:41005/mcp", "authorization":"Bearer configured",
