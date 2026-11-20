@@ -1614,8 +1614,7 @@ impl ThreadRequestProcessor {
         }
     }
 
-    /// Close birth and observe the exact retained originals. Observer cancellation
-    /// or an expired wait never removes their join receipts from this owner.
+    /// Close births and take a nonblocking census of retained originals.
     pub(crate) fn background_task_census(
         &self,
         deadline: tokio::time::Instant,
@@ -1623,6 +1622,8 @@ impl ThreadRequestProcessor {
         self.background_tasks.close_and_census(deadline)
     }
 
+    /// Close birth and observe the exact retained originals. Observer cancellation
+    /// or an expired wait never removes their join receipts from this owner.
     pub(crate) async fn drain_background_tasks_until(
         &self,
         deadline: tokio::time::Instant,

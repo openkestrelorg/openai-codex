@@ -527,7 +527,9 @@ async fn remove_stale_remote_plugin_caches_with_generation(
             if let Ok(plugin_id) = &plugin_id {
                 capabilities.include_active_bundle(store, plugin_id).await;
             }
-            stop.ensure_running("the next stale plugin cache removal")?;
+            if stop.is_stopped() {
+                return Err("plugin shutdown requested before stale cache removal".to_string());
+            }
             let lease = generation
                 .begin_commit()
                 .map_err(|_| "remote plugin publication authority unavailable".to_string())?;

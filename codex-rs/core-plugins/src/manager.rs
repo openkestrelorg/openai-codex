@@ -1045,12 +1045,12 @@ impl PluginsManager {
         )
     }
 
-    /// Observe this manager's actual plugin originals, never a cancellation acknowledgement.
     /// Signal workers without waiting or claiming that their originals joined.
     pub fn request_shutdown(&self, deadline: tokio::time::Instant) {
         self.task_registry.request_shutdown(deadline);
     }
 
+    /// Observe this manager's actual plugin originals, never a cancellation acknowledgement.
     pub async fn shutdown_until(&self, deadline: tokio::time::Instant) -> crate::PluginTaskDrain {
         self.task_registry.shutdown_until(deadline).await
     }
@@ -3449,7 +3449,8 @@ impl PluginsManager {
                         );
                         match outcome {
                             Ok(outcome) => {
-                                if !outcome.upgraded_roots.is_empty()
+                                if !manager.task_registry.worker_stop().is_stopped()
+                                    && !outcome.upgraded_roots.is_empty()
                                     && let Some(on_effective_plugins_changed) =
                                         on_effective_plugins_changed
                                 {
