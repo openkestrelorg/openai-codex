@@ -855,6 +855,54 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn shutdown_requests_worker_stop_before_the_original_join_deadline() {
+        let registry = PluginTaskRegistry::default();
+        let mut worker = spawn_gated_worker(&registry);
+        assert!(!worker.run_step().await);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let drain = registry.shutdown_until(deadline);
+        tokio::pin!(drain);
+        assert!((&mut drain).now_or_never().is_none());
+        assert!(worker.run_step().await, "shutdown must stop the next unit");
+        assert_eq!(worker.steps.load(Ordering::SeqCst), 1);
+        assert_eq!(worker.receipt.await, JoinOutcome::Joined);
+        assert!(drain.await.is_clean(), "the actual original must be joined");
+        assert!(
+            Instant::now() < deadline,
+            "stop must leave time for the join"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_interrupts_an_in_flight_owned_step_before_deadline_expiry() {
+        struct StepDrop(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for StepDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let registry = PluginTaskRegistry::default();
+        let stop = registry.worker_stop();
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let step_dropped = Arc::clone(&dropped);
+        let step = stop.run_until(Duration::from_secs(30), async move {
+            let _drop = StepDrop(step_dropped);
+            futures::future::pending::<()>().await;
+        });
+        tokio::pin!(step);
+        assert!((&mut step).now_or_never().is_none());
+        assert!(!dropped.load(Ordering::SeqCst));
+        let began = Instant::now();
+        let deadline = began + Duration::from_secs(2);
+        assert!(registry.shutdown_until(deadline).await.is_clean());
+        assert_eq!((&mut step).now_or_never(), Some(None));
+        assert!(dropped.load(Ordering::SeqCst));
+        assert_eq!(Instant::now(), began, "the join budget was not consumed");
+    }
+
     #[test]
     fn cooperatively_stopped_worker_no_longer_pins_runtime_drop() {
         let runtime = tokio::runtime::Builder::new_current_thread()
