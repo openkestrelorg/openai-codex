@@ -10,23 +10,38 @@ mod bundled_bwrap;
 #[cfg(target_os = "linux")]
 mod bwrap;
 #[cfg(target_os = "linux")]
+mod cleanup_custody;
+#[cfg(target_os = "linux")]
 mod daemon_mounts;
 #[cfg(target_os = "linux")]
 mod exec_util;
 #[cfg(target_os = "linux")]
 mod fd_mount;
 #[cfg(target_os = "linux")]
-mod landlock;
+mod forwarded_fds;
 #[cfg(target_os = "linux")]
 mod launcher;
 #[cfg(target_os = "linux")]
 mod linux_run_main;
+#[cfg(all(target_os = "linux", test))]
+mod managed_tcp;
+#[cfg(all(target_os = "linux", test))]
+mod managed_tcp_dns;
 #[cfg(target_os = "linux")]
 mod proxy_lifecycle;
 #[cfg(target_os = "linux")]
 mod proxy_routing;
 #[cfg(target_os = "linux")]
+mod seccomp;
+#[cfg(target_os = "linux")]
+mod synthetic_targets;
+#[cfg(target_os = "linux")]
 mod wslg;
+
+#[cfg(target_os = "linux")]
+pub use bundled_bwrap::find_bundled_bwrap_for_exe;
+#[cfg(target_os = "linux")]
+pub use bwrap::expand_unreadable_globs;
 
 /// Exit status returned when bundled bubblewrap fails digest verification.
 #[cfg(target_os = "linux")]

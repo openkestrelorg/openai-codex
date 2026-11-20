@@ -15,6 +15,7 @@ mod agent_response;
 mod guardian_assessment;
 mod network_policy;
 mod otlp;
+mod skill_invocation;
 mod targets;
 mod tool_result;
 
@@ -34,6 +35,7 @@ pub use crate::config::validate_span_attributes;
 pub use crate::events::session_telemetry::AuthEnvTelemetryMetadata;
 pub use crate::events::session_telemetry::SessionTelemetry;
 pub use crate::events::session_telemetry::SessionTelemetryMetadata;
+pub use crate::events::session_telemetry::bounded_product_sku;
 pub use crate::managed_routes::ManagedTelemetryRoutes;
 pub use crate::managed_routes::RetiredTelemetry;
 pub use crate::managed_routes::TelemetryPublication;
@@ -48,6 +50,8 @@ pub use crate::provider::OtelShutdownError;
 pub use crate::provider_retirement::OtelRetirement;
 pub use crate::provider_retirement::OtelRetirementError;
 pub use crate::root_span_context::root_span_with_w3c_parent;
+pub use crate::skill_invocation::SkillInvocationEvent;
+pub use crate::skill_invocation::SkillInvocationType;
 pub use crate::trace_context::context_from_w3c_trace_context;
 pub use crate::trace_context::current_span_trace_id;
 pub use crate::trace_context::current_span_w3c_trace_context;
@@ -59,6 +63,7 @@ pub use crate::trace_context::span_with_parent_context;
 pub use crate::trace_context::traceparent_context_from_env;
 pub use crate::trace_context::validate_tracestate_entries;
 pub use crate::trace_context::validate_tracestate_member;
+pub use crate::trace_context::w3c_trace_context_from_context;
 pub use codex_utils_string::sanitize_metric_tag_value;
 
 #[derive(Debug, Clone, Serialize, Display)]

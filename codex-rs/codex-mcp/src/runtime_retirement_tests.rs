@@ -1,56 +1,111 @@
 use super::*;
-use pretty_assertions::assert_eq;
+use futures::FutureExt;
+use futures::future::BoxFuture;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::sync::Semaphore;
 
 #[tokio::test]
-async fn external_control_retains_original_task_and_requires_positive_proof() {
-    let control = McpRuntimeRetirement::default();
-    let registry = control.registry.clone();
-    let resource = Arc::new(());
-    let weak = Arc::downgrade(&resource);
-    let task = registry
+async fn runtime_closure_fences_every_registered_gate_before_first_cancellation() {
+    let root = McpRuntimeRetirement::default();
+    let first = PrivateClientRetirement::default();
+    let second = PrivateClientRetirement::default();
+    let cancellation = CancellationToken::new();
+    let second_slot = Arc::new(ConnectionSlot::default());
+    root.register_connection(first.clone(), None, cancellation.clone())
+        .unwrap();
+    root.register_connection(
+        second.clone(),
+        Some(Arc::clone(&second_slot)),
+        CancellationToken::new(),
+    )
+    .unwrap();
+    // Bind the cancellation to a real registered private lower owner as well.
+    first
+        .registry
+        .register_connection(cancellation.clone())
+        .unwrap();
+    let attempted = Arc::new(AtomicUsize::new(0));
+    let private_attempted = Arc::clone(&attempted);
+    let shared_attempted = Arc::clone(&attempted);
+    let ready = Arc::new(Semaphore::new(0));
+    let entered = Arc::clone(&ready);
+    let task = first
+        .registry
         .task_ticket()
         .register(move || async move {
-            let _resource = resource;
-            RuntimeTaskOutcome::Failed
+            entered.add_permits(1);
+            cancellation.cancelled().await;
+            let private = second.track_startup(CancellationToken::new(), |_| {
+                private_attempted.fetch_add(1, Ordering::SeqCst);
+                panic!("second private gate must already be fenced")
+            });
+            assert!(matches!(
+                private.await,
+                Err(crate::rmcp_client::StartupOutcomeError::Cancelled)
+            ));
+            let pool = crate::McpConnectionPool::default();
+            let shared = pool
+                .connect(
+                    second_slot,
+                    crate::connection_pool::tests::key(
+                        &crate::connection_pool::tests::context(),
+                        &crate::connection_pool::tests::config(),
+                    ),
+                    Arc::default(),
+                    None,
+                    CancellationToken::new(),
+                    move |_, _, _| {
+                        shared_attempted.fetch_add(1, Ordering::SeqCst);
+                        panic!("second shared gate must already be fenced")
+                    },
+                )
+                .await;
+            assert!(matches!(
+                shared,
+                Err(crate::rmcp_client::StartupOutcomeError::Cancelled)
+            ));
+            crate::private_retirement::PrivateTaskOutcome::Complete
         })
         .unwrap();
-    assert_eq!(task.await, RuntimeTaskOutcome::Failed);
-    drop(registry);
-    assert!(weak.upgrade().is_none());
-    let report = control
+    let caller = tokio::spawn(task);
+    ready.acquire().await.unwrap().forget();
+    root.close_registration();
+    caller.await.unwrap();
+    let report = root
         .shutdown_until(Instant::now() + Duration::from_secs(1))
         .await;
-    assert!(!report.is_complete());
-    assert!(!control.is_retired());
-    assert_eq!(report.tasks, vec![(0, RuntimeTaskOutcome::Failed)]);
-    assert_eq!(control.shutdown_until(Instant::now()).await, report);
+    assert!(report.are_connections_released(), "{report:?}");
+    assert_eq!(attempted.load(Ordering::SeqCst), 0);
+    assert_eq!(report.registered_at_end, 2);
+    assert!(
+        root.register_connection(
+            PrivateClientRetirement::default(),
+            None,
+            CancellationToken::new()
+        )
+        .is_err()
+    );
 }
 
-struct PausedConnectionFactory {
+struct GatedTransport {
     entered: Arc<Semaphore>,
     release: Arc<Semaphore>,
     stream: Arc<Mutex<Option<tokio::io::DuplexStream>>>,
 }
 
-impl codex_rmcp_client::InProcessTransportFactory for PausedConnectionFactory {
+impl codex_rmcp_client::InProcessTransportFactory for GatedTransport {
     fn open(&self) -> BoxFuture<'static, std::io::Result<tokio::io::DuplexStream>> {
         let entered = Arc::clone(&self.entered);
         let release = Arc::clone(&self.release);
         let stream = Arc::clone(&self.stream);
         async move {
             entered.add_permits(1);
-            release
-                .acquire()
-                .await
-                .expect("release admitted creation")
-                .forget();
+            release.acquire().await.unwrap().forget();
             stream
                 .lock()
-                .expect("stream owner")
+                .unwrap()
                 .take()
                 .ok_or_else(|| std::io::Error::other("already consumed"))
         }
@@ -59,297 +114,483 @@ impl codex_rmcp_client::InProcessTransportFactory for PausedConnectionFactory {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn admitted_physical_creation_finishing_after_upper_freeze_is_actually_closed() {
+async fn external_runtime_owner_retains_cancelled_constructor_and_actual_late_transport() {
     use tokio::io::AsyncReadExt;
-    let registry = RuntimeRetirementRegistry::default();
-    let owner = registry
-        .register_connection(CancellationToken::new())
-        .expect("reserve upper owner");
-    let (client, mut peer) = tokio::io::duplex(64);
+    let root = McpRuntimeRetirement::default();
+    let private = PrivateClientRetirement::default();
+    root.register_connection(private.clone(), None, CancellationToken::new())
+        .unwrap();
+    let (stream, mut peer) = tokio::io::duplex(64);
     let entered = Arc::new(Semaphore::new(0));
     let release = Arc::new(Semaphore::new(0));
-    let factory = Arc::new(PausedConnectionFactory {
+    let factory = Arc::new(GatedTransport {
         entered: Arc::clone(&entered),
         release: Arc::clone(&release),
-        stream: Arc::new(Mutex::new(Some(client))),
+        stream: Arc::new(Mutex::new(Some(stream))),
     });
-    // The upper task is admitted and its lower physical creation has begun,
-    // but no pending transport can yet be returned to the constructor.
-    let lower = owner.lower();
-    let task = owner
-        .task_ticket()
-        .register(move || async move {
-            match codex_rmcp_client::RmcpClient::new_in_process_client_in_retirement(factory, lower)
-                .await
-            {
-                Ok(client) => {
-                    drop(client);
-                    RuntimeTaskOutcome::Complete
-                }
-                Err(_) => RuntimeTaskOutcome::Failed,
-            }
-        })
-        .expect("register startup");
-    let caller = tokio::spawn(task);
-    entered
-        .acquire()
-        .await
-        .expect("real factory entered")
-        .forget();
-    let deadline = Instant::now() + Duration::from_secs(3);
-    registry.close_registration();
-    let retiring = registry.clone();
-    let shutdown = tokio::spawn(async move { retiring.shutdown_until(deadline).await });
+    let startup = private.track_startup(CancellationToken::new(), move |lower| {
+        async move {
+            let client =
+                codex_rmcp_client::RmcpClient::new_in_process_client_in_retirement(factory, lower)
+                    .await
+                    .map_err(anyhow::Error::from)?;
+            Ok(
+                crate::connection_manager::tests::create_test_managed_client_for_transport(
+                    Vec::new(),
+                    client,
+                ),
+            )
+        }
+        .boxed()
+        .shared()
+    });
+    let caller = tokio::spawn(startup);
+    entered.acquire().await.unwrap().forget();
+    caller.abort();
+    assert!(matches!(caller.await, Err(error) if error.is_cancelled()));
+    drop(private);
+    let pending = root.shutdown_until(Instant::now()).await;
+    assert!(!pending.are_connections_released());
+    assert_eq!(pending.connections.len(), 1);
     release.add_permits(1);
-    let report = shutdown.await.expect("retirement joined");
-    assert_eq!(
-        caller.await.expect("startup joined"),
-        RuntimeTaskOutcome::Complete
-    );
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let report = root.shutdown_until(deadline).await;
+    assert!(report.are_connections_released(), "{report:?}");
     assert!(
-        report.is_complete(),
-        "late attachment must be retired, not omitted: {report:?}"
-    );
-    assert_eq!(report.connections.len(), 1);
-    assert_eq!(
-        report.connections[0].1.attempts.len(),
-        1,
-        "census includes physical creation before freeze"
+        !report.connections[0].private.connections[0]
+            .1
+            .attempts
+            .is_empty()
     );
     assert_eq!(
         tokio::time::timeout_at(deadline, peer.read(&mut [0]))
             .await
-            .expect("EOF under original deadline")
-            .expect("read peer"),
+            .unwrap()
+            .unwrap(),
         0
     );
 }
 
 #[tokio::test]
-async fn dormant_tasks_are_skipped_and_connection_identity_is_stable() {
-    let registry = RuntimeRetirementRegistry::default();
-    let cancel = CancellationToken::new();
-    let owner = registry
-        .register_connection(cancel.clone())
-        .expect("reserve");
-    let reused = Arc::clone(&owner);
-    assert_eq!(owner.id(), reused.id());
-    let count = Arc::new(AtomicUsize::new(0));
-    let launched = Arc::clone(&count);
-    let task = owner
-        .task_ticket()
-        .register(move || async move {
-            launched.fetch_add(1, Ordering::SeqCst);
-            RuntimeTaskOutcome::Complete
-        })
-        .expect("register");
-    let report = registry
-        .shutdown_until(Instant::now() + Duration::from_secs(1))
-        .await;
-    assert!(report.is_complete());
-    assert_eq!(report.connections.len(), 1);
-    assert_eq!(task.await, RuntimeTaskOutcome::Skipped);
-    assert_eq!(count.load(Ordering::SeqCst), 0);
-    assert!(cancel.is_cancelled());
-    assert!(
-        registry
-            .register_connection(CancellationToken::new())
-            .is_err()
-    );
-}
-
-#[tokio::test(start_paused = true)]
-async fn expired_budget_does_not_resume_admitted_task_and_terminal_report_is_replayable() {
-    let registry = RuntimeRetirementRegistry::default();
-    let gate = Arc::new(Semaphore::new(0));
-    let resumed = Arc::clone(&gate);
-    let count = Arc::new(AtomicUsize::new(0));
-    let completed = Arc::clone(&count);
-    let task = registry
-        .task_ticket()
-        .register(move || async move {
-            resumed.acquire().await.expect("resume").forget();
-            completed.fetch_add(1, Ordering::SeqCst);
-            RuntimeTaskOutcome::Complete
-        })
-        .expect("register task");
-    assert!(task.now_or_never().is_none());
-    gate.add_permits(1);
-    let expired = Instant::now();
-    let report = registry.shutdown_until(expired).await;
-    assert_eq!(report.tasks, vec![(0, RuntimeTaskOutcome::TimedOut)]);
-    assert_eq!(count.load(Ordering::SeqCst), 0);
-    let report = registry
-        .shutdown_until(Instant::now() + Duration::from_secs(1))
-        .await;
-    assert!(report.is_complete());
-    assert_eq!(registry.shutdown_until(expired).await, report);
-    assert_eq!(count.load(Ordering::SeqCst), 1);
-}
-
-#[tokio::test(start_paused = true)]
-async fn timed_out_task_is_owned_and_can_be_drained_by_later_observer() {
-    let registry = RuntimeRetirementRegistry::default();
-    let gate = Arc::new(Semaphore::new(0));
-    let resumed = Arc::clone(&gate);
-    let task = registry
-        .task_ticket()
-        .register(move || async move {
-            resumed.acquire().await.expect("resume").forget();
-            RuntimeTaskOutcome::Complete
-        })
-        .expect("register summary");
-    assert!(task.now_or_never().is_none());
-    let report = registry
-        .shutdown_until(Instant::now() + Duration::from_secs(1))
-        .await;
-    assert_eq!(report.tasks, vec![(0, RuntimeTaskOutcome::TimedOut)]);
-    gate.add_permits(1);
-    let complete = registry
-        .shutdown_until(Instant::now() + Duration::from_secs(1))
-        .await;
-    assert_eq!(complete.tasks, vec![(0, RuntimeTaskOutcome::Complete)]);
-    assert!(complete.is_complete());
-}
-
-#[tokio::test(start_paused = true)]
-async fn all_lower_gates_close_before_cancelled_task_is_polled() {
-    let registry = RuntimeRetirementRegistry::default();
-    let cancellation = CancellationToken::new();
-    let owner = registry
-        .register_connection(cancellation.clone())
-        .expect("reserve");
-    let lower = owner.lower();
-    let task = owner
-        .task_ticket()
-        .register(move || async move {
-            cancellation.cancelled().await;
-            // A public lower retirement observation must see a closed, empty census.
-            assert!(
-                lower
-                    .shutdown_until(Instant::now() + Duration::from_secs(1))
-                    .await
-                    .is_complete()
-            );
-            RuntimeTaskOutcome::Complete
-        })
-        .expect("register");
-    assert!(task.now_or_never().is_none());
-    assert!(
-        registry
-            .shutdown_until(Instant::now() + Duration::from_secs(1))
-            .await
-            .is_complete()
-    );
-}
-
-#[tokio::test]
-async fn successful_compaction_drops_runtime_owners_and_retains_result() {
-    let registry = RuntimeRetirementRegistry::default();
-    let owner = registry
-        .register_connection(CancellationToken::new())
-        .expect("reserve");
-    let weak = Arc::downgrade(&owner);
-    drop(owner);
-    let report = registry
-        .shutdown_until(Instant::now() + Duration::from_secs(1))
-        .await;
-    assert!(report.is_complete());
-    assert!(weak.upgrade().is_none());
-    assert_eq!(registry.shutdown_until(Instant::now()).await, report);
-}
-
-#[tokio::test]
-async fn stored_future_has_no_strong_registry_cycle() {
-    let registry = RuntimeRetirementRegistry::default();
-    let probe = Arc::new(());
-    let capture = Arc::clone(&probe);
-    let task = registry
-        .task_ticket()
-        .register(move || async move {
-            let _capture = capture;
+async fn startup_context_detaches_containing_census_before_lazy_future_retention() {
+    let root = McpRuntimeRetirement::default();
+    let weak = Arc::downgrade(&root.state);
+    let mut context = crate::connection_pool::tests::context();
+    context.retirement = Some(root.clone());
+    let detached = context.without_retirement_owner();
+    assert!(detached.retirement.is_none());
+    let private = PrivateClientRetirement::default();
+    root.register_connection(private.clone(), None, CancellationToken::new())
+        .unwrap();
+    let startup = private.track_startup(CancellationToken::new(), move |_| {
+        async move {
+            let _detached = detached;
             std::future::pending().await
-        })
-        .expect("register");
-    assert!(task.now_or_never().is_none());
-    assert_eq!(Arc::strong_count(&probe), 2);
-    drop(registry);
-    assert_eq!(Arc::strong_count(&probe), 1);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn task_first_poll_and_gate_close_record_exact_admission() {
-    let registry = RuntimeRetirementRegistry::default();
-    let invoked = Arc::new(AtomicUsize::new(0));
-    let count = Arc::clone(&invoked);
-    let task = registry
-        .task_ticket()
-        .register(move || {
-            count.fetch_add(1, Ordering::SeqCst);
-            async { RuntimeTaskOutcome::Complete }
-        })
-        .expect("reserve");
-    let admission = Arc::clone(&registry.state.lock().expect("registry").tasks[0].admission);
-    let gate = Arc::new(tokio::sync::Barrier::new(2));
-    let started = Arc::clone(&gate);
-    let caller = tokio::spawn(async move {
-        started.wait().await;
-        task.await
+        }
+        .boxed()
+        .shared()
     });
-    gate.wait().await;
-    registry.close_registration();
-    let result = caller.await.expect("caller joined");
-    let recorded = *admission.lock().expect("admission");
-    match recorded {
-        TaskAdmission::Admitted => {
-            assert_eq!(result, RuntimeTaskOutcome::Complete);
-            assert_eq!(invoked.load(Ordering::SeqCst), 1);
-        }
-        TaskAdmission::Skipped => {
-            assert_eq!(result, RuntimeTaskOutcome::Skipped);
-            assert_eq!(invoked.load(Ordering::SeqCst), 0);
-        }
-        TaskAdmission::Dormant => panic!("close must classify every reserved task"),
-    }
+    drop(startup);
+    drop(private);
+    drop(root);
     assert!(
-        registry
-            .shutdown_until(Instant::now() + Duration::from_secs(1))
-            .await
-            .is_complete()
+        weak.upgrade().is_none(),
+        "a dormant original startup must not retain its own containing census"
     );
 }
 
 #[tokio::test]
-async fn poisoned_registry_refuses_registration_and_success_but_cancels_owners() {
-    let registry = RuntimeRetirementRegistry::default();
-    let cancellation = CancellationToken::new();
-    let _owner = registry
-        .register_connection(cancellation.clone())
-        .expect("reserve");
-    let state = Arc::clone(&registry.state);
+async fn empty_runtime_exposes_external_connection_owner_before_shutdown() {
+    let external = McpRuntimeRetirement::default();
+    let runtime = crate::McpRuntime::empty_in_retirement(true, external.clone());
+    assert!(!external.is_closed());
+    assert!(Arc::ptr_eq(
+        &external.state,
+        &runtime.retirement_owner().state
+    ));
+    runtime.shutdown().await;
+    drop(runtime);
+    let report = external.shutdown_until(Instant::now()).await;
+    assert!(report.are_connections_released());
+    assert_eq!(report.registered_at_end, 0);
+}
+
+#[tokio::test]
+async fn admitted_generation_prevents_empty_success_and_cannot_publish_after_close() {
+    let root = McpRuntimeRetirement::default();
+    let permit = root.admit_generation().unwrap();
+    let pending = root.shutdown_until(Instant::now()).await;
+    assert!(!pending.are_connections_released());
+    assert!(pending.connections.is_empty());
+    assert_eq!(pending.constructing_generations, vec![0]);
+    assert_eq!(pending.generations_admitted, 1);
+    let published = AtomicUsize::new(0);
     assert!(
-        std::thread::spawn(move || {
-            let _guard = state.lock().expect("registry");
-            panic!("injected interrupted mutation");
-        })
-        .join()
-        .is_err()
+        permit
+            .publish_if_open(|| published.fetch_add(1, Ordering::SeqCst))
+            .is_none()
     );
+    assert_eq!(published.load(Ordering::SeqCst), 0);
+    assert!(root.admit_generation().is_err());
+    drop(permit);
+    let settled = root.shutdown_until(Instant::now()).await;
+    assert!(settled.are_connections_released());
+    assert_eq!(settled.generations_settled, 1);
+    assert_eq!(settled.generations_published, 0);
+}
+
+#[tokio::test]
+async fn cancelled_constructor_settles_its_original_generation_reservation() {
+    let root = McpRuntimeRetirement::default();
+    let caller_root = root.clone();
+    let entered = Arc::new(Semaphore::new(0));
+    let ready = Arc::clone(&entered);
+    let caller = tokio::spawn(async move {
+        let _permit = caller_root.admit_generation().unwrap();
+        ready.add_permits(1);
+        std::future::pending::<()>().await;
+    });
+    entered.acquire().await.unwrap().forget();
     assert!(
-        registry
-            .register_connection(CancellationToken::new())
-            .is_err()
+        !root
+            .shutdown_until(Instant::now())
+            .await
+            .are_connections_released()
     );
-    assert!(
-        registry
-            .task_ticket()
-            .register(|| async { RuntimeTaskOutcome::Complete })
-            .is_err()
-    );
-    let report = registry
+    caller.abort();
+    assert!(caller.await.unwrap_err().is_cancelled());
+    let report = root
         .shutdown_until(Instant::now() + Duration::from_secs(1))
         .await;
-    assert!(!report.is_complete());
-    assert_eq!(report.tasks, vec![(0, RuntimeTaskOutcome::Failed)]);
-    assert!(cancellation.is_cancelled());
+    assert!(report.are_connections_released());
+    assert!(report.constructing_generations.is_empty());
+    assert_eq!(report.generations_admitted, report.generations_settled);
+}
+
+#[tokio::test]
+async fn publication_commit_is_linearized_with_closure_and_runs_once() {
+    let root = McpRuntimeRetirement::default();
+    let permit = root.admit_generation().unwrap();
+    let (entered, inside) = std::sync::mpsc::channel();
+    let (release, resume) = std::sync::mpsc::channel();
+    let (attempted, trying) = std::sync::mpsc::channel();
+    let (closed, done) = std::sync::mpsc::channel();
+    let published = Arc::new(AtomicUsize::new(0));
+    let count = Arc::clone(&published);
+    let publisher = std::thread::spawn(move || {
+        assert!(
+            permit
+                .publish_if_open(|| {
+                    entered.send(()).unwrap();
+                    resume.recv_timeout(Duration::from_secs(1)).unwrap();
+                    count.fetch_add(1, Ordering::SeqCst);
+                })
+                .is_some()
+        );
+        assert!(
+            permit
+                .publish_if_open(|| panic!("a generation commits at most once"))
+                .is_none()
+        );
+    });
+    inside.recv_timeout(Duration::from_secs(1)).unwrap();
+    let closing_root = root.clone();
+    let closer = std::thread::spawn(move || {
+        attempted.send(()).unwrap();
+        closing_root.close_registration();
+        closed.send(()).unwrap();
+    });
+    trying.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert_eq!(done.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty));
+    release.send(()).unwrap();
+    publisher.join().unwrap();
+    closer.join().unwrap();
+    done.recv_timeout(Duration::from_secs(1)).unwrap();
+    let report = root.shutdown_until(Instant::now()).await;
+    assert!(report.are_connections_released());
+    assert_eq!(published.load(Ordering::SeqCst), 1);
+    assert_eq!(report.generations_published, 1);
+}
+
+#[tokio::test]
+async fn cancelled_generation_observer_does_not_settle_the_constructor() {
+    let root = McpRuntimeRetirement::default();
+    let permit = root.admit_generation().unwrap();
+    let mut observation = Box::pin(root.shutdown_until(Instant::now() + Duration::from_secs(1)));
+    assert!(futures::poll!(&mut observation).is_pending());
+    drop(observation);
+    let pending = root.shutdown_until(Instant::now()).await;
+    assert_eq!(pending.constructing_generations, vec![0]);
+    assert!(!pending.are_connections_released());
+    drop(permit);
+    let done = root.shutdown_until(Instant::now()).await;
+    assert!(done.are_connections_released());
+    assert_eq!(done.generations_settled, 1);
+}
+
+#[tokio::test]
+async fn generation_permit_is_weak_and_does_not_keep_its_census_alive() {
+    let root = McpRuntimeRetirement::default();
+    let weak = Arc::downgrade(&root.state);
+    let permit = root.admit_generation().unwrap();
+    drop(root);
+    assert!(weak.upgrade().is_none());
+    assert!(
+        permit
+            .publish_if_open(|| panic!("lost census must refuse publication"))
+            .is_none()
+    );
+    drop(permit);
+}
+
+#[tokio::test]
+async fn closed_generation_skips_synchronous_preparation_effects() {
+    let root = McpRuntimeRetirement::default();
+    let permit = root.admit_generation().unwrap();
+    root.close_registration();
+    let effects = AtomicUsize::new(0);
+    assert!(
+        permit
+            .with_open_gate(|| effects.fetch_add(1, Ordering::SeqCst))
+            .is_none()
+    );
+    assert_eq!(effects.load(Ordering::SeqCst), 0);
+    drop(permit);
+    assert!(
+        root.shutdown_until(Instant::now())
+            .await
+            .are_connections_released()
+    );
+}
+
+#[tokio::test]
+async fn runtime_closes_registered_worker_gates_before_cancelling_any_connection() {
+    let root = McpRuntimeRetirement::default();
+    let workers = crate::McpWorkerOwner::default();
+    root.register_workers(workers.clone());
+    root.register_workers(workers.clone());
+    assert_eq!(root.state.lock().unwrap().workers.len(), 1);
+    let cancelled = CancellationToken::new();
+    root.register_connection(Default::default(), None, cancelled.clone())
+        .unwrap();
+    let observer_workers = workers.clone();
+    let observer = tokio::spawn(async move {
+        cancelled.cancelled().await;
+        let completion = observer_workers.spawn(
+            &tokio::runtime::Handle::current(),
+            crate::McpWorkerKind::Reconnect,
+            async {
+                panic!("closed reconnect body");
+            },
+        );
+        assert!(matches!(
+            completion.await,
+            crate::worker_joins::WorkerExit::NotAdmitted
+        ));
+    });
+    root.close_registration();
+    observer.await.unwrap();
+    let after = crate::McpWorkerOwner::default();
+    root.register_workers(after.clone());
+    assert!(
+        after
+            .observe_until(Instant::now())
+            .await
+            .startup_admission_closed
+    );
+    let report = workers.observe_until(Instant::now()).await;
+    assert!(report.startup_admission_closed);
+    assert_eq!(report.registered_at_end, 0);
+    assert_eq!(report.refused_at_end, 1);
+}
+
+#[tokio::test]
+async fn closing_session_worker_admission_does_not_close_shared_process_owner() {
+    let context = crate::connection_pool::tests::context();
+    let session = context.workers.clone();
+    let root = context.retirement.clone().unwrap();
+    let pool = crate::McpConnectionPool::default();
+    let pooled = context.for_pooled_connection(&pool);
+    root.close_registration();
+    assert!(
+        session
+            .observe_until(Instant::now())
+            .await
+            .startup_admission_closed
+    );
+    assert!(
+        !pooled
+            .workers
+            .observe_until(Instant::now())
+            .await
+            .startup_admission_closed
+    );
+    let actual = pooled.workers.spawn(
+        &tokio::runtime::Handle::current(),
+        crate::McpWorkerKind::AuthNotification,
+        async {},
+    );
+    assert!(matches!(
+        actual.await,
+        crate::worker_joins::WorkerExit::Joined
+    ));
+    assert_eq!(
+        pool.observe_background_workers_until(Instant::now())
+            .await
+            .registered_at_end,
+        1
+    );
+}
+
+#[tokio::test]
+async fn connection_empty_success_is_not_registered_runtime_worker_drain() {
+    let root = McpRuntimeRetirement::default();
+    let report = root
+        .drain_workers_until(Instant::now() + Duration::from_secs(1))
+        .await;
+    assert!(report.connections.are_connections_released());
+    assert_eq!(report.runtime_shutdowns, 0);
+    assert!(!report.are_recorded_workers_drained());
+}
+
+#[tokio::test]
+async fn external_census_starts_one_actual_runtime_shutdown_and_seals_after_join_proof() {
+    let runtime = crate::McpRuntime::empty(true);
+    let root = runtime.retirement_owner();
+    let workers = runtime.worker_owner();
+    let report = root
+        .drain_workers_until(Instant::now() + Duration::from_secs(1))
+        .await;
+    assert!(report.are_recorded_workers_drained(), "{report:?}");
+    assert_eq!(report.runtime_shutdowns, 1);
+    assert_eq!(report.runtime_shutdowns_joined, 1);
+    assert_eq!(report.workers.len(), 1);
+    assert_eq!(report.workers[0].registered_at_end, 2);
+    assert!(report.workers[0].all_admission_closed);
+    runtime.shutdown().await;
+    assert!(matches!(
+        workers
+            .spawn(
+                &tokio::runtime::Handle::current(),
+                crate::McpWorkerKind::DiscoveryCleanup,
+                async {
+                    panic!("cleanup after positive seal");
+                }
+            )
+            .await,
+        crate::worker_joins::WorkerExit::NotAdmitted
+    ));
+    let replay = root
+        .drain_workers_until(Instant::now() + Duration::from_secs(1))
+        .await;
+    assert!(replay.are_recorded_workers_drained());
+    assert_eq!(
+        replay.workers[0].registered_at_end,
+        report.workers[0].registered_at_end
+    );
+    assert_eq!(replay.workers[0].counts, report.workers[0].counts);
+    assert_eq!(
+        replay.workers[0].refused_at_end,
+        report.workers[0].refused_at_end + 1
+    );
+}
+
+#[tokio::test]
+async fn birth_retained_shutdown_control_does_not_hold_current_snapshot_after_runtime_drop() {
+    let runtime = crate::McpRuntime::empty(true);
+    let root = runtime.retirement_owner();
+    let current = Arc::downgrade(&runtime.latest_connections());
+    drop(runtime);
+    assert!(current.upgrade().is_none());
+    let report = root
+        .drain_workers_until(Instant::now() + Duration::from_secs(1))
+        .await;
+    assert!(report.are_recorded_workers_drained(), "{report:?}");
+    assert_eq!(report.runtime_shutdowns_joined, 1);
+    assert_eq!(report.workers[0].registered_at_end, 1);
+}
+
+#[tokio::test]
+async fn cancelled_external_worker_drain_retains_actual_shutdown_for_later_observer() {
+    let runtime = crate::McpRuntime::empty(true);
+    let root = runtime.retirement_owner();
+    let mut observer = Box::pin(root.drain_workers_until(Instant::now() + Duration::from_secs(1)));
+    assert!(futures::poll!(&mut observer).is_pending());
+    drop(observer);
+    drop(runtime);
+    let report = root
+        .drain_workers_until(Instant::now() + Duration::from_secs(1))
+        .await;
+    assert!(report.are_recorded_workers_drained(), "{report:?}");
+    assert_eq!(report.runtime_shutdowns, 1);
+    assert_eq!(report.workers[0].registered_at_end, 2);
+}
+
+#[tokio::test]
+async fn expired_external_worker_drain_keeps_late_cleanup_and_uses_one_deadline() {
+    let runtime = crate::McpRuntime::empty(true);
+    let root = runtime.retirement_owner();
+    let workers = runtime.worker_owner();
+    let cleanup = workers.clone();
+    let release = Arc::new(tokio::sync::Notify::new());
+    let resume = Arc::clone(&release);
+    let called = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&called);
+    drop(workers.spawn(
+        &tokio::runtime::Handle::current(),
+        crate::McpWorkerKind::DeferredStartup,
+        async move {
+            resume.notified().await;
+            drop(cleanup.spawn(
+                &tokio::runtime::Handle::current(),
+                crate::McpWorkerKind::DiscoveryCleanup,
+                async move {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                },
+            ));
+        },
+    ));
+    let deadline = Instant::now() + Duration::from_millis(20);
+    let incomplete = root.drain_workers_until(deadline).await;
+    assert!(!incomplete.are_recorded_workers_drained());
+    assert!(!incomplete.workers[0].all_admission_closed);
+    assert_eq!(called.load(Ordering::SeqCst), 0);
+    release.notify_one();
+    let complete = root
+        .drain_workers_until(Instant::now() + Duration::from_secs(1))
+        .await;
+    assert!(complete.are_recorded_workers_drained(), "{complete:?}");
+    assert_eq!(called.load(Ordering::SeqCst), 1);
+    assert_eq!(complete.workers[0].registered_at_end, 4);
+    assert!(complete.workers[0].all_admission_closed);
+}
+
+#[tokio::test]
+async fn unsettled_generation_prevents_worker_seal_despite_empty_connection_population() {
+    let runtime = crate::McpRuntime::empty(true);
+    let root = runtime.retirement_owner();
+    let workers = runtime.worker_owner();
+    let constructor = root.admit_generation().unwrap();
+    let report = root
+        .drain_workers_until(Instant::now() + Duration::from_millis(20))
+        .await;
+    assert!(!report.are_recorded_workers_drained());
+    assert_eq!(report.connections.constructing_generations.len(), 1);
+    assert!(!report.workers[0].all_admission_closed);
+    assert!(matches!(
+        workers
+            .spawn(
+                &tokio::runtime::Handle::current(),
+                crate::McpWorkerKind::DiscoveryCleanup,
+                async {}
+            )
+            .await,
+        crate::worker_joins::WorkerExit::Joined
+    ));
+    drop(constructor);
+    let settled = root
+        .drain_workers_until(Instant::now() + Duration::from_secs(1))
+        .await;
+    assert!(settled.are_recorded_workers_drained(), "{settled:?}");
+    assert_eq!(settled.workers[0].registered_at_end, 3);
 }

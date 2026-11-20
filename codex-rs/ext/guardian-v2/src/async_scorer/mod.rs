@@ -3,14 +3,18 @@ mod approval;
 mod authorization;
 mod classification;
 mod config;
+mod conversation;
 mod coverage;
+mod decisions;
 mod extension;
 mod metrics;
 mod observation;
 mod parent_compaction;
+mod request;
 mod sampler;
 mod score;
 mod startup;
+mod tasks;
 mod transcript;
 mod truncation;
 mod trusted_skills;
@@ -18,3 +22,5 @@ mod trusted_tools;
 mod wrapper_lag;
 
 pub(crate) use extension::install;
+
+mod work;

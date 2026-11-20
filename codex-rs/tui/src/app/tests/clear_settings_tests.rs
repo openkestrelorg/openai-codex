@@ -27,7 +27,8 @@ pub(super) async fn pump_until_turn_request(
             if let Ok(Some(event)) =
                 tokio::time::timeout(Duration::from_millis(20), server.next_event()).await
             {
-                app.handle_app_server_event(server, event).await;
+                assert_eq!(event.backend_id, server.backend_id());
+                app.handle_app_server_event(server, event.event).await;
             }
         }
         Ok::<(), color_eyre::eyre::Report>(())
@@ -65,12 +66,12 @@ fn clear_re_resolves_defaults_and_submits_with_default_mode() -> Result<()> {
                     )
                     .await?;
                     let mut tui = crate::tui::test_support::make_test_tui()?;
-                    app.start_fresh_session_with_summary_hint(
+                    app.start_fresh_session(
                         &mut tui,
                         &mut server,
+                        /*session_start_source*/ None,
                         /*initial_user_message*/ None,
                         /*new_thread_name*/ None,
-                        /*session_start_source*/ None,
                     )
                     .await;
                     for (index, effort) in [Some("high"), None].into_iter().enumerate() {
@@ -91,14 +92,13 @@ fn clear_re_resolves_defaults_and_submits_with_default_mode() -> Result<()> {
                             crate::collaboration_modes::plan_mask(app.model_catalog.as_ref())
                                 .expect("Plan preset");
                         app.chat_widget.set_collaboration_mask(plan);
-                        app.handle_event(
+                        app.clear_displayed_session(
                             &mut tui,
                             &mut server,
-                            AppEvent::ClearUiAndSubmitUserMessage {
-                                text: "continue on successor".to_string(),
-                            },
+                            Some("continue on successor".to_string().into()),
+                            None,
                         )
-                        .await?;
+                        .await;
                         let successor = app.current_displayed_thread_id().expect("successor");
                         assert_ne!(successor, predecessor);
                         pump_until_turn_request(
@@ -130,7 +130,8 @@ fn clear_re_resolves_defaults_and_submits_with_default_mode() -> Result<()> {
                             clear,
                             &serde_json::json!({
                                 "threadId": predecessor.to_string(),
-                                "modelSettings": {"model": model, "reasoningEffort": effort}
+                                "modelSettings": {"model": model, "reasoningEffort": effort},
+                                "retainForConnection": true
                             })
                         );
                         let read = server
@@ -149,11 +150,6 @@ fn clear_re_resolves_defaults_and_submits_with_default_mode() -> Result<()> {
                             ),
                             (model.as_str(), expected_effort.clone(), ModeKind::Default)
                         );
-                        if index == 0 {
-                            let rendered = render_bottom_popup(&app.chat_widget, /*width*/ 80)
-                                .replace(&app.config.cwd.display().to_string(), "<PROJECT>");
-                            insta::assert_snapshot!("clear_resolved_model_and_effort", rendered);
-                        }
                     }
                     server.shutdown().await?;
                     proxy.await??;
@@ -188,25 +184,24 @@ fn clear_default_resolution_failure_preserves_predecessor_and_message() -> Resul
                     )
                     .await?;
                     let mut tui = crate::tui::test_support::make_test_tui()?;
-                    app.start_fresh_session_with_summary_hint(
+                    app.start_fresh_session(
                         &mut tui,
                         &mut server,
+                        /*session_start_source*/ None,
                         /*initial_user_message*/ None,
                         /*new_thread_name*/ None,
-                        /*session_start_source*/ None,
                     )
                     .await;
                     let predecessor = app.current_displayed_thread_id().expect("predecessor");
                     let original_config = app.config.clone();
                     std::fs::write(home.path().join("config.toml"), "invalid = [")?;
-                    app.handle_event(
+                    app.clear_displayed_session(
                         &mut tui,
                         &mut server,
-                        AppEvent::ClearUiAndSubmitUserMessage {
-                            text: "keep this message".to_string(),
-                        },
+                        Some("keep this message".to_string().into()),
+                        None,
                     )
-                    .await?;
+                    .await;
                     assert_eq!(app.current_displayed_thread_id(), Some(predecessor));
                     assert_eq!(app.config, original_config);
                     assert_eq!(

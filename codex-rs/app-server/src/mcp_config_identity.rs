@@ -1,4 +1,5 @@
 use codex_core::config::Config;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::RwLock;
 
@@ -34,8 +35,32 @@ pub(crate) struct McpConfigIdentity {
 
 impl McpConfigIdentity {
     pub(crate) fn from_config(config: &Config) -> std::io::Result<Option<Self>> {
+        let Some(inputs) = config.config_layer_stack.mcp_user_input_identity() else {
+            return Ok(None);
+        };
+        let layers = inputs
+            .into_iter()
+            .map(|(file, version)| {
+                file.into_path_buf()
+                    .into_os_string()
+                    .into_string()
+                    .map(|file_path| McpConfigIdentityLayer { file_path, version })
+                    .map_err(|_| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "selected MCP configuration path is not valid UTF-8",
+                        )
+                    })
+            })
+            .collect::<std::io::Result<Vec<_>>>()?;
+        Ok((!layers.is_empty()).then_some(Self { layers }))
+    }
+
+    pub(crate) fn from_layers(
+        stack: &codex_config::ConfigLayerStack,
+    ) -> std::io::Result<Option<Self>> {
         let mut layers = Vec::new();
-        for layer in config.config_layer_stack.layers_low_to_high() {
+        for layer in stack.layers_low_to_high() {
             let codex_config::ConfigLayerSource::User { file, .. } = &layer.name else {
                 continue;
             };
@@ -60,14 +85,56 @@ impl McpConfigIdentity {
 }
 
 /// Process-scoped ownership of the last selected user configuration identity
-/// accepted by a strict MCP refresh.
+/// accepted by startup or a complete host-owned runtime transition.
+/// Live session membership, including delegates outside ThreadManager, must
+/// agree with that baseline before it can be reported.
 ///
 /// Reads and replacements are synchronous and intentionally short-lived; no
 /// caller may hold this lock while doing configuration or thread work.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct AppliedMcpConfigIdentity {
-    identity: Arc<RwLock<Option<McpConfigIdentity>>>,
+    state: Arc<RwLock<AppliedIdentityState>>,
     apply_gate: codex_core::RuntimeConfigChangeGate,
+}
+
+#[derive(Debug, Default)]
+struct AppliedIdentityState {
+    baseline: Option<McpConfigIdentity>,
+    next_member: u64,
+    untrackable: bool,
+    // None means a rejected or otherwise unidentifiable runtime publication.
+    members: BTreeMap<u64, Option<McpConfigIdentity>>,
+}
+
+struct RuntimeIdentityMember {
+    state: Arc<RwLock<AppliedIdentityState>>,
+    id: u64,
+}
+
+impl codex_core::RuntimeConfigMembership for RuntimeIdentityMember {
+    fn before_publication(&self, config: &Config, outcome: codex_core::ConfigRefreshOutcome) {
+        if let Ok(mut state) = self.state.write()
+            && let Some(member) = state.members.get_mut(&self.id)
+        {
+            *member = match outcome {
+                codex_core::ConfigRefreshOutcome::Published => {
+                    McpConfigIdentity::from_config(config).ok().flatten()
+                }
+                // Rejected swaps can carry old layers over a changed ordinary
+                // map. Those layers do not prove a known runtime identity.
+                codex_core::ConfigRefreshOutcome::Rejected => None,
+                codex_core::ConfigRefreshOutcome::Stale => return,
+            };
+        }
+    }
+}
+
+impl Drop for RuntimeIdentityMember {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.state.write() {
+            state.members.remove(&self.id);
+        }
+    }
 }
 
 impl AppliedMcpConfigIdentity {
@@ -77,24 +144,31 @@ impl AppliedMcpConfigIdentity {
             // unavailable UTF-8 wire identity is therefore retained as
             // unavailable and the read/reload request returns an ordinary
             // error instead of reporting a lossy identity.
-            identity: Arc::new(RwLock::new(
-                McpConfigIdentity::from_config(config).ok().flatten(),
-            )),
+            state: Arc::new(RwLock::new(AppliedIdentityState {
+                baseline: McpConfigIdentity::from_config(config).ok().flatten(),
+                ..AppliedIdentityState::default()
+            })),
             apply_gate: codex_core::RuntimeConfigChangeGate::default(),
         }
     }
 
     pub(crate) fn replace(&self, identity: Option<McpConfigIdentity>) {
-        if let Ok(mut retained_identity) = self.identity.write() {
-            *retained_identity = identity;
+        if let Ok(mut state) = self.state.write() {
+            state.baseline = identity;
         }
     }
 
     pub(crate) fn current(&self) -> Option<McpConfigIdentity> {
-        self.identity
-            .read()
-            .ok()
-            .and_then(|retained_identity| retained_identity.clone())
+        let state = self.state.read().ok()?;
+        if state.untrackable {
+            return None;
+        }
+        let baseline = state.baseline.as_ref()?;
+        state
+            .members
+            .values()
+            .all(|member| member.as_ref() == Some(baseline))
+            .then(|| baseline.clone())
     }
 
     /// A best-effort runtime reload can refresh only a subset of threads, so
@@ -123,6 +197,27 @@ impl codex_core::RuntimeConfigChangeListener for AppliedMcpConfigIdentity {
         // protocol identity. Fail closed until an app-server-owned complete
         // transition replaces it.
         self.invalidate();
+    }
+
+    fn register_runtime_config(
+        &self,
+        config: &Config,
+    ) -> Option<Arc<dyn codex_core::RuntimeConfigMembership>> {
+        let mut state = self.state.write().ok()?;
+        let id = state.next_member;
+        let Some(next_member) = id.checked_add(1) else {
+            state.baseline = None;
+            state.untrackable = true;
+            return None;
+        };
+        state.next_member = next_member;
+        state
+            .members
+            .insert(id, McpConfigIdentity::from_config(config).ok().flatten());
+        Some(Arc::new(RuntimeIdentityMember {
+            state: Arc::clone(&self.state),
+            id,
+        }))
     }
 }
 
@@ -220,7 +315,6 @@ mod tests {
         );
         Ok(())
     }
-
     #[tokio::test]
     async fn apply_lock_serializes_runtime_identity_transitions() {
         let identity = AppliedMcpConfigIdentity::default();
@@ -258,5 +352,115 @@ mod tests {
         first.await.expect("first task succeeds");
         second_entered_rx.await.expect("second transition enters");
         second.await.expect("second task succeeds");
+    }
+
+    #[tokio::test]
+    async fn live_delegate_with_old_layers_withholds_a_new_complete_baseline() -> anyhow::Result<()>
+    {
+        use codex_core::RuntimeConfigChangeListener;
+        let home = tempdir()?;
+        let file = home.path().join(codex_config::CONFIG_TOML_FILE);
+        std::fs::write(&file, "[features]\nplugins = false\n")?;
+        let manager = ConfigManager::without_managed_config_for_tests(home.path().to_path_buf());
+        let old = manager.load_latest_config(None).await?;
+        let applied = AppliedMcpConfigIdentity::from_startup_config(&old);
+        let parent = applied
+            .register_runtime_config(&old)
+            .expect("parent member");
+        let delegate = applied
+            .register_runtime_config(&old)
+            .expect("delegate member");
+        let retained_runtime = Arc::new(codex_mcp::McpRuntime::empty(false));
+        retained_runtime.retain_lifetime_guard(Box::new(Arc::clone(&delegate)));
+        std::fs::write(
+            &file,
+            "[features]\nplugins = false\nsecret_auth_storage = true\n",
+        )?;
+        let next = manager.load_latest_config(None).await?;
+        let next_identity = McpConfigIdentity::from_config(&next)?;
+        let guard = applied.lock_apply().await;
+        applied.invalidate();
+        parent.before_publication(&next, codex_core::ConfigRefreshOutcome::Published);
+        applied.replace(next_identity.clone());
+        assert!(
+            applied.current().is_none(),
+            "the unenumerated delegate still uses old layers"
+        );
+        drop(guard);
+        // Dropping one observer must not retire a runtime still owned elsewhere.
+        let retained_delegate = Arc::clone(&delegate);
+        drop(delegate);
+        assert!(applied.current().is_none());
+        drop(retained_delegate);
+        assert!(
+            applied.current().is_none(),
+            "a retained MCP runtime still owns its provenance"
+        );
+        drop(retained_runtime);
+        assert_eq!(applied.current(), next_identity);
+        drop(parent);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejected_member_cannot_reuse_its_old_layer_identity() -> anyhow::Result<()> {
+        use codex_core::RuntimeConfigChangeListener;
+        let home = tempdir()?;
+        let manager = ConfigManager::without_managed_config_for_tests(home.path().to_path_buf());
+        let config = manager.load_latest_config(None).await?;
+        let applied = AppliedMcpConfigIdentity::from_startup_config(&config);
+        let baseline = applied.current();
+        assert!(baseline.is_some());
+        let member = applied
+            .register_runtime_config(&config)
+            .expect("runtime member");
+        member.before_publication(&config, codex_core::ConfigRefreshOutcome::Rejected);
+        applied.replace(baseline.clone());
+        assert!(
+            applied.current().is_none(),
+            "old layer bytes do not identify a mixed rejected runtime"
+        );
+        member.before_publication(&config, codex_core::ConfigRefreshOutcome::Stale);
+        assert!(
+            applied.current().is_none(),
+            "a stale refusal cannot repair unknown provenance"
+        );
+        member.before_publication(&config, codex_core::ConfigRefreshOutcome::Published);
+        assert_eq!(applied.current(), baseline);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancelled_start_membership_is_removed_without_advancing_the_baseline()
+    -> anyhow::Result<()> {
+        use codex_core::RuntimeConfigChangeListener;
+        let home = tempdir()?;
+        let file = home.path().join(codex_config::CONFIG_TOML_FILE);
+        std::fs::write(&file, "[features]\nplugins = false\n")?;
+        let manager = ConfigManager::without_managed_config_for_tests(home.path().to_path_buf());
+        let old = manager.load_latest_config(None).await?;
+        let applied = AppliedMcpConfigIdentity::from_startup_config(&old);
+        let baseline = applied.current();
+        std::fs::write(
+            &file,
+            "[features]\nplugins = false\nsecret_auth_storage = true\n",
+        )?;
+        let next = manager.load_latest_config(None).await?;
+        let starting = applied
+            .register_runtime_config(&next)
+            .expect("starting runtime member");
+        assert!(applied.current().is_none());
+        drop(starting);
+        assert_eq!(applied.current(), baseline);
+        applied.invalidate();
+        let matching = applied
+            .register_runtime_config(&old)
+            .expect("matching runtime member");
+        drop(matching);
+        assert!(
+            applied.current().is_none(),
+            "member retirement cannot invent a completed reload"
+        );
+        Ok(())
     }
 }

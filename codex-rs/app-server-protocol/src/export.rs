@@ -53,6 +53,7 @@ const EXPERIMENTAL_CLIENT_METHOD_DEPENDENCY_TYPES: &[&str] = &[
     "BedrockEnvironmentCredential",
     "EnvironmentShellInfo",
     "EnvironmentStatusKind",
+    "GuardianAssessmentOutcome",
     "ManagedTransitionIntent",
     "ManagedTransitionPhase",
     "ManagedTransitionRefusal",
@@ -61,6 +62,7 @@ const EXPERIMENTAL_CLIENT_METHOD_DEPENDENCY_TYPES: &[&str] = &[
     "RemoteControlClient",
     "RemoteControlClientsListOrder",
     "ThreadBackgroundTerminal",
+    "ThreadGuardianAssessment",
     "ThreadRetentionRefusalReason",
     "ThreadSearchOccurrence",
     "ThreadSearchTextRange",
@@ -141,6 +143,7 @@ pub fn generate_ts_with_options(
     export_client_responses(out_dir)?;
     ClientNotification::export_all_to(out_dir)?;
     crate::UserVerificationRpcError::export_all_to(out_dir)?;
+    crate::ModelProviderError::export_all_to(out_dir)?;
 
     ServerRequest::export_all_to(out_dir)?;
     export_server_responses(out_dir)?;
@@ -241,6 +244,10 @@ pub fn generate_json_with_experimental(out_dir: &Path, experimental_api: bool) -
     schemas.push(write_json_schema::<crate::UserVerificationRpcError>(
         out_dir,
         "v2::UserVerificationRpcError",
+    )?);
+    schemas.push(write_json_schema::<crate::ModelProviderError>(
+        out_dir,
+        "v2::ModelProviderError",
     )?);
     schemas.extend(export_client_param_schemas(out_dir)?);
     schemas.extend(export_client_response_schemas(out_dir)?);
@@ -1093,6 +1100,13 @@ fn build_schema_bundle(schemas: Vec<GeneratedSchema>) -> Result<Value> {
             continue;
         }
 
+        // Standalone roots declare the dialect; embedded definitions inherit
+        // the bundle's dialect. Normalize only this root metadata before the
+        // strict duplicate-definition comparison below.
+        if let Value::Object(ref mut object) = value {
+            object.remove("$schema");
+        }
+
         if let Some(ref ns) = namespace {
             rewrite_refs_to_namespace(&mut value, ns);
         } else {
@@ -1426,6 +1440,11 @@ where
             strip_v1_server_notification_variants_from_json_schema(&mut schema_value);
             add_server_notification_emitted_at_to_json_schema(&mut schema_value)?;
         }
+        if let Some(Value::Object(error_schema)) =
+            schema_value.pointer_mut("/definitions/CodexErrorInfo")
+        {
+            keep_enum_open_ended(error_schema);
+        }
         enforce_numbered_definition_collision_overrides(file_stem, &mut schema_value);
         annotate_schema(&mut schema_value, Some(file_stem));
     }
@@ -1455,6 +1474,13 @@ where
         logical_name: logical_name.to_string(),
         value: schema_value,
     })
+}
+
+fn keep_enum_open_ended(schema: &mut Map<String, Value>) {
+    if let Some(Value::Array(mut variants)) = schema.remove("oneOf") {
+        variants.push(serde_json::json!({ "type": ["string", "object"] }));
+        schema.insert("anyOf".to_string(), Value::Array(variants));
+    }
 }
 
 fn add_server_notification_emitted_at_to_json_schema(schema: &mut Value) -> Result<()> {
@@ -2247,12 +2273,28 @@ mod tests {
             "params?: GetAccountRateLimitsParams | undefined, }"
         );
         assert!(client_request_ts.contains(LEGACY_ACCOUNT_RATE_LIMITS_REQUEST));
+        const LEGACY_GATEWAY_READ_REQUEST: &str = concat!(
+            "{ \"method\": \"account/gatewayOAuth/read\", id: RequestId, ",
+            "params?: GatewayOAuthReadParams | null | undefined, }"
+        );
+        assert!(client_request_ts.contains(LEGACY_GATEWAY_READ_REQUEST));
+        const LEGACY_GATEWAY_LOGIN_REQUEST: &str = concat!(
+            "{ \"method\": \"account/gatewayOAuth/login\", id: RequestId, ",
+            "params?: GatewayOAuthLoginParams | null | undefined, }"
+        );
+        assert!(client_request_ts.contains(LEGACY_GATEWAY_LOGIN_REQUEST));
         let account_usage_response_ts = std::str::from_utf8(
             fixture_tree
                 .get(Path::new("v2/GetAccountTokenUsageResponse.ts"))
                 .ok_or_else(|| anyhow::anyhow!("missing account usage response fixture"))?,
         )?;
         assert!(account_usage_response_ts.contains("threadUsage?: ThreadUsage | null"));
+        let mcp_login_completion_ts = std::str::from_utf8(
+            fixture_tree
+                .get(Path::new("v2/McpServerOauthLoginCompletedNotification.ts"))
+                .ok_or_else(|| anyhow::anyhow!("missing MCP login completion fixture"))?,
+        )?;
+        assert!(mcp_login_completion_ts.contains("loginId?: string | null"));
         let server_request_ts = std::str::from_utf8(
             fixture_tree
                 .get(Path::new("ServerRequest.ts"))
@@ -2304,14 +2346,14 @@ mod tests {
                 continue;
             }
 
-            // Only allow "?: T | null" in objects representing JSON-RPC requests,
-            // which we assume are called "*Params".
+            // Allow "?: T | null" in JSON-RPC request objects and nested request types.
             let allow_optional_nullable = path
                 .file_stem()
                 .and_then(|stem| stem.to_str())
                 .is_some_and(|stem| {
                     stem.ends_with("Params")
                         || stem == "InitializeCapabilities"
+                        || stem == "AdditionalContextEntry"
                         || matches!(
                             stem,
                             "CollabAgentRef"
@@ -2325,18 +2367,22 @@ mod tests {
                 });
 
             let contents = std::str::from_utf8(contents)?;
-            // Both stable usage RPCs originally required `params: undefined`. Preserve that
+            // These existing RPCs originally required `params: undefined`. Preserve that
             // source compatibility only for these exact envelopes, not arbitrary new fields.
             let checked_contents = if path == Path::new("ClientRequest.ts") {
                 contents
                     .replace(LEGACY_ACCOUNT_USAGE_REQUEST, "")
                     .replace(LEGACY_ACCOUNT_RATE_LIMITS_REQUEST, "")
+                    .replace(LEGACY_GATEWAY_READ_REQUEST, "")
+                    .replace(LEGACY_GATEWAY_LOGIN_REQUEST, "")
             } else {
                 contents.to_owned()
             };
             if checked_contents.contains("| undefined") {
                 undefined_offenders.push(path.clone());
             }
+            // The exact gateway envelopes above also accept legacy null params.
+            let contents = checked_contents.as_str();
 
             const SKIP_PREFIXES: &[&str] = &[
                 "const ",
@@ -2446,14 +2492,26 @@ mod tests {
 
                 // If the last non-whitespace before ':' is '?', then this is an
                 // optional field with a nullable type (i.e., "?: T | null").
-                // These are only allowed in *Params types, except the additive stable usage
-                // response field, which older servers omit and newer servers return as null.
-                let legacy_account_usage_response = path
+                // These are only allowed in *Params types, except additive stable fields
+                // that older servers omit and newer servers may return as null.
+                let legacy_optional_nullable_field = (path
                     == Path::new("v2/GetAccountTokenUsageResponse.ts")
-                    && field_prefix.trim() == "threadUsage?";
+                    && field_prefix.trim() == "threadUsage?")
+                    || (path == Path::new("v2/ThreadUsage.ts")
+                        && field_prefix.trim() == "nativeUsageUsdMicros?")
+                    || (path == Path::new("v2/ThreadItem.ts")
+                        && matches!(field_prefix.trim(), "startedAtMs?" | "completedAtMs?"))
+                    || (path == Path::new("v2/McpServerOauthLoginCompletedNotification.ts")
+                        && field_prefix.trim() == "loginId?")
+                    || (path == Path::new("v2/ProcessExitedNotification.ts")
+                        && field_prefix.trim() == "outputDrainTimedOut?")
+                    || (path == Path::new("v2/MisalignmentErrorDetails.ts")
+                        && field_prefix.trim() == "reviewTarget?")
+                    || (path == Path::new("v2/ItemCompletedNotification.ts")
+                        && field_prefix.trim() == "contentTokenCount?");
                 if field_prefix.chars().rev().find(|c| !c.is_whitespace()) == Some('?')
                     && !allow_optional_nullable
-                    && !legacy_account_usage_response
+                    && !legacy_optional_nullable_field
                 {
                     let line_number =
                         contents[..abs_idx].chars().filter(|c| *c == '\n').count() + 1;
@@ -2521,6 +2579,8 @@ mod tests {
             "ManagedTransitionRefusal",
             "ManagedTransitionRefusalKind",
             "ManagedTransitionStatus",
+            "ManagedTransitionStatusNotification",
+            "ThreadRetentionRefusalReason",
         ] {
             assert!(
                 !typescript_dir
@@ -2561,10 +2621,29 @@ mod tests {
             "ManagedTransitionRefusal",
             "ManagedTransitionRefusalKind",
             "ManagedTransitionStatus",
+            "ManagedTransitionStatusNotification",
+            "ThreadRetentionRefusalReason",
         ] {
             assert!(!stable_json_definitions.contains_key(type_name));
             assert!(experimental_typescript_index.contains(type_name));
             assert!(experimental_json_definitions.contains_key(type_name));
+        }
+
+        for file in ["ServerNotification.ts", "ServerNotificationEnvelope.ts"] {
+            let stable = fs::read_to_string(typescript_dir.join(file))?;
+            let experimental = fs::read_to_string(experimental_typescript_dir.join(file))?;
+            assert!(!stable.contains("account/managedAuthTransition/updated"));
+            assert!(experimental.contains("account/managedAuthTransition/updated"));
+        }
+        for file in [
+            "ServerNotification.json",
+            "codex_app_server_protocol.schemas.json",
+            "codex_app_server_protocol.v2.schemas.json",
+        ] {
+            let stable = fs::read_to_string(json_dir.join(file))?;
+            let experimental = fs::read_to_string(experimental_json_dir.join(file))?;
+            assert!(!stable.contains("account/managedAuthTransition/updated"));
+            assert!(experimental.contains("account/managedAuthTransition/updated"));
         }
 
         Ok(())
@@ -2613,28 +2692,35 @@ mod tests {
     }
 
     #[test]
-    fn stable_schema_filter_removes_mock_thread_start_field() -> Result<()> {
-        let output_dir = std::env::temp_dir().join(format!("codex_schema_{}", Uuid::now_v7()));
-        fs::create_dir(&output_dir)?;
-        let schema = write_json_schema_with_return::<v2::ThreadStartParams>(
-            &output_dir,
-            "ThreadStartParams",
+    fn retention_response_bundles_as_root_and_nested_definition() -> Result<()> {
+        let out = tempfile::tempdir()?;
+        let carrier =
+            write_json_schema::<v2::ThreadStartResponse>(out.path(), "v2::ThreadStartResponse")?;
+        let response = write_json_schema::<v2::ThreadRetentionAcquireResponse>(
+            out.path(),
+            "v2::ThreadRetentionAcquireResponse",
         )?;
-        let mut bundle = build_schema_bundle(vec![schema])?;
-        filter_experimental_schema(&mut bundle)?;
+        assert!(response.value.get("$schema").is_some());
+        let bundle = build_schema_bundle(vec![carrier, response])?;
+        let response = &bundle["definitions"]["v2"]["ThreadRetentionAcquireResponse"];
+        assert!(response.get("$schema").is_none());
+        assert!(response.get("oneOf").is_some());
+        assert_eq!(bundle["$schema"], "http://json-schema.org/draft-07/schema#");
+        Ok(())
+    }
 
-        let definitions = bundle["definitions"]
-            .as_object()
-            .expect("schema bundle should include definitions");
-        let (_, def_schema) = definitions
-            .iter()
-            .find(|(name, _)| definition_matches_type(name, "ThreadStartParams"))
-            .expect("ThreadStartParams definition should exist");
-        let properties = def_schema["properties"]
-            .as_object()
-            .expect("ThreadStartParams should have properties");
-        assert_eq!(properties.contains_key("mockExperimentalField"), false);
-        let _cleanup = fs::remove_dir_all(&output_dir);
+    #[test]
+    fn retention_response_bundle_still_refuses_structural_collision() -> Result<()> {
+        let out = tempfile::tempdir()?;
+        let carrier =
+            write_json_schema::<v2::ThreadStartResponse>(out.path(), "v2::ThreadStartResponse")?;
+        let mut response = write_json_schema::<v2::ThreadRetentionAcquireResponse>(
+            out.path(),
+            "v2::ThreadRetentionAcquireResponse",
+        )?;
+        response.value["oneOf"][0]["additionalProperties"] = Value::Bool(true);
+        let error = build_schema_bundle(vec![carrier, response]).unwrap_err();
+        assert!(error.to_string().contains("schema definition collision"));
         Ok(())
     }
 
@@ -3043,21 +3129,6 @@ permissionProfile?: string | null};
             filtered.contains(r#"import type { SandboxPolicy } from "./SandboxPolicy";"#),
             true
         );
-        Ok(())
-    }
-
-    #[test]
-    fn stable_schema_filter_removes_mock_experimental_method() -> Result<()> {
-        let output_dir = std::env::temp_dir().join(format!("codex_schema_{}", Uuid::now_v7()));
-        fs::create_dir(&output_dir)?;
-        let schema =
-            write_json_schema_with_return::<crate::ClientRequest>(&output_dir, "ClientRequest")?;
-        let mut bundle = build_schema_bundle(vec![schema])?;
-        filter_experimental_schema(&mut bundle)?;
-
-        let bundle_str = serde_json::to_string(&bundle)?;
-        assert_eq!(bundle_str.contains("mock/experimentalMethod"), false);
-        let _cleanup = fs::remove_dir_all(&output_dir);
         Ok(())
     }
 

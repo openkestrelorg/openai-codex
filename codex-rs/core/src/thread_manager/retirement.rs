@@ -18,9 +18,12 @@ use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::Weak;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use tokio::sync::Notify;
 use tokio::sync::oneshot;
 use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ConstructionOutcome {
@@ -32,17 +35,33 @@ struct Construction {
     completion: Shared<BoxFuture<'static, ConstructionOutcome>>,
     account_dependent: bool,
     startup: Arc<SessionStartupCustody>,
+    publication: ConstructionPublication,
 }
+
+#[cfg(test)]
+type PublicationProbe = Arc<dyn Fn(&Arc<CodexThread>) + Send + Sync>;
 
 #[derive(Default)]
 struct State {
     closed: bool,
     deadline: Option<Instant>,
+    // The host's shutdown-edge deadline (latched, only tightens). A runtime
+    // published after it is bound at publication.
+    shutdown_deadline: Option<Instant>,
     constructions: Vec<Construction>,
     panicked: bool,
     terminal: Option<ConstructionDrain>,
     published: Vec<Arc<CodexThread>>,
     compacted: usize,
+    #[cfg(test)]
+    pause_after_publish: Option<(Arc<Notify>, Arc<Notify>)>,
+    /// Runs right after a runtime becomes visible in the registry and the
+    /// lookup map, outside the registry mutex.
+    #[cfg(test)]
+    publication_probe: Option<PublicationProbe>,
+    /// Runs at the start of every compaction, outside the registry mutex.
+    #[cfg(test)]
+    compaction_probe: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 #[path = "population.rs"]
@@ -58,28 +77,209 @@ pub(super) struct ThreadConstructions {
 pub(super) struct ConstructionTicket(Weak<Mutex<State>>, Arc<Notify>);
 
 /// Caller cancellation and final map publication share one synchronous gate.
+/// Observer departure before the publication commit is also delivered to the
+/// retained constructor as a cancellation request; after the commit it is an
+/// ordinary departure and the published thread takes ordinary retirement.
 #[derive(Clone)]
-pub(super) struct ConstructionPublication(Arc<Mutex<bool>>);
+pub(super) struct ConstructionPublication {
+    gate: Arc<Mutex<PublicationGate>>,
+    cancel: CancellationToken,
+    expired: CancellationToken,
+    started: Arc<AtomicBool>,
+    registry: Weak<Mutex<State>>,
+    activity: Arc<Notify>,
+}
 
-struct ObserverGuard(ConstructionPublication);
+struct PublicationGate {
+    alive: bool,
+    published: bool,
+}
+
+struct ObserverGuard {
+    publication: ConstructionPublication,
+    completion: Shared<BoxFuture<'static, ConstructionOutcome>>,
+}
 
 impl Drop for ObserverGuard {
     fn drop(&mut self) {
-        *self
-            .0
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = false;
+        // Check-and-refuse under the publication gate: either the commit has
+        // happened (no request), or no commit can follow (alive is false).
+        let published = {
+            let mut gate = self
+                .publication
+                .gate
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            gate.alive = false;
+            gate.published
+        };
+        // A published start takes ordinary retirement and a finished one needs
+        // nothing; neither receives a constructor cancellation.
+        if published || self.completion.peek().is_some() {
+            return;
+        }
+        // Every other departure is an idempotent cancellation request to the
+        // retained constructor, whether or not admission is still open and
+        // whether or not it was ever polled. The request drives nothing by
+        // itself: the constructor consumes it only if something else polls
+        // it, its cancellation arm is gated by `unless_published`, and its
+        // cleanup stays clamped to the registry deadline, so it can neither
+        // extend nor bypass shutdown.
+        self.publication.cancel.cancel();
+        // The checks below only decide whether to spawn a progress observer.
+        // A never-polled constructor owns no startup work and must not be
+        // started by its departing observer. Once admission is closed the
+        // manager drain owns driving this constructor to its deadline.
+        if !self.publication.started.load(Ordering::Acquire) {
+            return;
+        }
+        let open = self.publication.registry.upgrade().is_some_and(|registry| {
+            let state = registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            !state.closed
+        });
+        if !open {
+            return;
+        }
+        // The registry keeps the original Shared and its recorded outcome. This
+        // clone only supplies progress, and stops at the same clamped registry
+        // deadline as the constructor's cleanup. Dropping it (e.g. runtime
+        // shutdown) leaves the original, still counted, in the registry.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let mut completion = self.completion.clone();
+            let clock = self.publication.clone();
+            drop(handle.spawn(async move {
+                let _ = observe_until_expiry(&mut completion, &clock).await;
+            }));
+        }
     }
 }
 
 impl ConstructionPublication {
-    pub(super) fn publish<T>(&self, publication: impl FnOnce() -> T) -> CodexResult<T> {
-        let alive = self.0.lock().map_err(|_| CodexErr::InternalAgentDied)?;
-        if !*alive {
+    /// The commit is recorded under the same gate as the insert, and only if
+    /// the insert succeeded.
+    pub(super) fn publish<T>(
+        &self,
+        publication: impl FnOnce() -> CodexResult<T>,
+    ) -> CodexResult<T> {
+        let mut gate = self.gate.lock().map_err(|_| CodexErr::InternalAgentDied)?;
+        if !gate.alive {
             return Err(CodexErr::InternalAgentDied);
         }
-        Ok(publication())
+        let published = publication()?;
+        gate.published = true;
+        Ok(published)
+    }
+
+    /// Registry-expiry refusal through the same gate as the commit. Returns
+    /// false (and does nothing) if this start already published: ordinary
+    /// retirement applies. Otherwise publication can no longer commit and the
+    /// constructor is asked to stop.
+    pub(super) fn refuse_unpublished(&self) -> bool {
+        {
+            let mut gate = self
+                .gate
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if gate.published {
+                return false;
+            }
+            gate.alive = false;
+        }
+        self.expired.cancel();
+        true
+    }
+
+    pub(super) fn expiry_cancellation(&self) -> CancellationToken {
+        self.expired.clone()
+    }
+
+    /// Resolves after `signal`, unless this start has committed publication by
+    /// then; a published start only leaves through ordinary retirement.
+    pub(super) async fn unless_published(&self, signal: impl std::future::Future<Output = ()>) {
+        signal.await;
+        if self.is_published() {
+            std::future::pending::<()>().await;
+        }
+    }
+
+    pub(super) fn is_published(&self) -> bool {
+        self.gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .published
+    }
+
+    /// Cancelled when the caller's observer goes away before completion and
+    /// before the publication commit, including after admission has closed.
+    pub(super) fn observer_cancellation(&self) -> CancellationToken {
+        self.cancel.clone()
+    }
+
+    pub(in crate::thread_manager) fn registry_deadline(&self) -> Option<Instant> {
+        let registry = self.registry.upgrade()?;
+        let state = registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match (state.deadline, state.shutdown_deadline) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
+    /// Resolves at the earliest of `local` and the registry's latched
+    /// deadline, re-reading when admission closes or a drain latches one.
+    pub(super) async fn expiry(&self, local: Option<Instant>) {
+        ConstructionTicket(self.registry.clone(), Arc::clone(&self.activity))
+            .expiry(local)
+            .await;
+    }
+
+    /// The constructor's own terminal custody cleanup. It is bound to the
+    /// earliest applicable deadline and is never driven past a registry
+    /// deadline latched later. At expiry it stops polling, tightens the
+    /// custody bound and returns `None`; the retained cell then reports a
+    /// sticky `TimedOut` to every drain.
+    pub(super) async fn clamped_cleanup(
+        &self,
+        custody: &SessionStartupCustody,
+        budget: std::time::Duration,
+    ) -> Option<StartupCleanup> {
+        let local = Instant::now() + budget;
+        let deadline = self
+            .registry_deadline()
+            .map_or(local, |registry| registry.min(local));
+        let cleanup = tokio::select! {
+            biased;
+            _ = self.expiry(Some(local)) => None,
+            cleanup = custody.shutdown_until(deadline) => Some(cleanup),
+        };
+        if cleanup.is_none() {
+            let expired = self
+                .registry_deadline()
+                .map_or(local, |registry| registry.min(local));
+            custody.tighten_deadline(expired.min(Instant::now()));
+        }
+        cleanup
+    }
+
+    #[cfg(test)]
+    pub(super) async fn wait_after_publish_for_test(&self) {
+        let Some(registry) = self.registry.upgrade() else {
+            return;
+        };
+        let pause = {
+            let state = registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.pause_after_publish.clone()
+        };
+        drop(registry);
+        if let Some((entered, release)) = pause {
+            entered.notify_one();
+            release.notified().await;
+        }
     }
 }
 
@@ -94,11 +294,62 @@ pub(super) struct ConstructionDrain {
 }
 
 impl ThreadConstructions {
+    #[cfg(test)]
+    pub(in crate::thread_manager) fn first_startup_for_test(&self) -> Arc<SessionStartupCustody> {
+        Arc::clone(&self.state.lock().unwrap().constructions[0].startup)
+    }
+
+    #[cfg(test)]
+    pub(in crate::thread_manager) fn retains_without_compaction(
+        &self,
+        thread: &Arc<CodexThread>,
+    ) -> bool {
+        self.state
+            .lock()
+            .unwrap()
+            .published
+            .iter()
+            .any(|owned| Arc::ptr_eq(owned, thread))
+    }
+
+    /// Latch the host's shutdown-edge deadline (only tightens) and return the
+    /// published population to bind now. Synchronous: one short std mutex.
+    pub(super) fn latch_shutdown_deadline(&self, deadline: Instant) -> Vec<Arc<CodexThread>> {
+        population::compact(&self.state);
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let deadline = state
+            .shutdown_deadline
+            .map_or(deadline, |latched| latched.min(deadline));
+        state.shutdown_deadline = Some(deadline);
+        let published = state.published.clone();
+        let startups = state
+            .constructions
+            .iter()
+            .map(|entry| Arc::clone(&entry.startup))
+            .collect::<Vec<_>>();
+        drop(state);
+        // Early resources need the same permanent clock as already-published Sessions.
+        // Never take a startup/cleanup mutex under the registry mutex.
+        for startup in startups {
+            startup.tighten_shutdown_edge(deadline);
+        }
+        self.activity.notify_waiters();
+        published
+    }
+
     pub(super) fn close_until(&self, deadline: Instant) -> CodexResult<Instant> {
         let mut state = self.state.lock().map_err(|_| CodexErr::InternalAgentDied)?;
         state.closed = true;
         self.activity.notify_waiters();
-        Ok(*state.deadline.get_or_insert(deadline))
+        let deadline = state
+            .shutdown_deadline
+            .map_or(deadline, |edge| edge.min(deadline));
+        let bound = state.deadline.map_or(deadline, |first| first.min(deadline));
+        state.deadline = Some(bound);
+        Ok(bound)
     }
 
     pub(super) fn ticket(&self) -> ConstructionTicket {
@@ -190,16 +441,26 @@ impl ThreadConstructions {
             if !unavailable && let Some(report) = &state.terminal {
                 return report.clone();
             }
-            let deadline = *state.deadline.get_or_insert(deadline);
+            let deadline = state
+                .shutdown_deadline
+                .map_or(deadline, |edge| edge.min(deadline));
+            let deadline = state.deadline.map_or(deadline, |first| first.min(deadline));
+            state.deadline = Some(deadline);
             let pending = state
                 .constructions
                 .iter()
-                .map(|entry| (entry.completion.clone(), Arc::clone(&entry.startup)))
+                .map(|entry| {
+                    (
+                        entry.completion.clone(),
+                        Arc::clone(&entry.startup),
+                        entry.publication.clone(),
+                    )
+                })
                 .collect::<Vec<_>>();
             (deadline, pending, unavailable)
         };
         let observed = futures::future::join_all(pending.into_iter().map(
-            |(completion, startup)| async move {
+            |(mut completion, startup, publication)| async move {
                 // Unlike a JoinHandle, polling this future can start real work.
                 let outcome = if let Some(outcome) = completion.peek() {
                     Some(*outcome)
@@ -209,10 +470,27 @@ impl ThreadConstructions {
                     tokio::select! {
                         biased;
                         _ = tokio::time::sleep_until(deadline) => None,
-                        outcome = completion => Some(outcome),
+                        outcome = &mut completion => Some(outcome),
                     }
                 };
-                let cleanup = if outcome.is_some() {
+                // A missing outcome means the deadline has passed. An
+                // unpublished constructor is refused through its publication
+                // gate; a started one gets a single termination poll in which
+                // it drops its start and only inspects its elapsed custody. Its
+                // cell is then inspected under the elapsed bound, so pending
+                // custody reports a sticky TimedOut and an unfinished
+                // constructor stays counted. A published one retires ordinarily.
+                let refused = outcome.is_none() && publication.refuse_unpublished();
+                if refused {
+                    startup.tighten_deadline(deadline);
+                }
+                let outcome = match outcome {
+                    None if refused && publication.started.load(Ordering::Acquire) => {
+                        (&mut completion).now_or_never()
+                    }
+                    outcome => outcome,
+                };
+                let cleanup = if outcome.is_some() || refused {
                     match startup.shutdown_until(deadline).await {
                         StartupCleanup::NoUnpublishedSession => None,
                         cleanup => Some(cleanup),
@@ -261,6 +539,45 @@ impl ThreadConstructions {
 }
 
 impl ConstructionTicket {
+    /// The registry's latched deadline, if it is still reachable.
+    pub(super) fn deadline(&self) -> Option<Instant> {
+        let registry = self.0.upgrade()?;
+        let state = registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match (state.deadline, state.shutdown_deadline) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
+    /// Resolves at the earliest of `local` and the registry's latched
+    /// deadline, re-reading when admission closes or a drain latches one.
+    /// Holds only a weak registry reference.
+    pub(super) async fn expiry(&self, local: Option<Instant>) {
+        loop {
+            let changed = self.1.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let deadline = match (local, self.deadline()) {
+                (Some(local), Some(registry)) => Some(local.min(registry)),
+                (local, registry) => local.or(registry),
+            };
+            match deadline {
+                // An already-elapsed deadline resolves synchronously, without
+                // waiting for the next timer tick, so a caller polling expiry
+                // first can never poll new work after the deadline.
+                Some(deadline) if Instant::now() >= deadline => return,
+                Some(deadline) => tokio::select! {
+                    biased;
+                    _ = tokio::time::sleep_until(deadline) => return,
+                    _ = &mut changed => {}
+                },
+                None => changed.await,
+            }
+        }
+    }
+
     pub(super) fn register<F, Fut>(
         &self,
         account_work: Option<Box<dyn codex_extension_api::HostOperationWork>>,
@@ -273,7 +590,11 @@ impl ConstructionTicket {
         let registry = self.0.upgrade().ok_or(CodexErr::InternalAgentDied)?;
         population::compact(&registry);
         let mut state = registry.lock().map_err(|_| CodexErr::InternalAgentDied)?;
-        if state.closed {
+        if state.closed
+            || state
+                .shutdown_deadline
+                .is_some_and(|edge| Instant::now() >= edge)
+        {
             return Err(CodexErr::InternalAgentDied);
         }
         state.panicked |= state
@@ -284,13 +605,30 @@ impl ConstructionTicket {
             .constructions
             .retain(|entry| entry.completion.peek().is_none() || !entry.startup.is_empty());
         let startup = Arc::new(SessionStartupCustody::default());
+        if let Some(edge) = state.shutdown_deadline {
+            startup.tighten_shutdown_edge(edge);
+        }
+        // Lets lifetime cleanup outside this registry prove registry expiry.
+        let probe = self.clone();
+        startup.set_registry_deadline_probe(Box::new(move || probe.deadline()));
         let construction_startup = Arc::clone(&startup);
-        let publication = ConstructionPublication(Arc::new(Mutex::new(true)));
-        let observer = ObserverGuard(publication.clone());
+        let publication = ConstructionPublication {
+            gate: Arc::new(Mutex::new(PublicationGate {
+                alive: true,
+                published: false,
+            })),
+            cancel: CancellationToken::new(),
+            expired: CancellationToken::new(),
+            started: Arc::default(),
+            registry: Arc::downgrade(&registry),
+            activity: Arc::clone(&self.1),
+        };
+        let observer_publication = publication.clone();
         let (sender, receiver) = oneshot::channel();
         let account_dependent = account_work.is_some();
         let completion = async move {
             let _account_work = account_work;
+            publication.started.store(true, Ordering::Release);
             match AssertUnwindSafe(async move { factory(construction_startup, publication).await })
                 .catch_unwind()
                 .await
@@ -310,20 +648,111 @@ impl ConstructionTicket {
             completion: completion.clone(),
             account_dependent,
             startup,
+            publication: observer_publication.clone(),
         });
         self.1.notify_waiters();
+        drop(state);
+        let observer = ObserverGuard {
+            publication: observer_publication,
+            completion: completion.clone(),
+        };
         // The original is installed under the close gate before any polling.
         Ok(async move {
+            let mut completion = completion;
+            let clock = observer.publication.clone();
             let _observer = observer;
-            if completion.await == ConstructionOutcome::Panicked {
-                return Err(CodexErr::InternalAgentDied);
+            // A live observer stops driving at registry expiry too, and is
+            // refused instead of hanging. Its own published start still
+            // finishes for the caller awaiting this response.
+            match observe(&mut completion, &clock, PublishedAtExpiry::Finish).await {
+                Some(ConstructionOutcome::Returned) => {
+                    receiver.await.map_err(|_| CodexErr::InternalAgentDied)?
+                }
+                Some(ConstructionOutcome::Panicked) => Err(CodexErr::InternalAgentDied),
+                None => Err(CodexErr::TurnAborted),
             }
-            receiver.await.map_err(|_| CodexErr::InternalAgentDied)?
         }
         .boxed())
     }
 }
 
+/// What an observer does when the registry deadline expires after its start
+/// has already committed publication.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PublishedAtExpiry {
+    /// The live caller keeps receiving its own published start.
+    Finish,
+    /// A departed observer stops polling; the published thread takes
+    /// ordinary retirement and the registry keeps the original Shared.
+    Release,
+}
+
+/// Progress for a departed observer. It never polls the start at or after the
+/// registry deadline: at expiry an unpublished start is refused with a single
+/// termination poll, and a start that had already published is simply
+/// released, so no owner-retained polling of its post-publication steps
+/// outlives the deadline.
+async fn observe_until_expiry(
+    completion: &mut Shared<BoxFuture<'static, ConstructionOutcome>>,
+    clock: &ConstructionPublication,
+) -> Option<ConstructionOutcome> {
+    observe(completion, clock, PublishedAtExpiry::Release).await
+}
+
+/// Drive a retained constructor until it completes or the registry deadline
+/// expires. At expiry an unpublished start is refused through the publication
+/// gate and receives one termination poll, in which its biased expiry arm
+/// drops the start (e.g. pending MCP startup) and its clamped cleanup sees an
+/// elapsed bound; nothing is driven after that. A published start either
+/// keeps completing its post-publication steps for its live caller, or is
+/// released by a departed observer.
+async fn observe(
+    completion: &mut Shared<BoxFuture<'static, ConstructionOutcome>>,
+    clock: &ConstructionPublication,
+    published_at_expiry: PublishedAtExpiry,
+) -> Option<ConstructionOutcome> {
+    if published_at_expiry == PublishedAtExpiry::Release {
+        // Expiry is checked before every poll, synchronously against the
+        // latched deadline as well as through the timer (which may not have
+        // fired yet at the exact deadline instant). A departed observer thus
+        // never polls the start at or after the deadline, except for the
+        // single termination poll of a refused, unpublished start below.
+        let expiry = clock.expiry(/*local*/ None);
+        tokio::pin!(expiry);
+        let outcome = std::future::poll_fn(|cx| {
+            let elapsed = clock
+                .registry_deadline()
+                .is_some_and(|deadline| Instant::now() >= deadline);
+            if elapsed || expiry.as_mut().poll(cx).is_ready() {
+                return std::task::Poll::Ready(None);
+            }
+            completion.poll_unpin(cx).map(Some)
+        })
+        .await;
+        if outcome.is_some() {
+            return outcome;
+        }
+        if !clock.refuse_unpublished() {
+            return None;
+        }
+        return (&mut *completion).now_or_never();
+    }
+    let mut expired = false;
+    loop {
+        tokio::select! {
+            biased;
+            outcome = &mut *completion => return Some(outcome),
+            _ = clock.expiry(/*local*/ None), if !expired => {
+                if !clock.refuse_unpublished() {
+                    expired = true;
+                    continue;
+                }
+                return (&mut *completion).now_or_never();
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 #[path = "retirement_tests.rs"]
-mod tests;
+pub(crate) mod tests;

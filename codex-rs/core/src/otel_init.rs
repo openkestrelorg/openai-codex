@@ -68,7 +68,7 @@ fn provider_settings(
                 endpoint: endpoint.clone(),
                 headers: headers
                     .iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .map(|(name, value)| (name.clone(), value.as_str().to_owned()))
                     .collect(),
                 protocol,
                 tls: tls.as_ref().map(|config| OtelTlsSettings {
@@ -86,7 +86,7 @@ fn provider_settings(
             endpoint: endpoint.clone(),
             headers: headers
                 .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
+                .map(|(name, value)| (name.clone(), value.as_str().to_owned()))
                 .collect(),
             tls: tls.as_ref().map(|config| OtelTlsSettings {
                 ca_certificate: config.ca_certificate.clone(),
@@ -98,13 +98,15 @@ fn provider_settings(
 
     let exporter = to_otel_exporter(&config.otel.exporter);
     let trace_exporter = to_otel_exporter(&config.otel.trace_exporter);
-    let metrics_exporter = if config
-        .analytics_enabled
-        .unwrap_or(default_analytics_enabled)
+    // Analytics consent controls the built-in exporter, not explicit OTLP collectors.
+    let metrics_exporter = if matches!(config.otel.metrics_exporter, Kind::Statsig)
+        && !config
+            .analytics_enabled
+            .unwrap_or(default_analytics_enabled)
     {
-        to_otel_exporter(&config.otel.metrics_exporter)
-    } else {
         OtelExporter::None
+    } else {
+        to_otel_exporter(&config.otel.metrics_exporter)
     };
 
     let originator = originator();

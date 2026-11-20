@@ -36,6 +36,7 @@ async fn incomplete_chat_batches_retain_available_estimates_without_inventing_ze
             thread_id: "available".into(),
             estimated_usage_credits_micros: 1250000,
             estimated_usage_usd_micros: None,
+            native_usage_usd_micros: None,
             groups: Vec::new(),
         }]
     );
@@ -105,6 +106,8 @@ async fn slow_repairing_chat_listing_keeps_estimate_budget_and_ranks_across_page
         pages
     });
     let remote = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+        interactive_client: false,
+        required_human_approval: true,
         endpoint: RemoteAppServerEndpoint::WebSocket {
             websocket_url,
             auth_token: None,
@@ -112,7 +115,6 @@ async fn slow_repairing_chat_listing_keeps_estimate_budget_and_ranks_across_page
         client_name: "analytics-test".into(),
         client_version: "test".into(),
         experimental_api: false,
-        interactive_client: false,
         mcp_server_openai_form_elicitation: false,
         opt_out_notification_methods: Vec::new(),
         channel_capacity: 16,

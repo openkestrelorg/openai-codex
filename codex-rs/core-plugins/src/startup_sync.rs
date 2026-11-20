@@ -1,3 +1,4 @@
+use crate::retirement::WorkerStop;
 use std::fs::File;
 use std::path::Path;
 use std::path::PathBuf;
@@ -74,6 +75,57 @@ fn curated_plugins_sha_path(codex_home: &Path) -> PathBuf {
     codex_home.join(CURATED_PLUGINS_SHA_FILE)
 }
 
+use crate::retirement::WorkerStopScope as SyncStopScope;
+
+/// `min(cap, owner remaining)` for this thread's current step.
+fn step_budget(cap: Duration) -> Duration {
+    crate::retirement::current_worker_stop().step_timeout(cap)
+}
+
+fn sync_stopped() -> bool {
+    crate::retirement::ensure_worker_running("curated sync").is_err()
+}
+
+/// Checked between steps: at the shutdown deadline the worker schedules no
+/// further step and returns, so its retained join completes.
+fn ensure_not_stopped(next_step: &str) -> Result<(), String> {
+    if sync_stopped() {
+        return Err(format!(
+            "curated plugins sync stopped at the shutdown deadline before {next_step}"
+        ));
+    }
+    Ok(())
+}
+
+/// Bound an HTTP step on the worker's private runtime by the same budget.
+/// Dropping the request future cancels only this worker's own request.
+async fn with_step_budget<T>(
+    cap: Duration,
+    context: &str,
+    step: impl std::future::Future<Output = Result<T, String>>,
+) -> Result<T, String> {
+    crate::retirement::ensure_worker_running(context)?;
+    let stop = crate::retirement::current_worker_stop();
+    if !stop.is_managed() {
+        // Upstream's request builders already bound each individual request.
+        // Do not add an aggregate cap to existing unowned multi-request steps.
+        return step.await;
+    }
+    stop.run_until(cap, step)
+        .await
+        .ok_or_else(|| format!("{context} stopped by its step budget or the shutdown deadline"))?
+}
+
+/// As [`sync_openai_plugins_repo`], cooperatively stopped by `stop`.
+pub fn sync_openai_plugins_repo_until(
+    codex_home: &Path,
+    http_client_factory: HttpClientFactory,
+    stop: WorkerStop,
+) -> Result<String, String> {
+    let _scope = SyncStopScope::enter(stop);
+    sync_openai_plugins_repo(codex_home, http_client_factory)
+}
+
 pub fn sync_openai_plugins_repo(
     codex_home: &Path,
     http_client_factory: HttpClientFactory,
@@ -100,6 +152,7 @@ fn sync_openai_plugins_repo_with_transport_overrides(
     backup_archive_api_url: &str,
     http_client_factory: &HttpClientFactory,
 ) -> Result<String, String> {
+    ensure_not_stopped("the curated plugins sync lock")?;
     let _file_guard = lock_curated_plugins_startup_sync(codex_home)?;
 
     let git_sync_result = match git_binary {
@@ -121,7 +174,10 @@ fn sync_openai_plugins_repo_with_transport_overrides(
                     "git sync failed for curated plugin sync; falling back to GitHub HTTP"
                 );
             }
-            match sync_openai_plugins_repo_via_http(codex_home, api_base_url, http_client_factory) {
+            let http_result = ensure_not_stopped("the GitHub HTTP fallback").and_then(|()| {
+                sync_openai_plugins_repo_via_http(codex_home, api_base_url, http_client_factory)
+            });
+            match http_result {
                 Ok(remote_sha) => {
                     emit_curated_plugins_startup_sync_metric("http", "success");
                     emit_curated_plugins_startup_sync_final_metric("http", "success");
@@ -146,11 +202,14 @@ fn sync_openai_plugins_repo_with_transport_overrides(
                             backup_archive_api_url,
                             "GitHub HTTP sync failed for curated plugin sync; falling back to export archive"
                         );
-                        let result = sync_openai_plugins_repo_via_backup_archive(
-                            codex_home,
-                            backup_archive_api_url,
-                            http_client_factory,
-                        );
+                        let result =
+                            ensure_not_stopped("the export archive fallback").and_then(|()| {
+                                sync_openai_plugins_repo_via_backup_archive(
+                                    codex_home,
+                                    backup_archive_api_url,
+                                    http_client_factory,
+                                )
+                            });
                         let status = if result.is_ok() { "success" } else { "failure" };
                         emit_curated_plugins_startup_sync_metric("export_archive", status);
                         emit_curated_plugins_startup_sync_final_metric("export_archive", status);
@@ -176,9 +235,23 @@ fn lock_curated_plugins_startup_sync(codex_home: &Path) -> Result<File, String> 
         .truncate(false)
         .open(&lock_path)
         .map_err(|err| format!("failed to open curated plugins sync lock: {err}"))?;
-    lock_file
-        .lock()
-        .map_err(|err| format!("failed to lock curated plugins sync: {err}"))?;
+    let managed = crate::retirement::current_worker_stop().is_managed();
+    if managed {
+        loop {
+            ensure_not_stopped("the curated plugins sync lock")?;
+            match lock_file.try_lock() {
+                Ok(()) => break,
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    std::thread::sleep(step_budget(Duration::from_millis(10)));
+                }
+                Err(error) => return Err(format!("failed to lock curated plugins sync: {error}")),
+            }
+        }
+    } else {
+        lock_file
+            .lock()
+            .map_err(|err| format!("failed to lock curated plugins sync: {err}"))?;
+    }
     Ok(lock_file)
 }
 
@@ -195,6 +268,7 @@ fn sync_openai_plugins_repo_via_git(
         return Ok(remote_sha);
     }
 
+    ensure_not_stopped("git init")?;
     let staged_repo_dir = prepare_curated_repo_parent_and_temp_dir(&repo_path)?;
     run_git_in_repo(
         staged_repo_dir.path(),
@@ -203,8 +277,10 @@ fn sync_openai_plugins_repo_via_git(
         "git init curated plugins repo",
     )?;
 
+    ensure_not_stopped("git fetch")?;
     if repo_path.join(".git").is_dir() {
         fetch_curated_plugins_commit(&repo_path, &remote_sha, git_binary)?;
+        ensure_not_stopped("git copy of the fetched commit")?;
         fetch_curated_plugins_commit_from_source(
             staged_repo_dir.path(),
             &repo_path,
@@ -215,6 +291,7 @@ fn sync_openai_plugins_repo_via_git(
         fetch_curated_plugins_commit(staged_repo_dir.path(), &remote_sha, git_binary)?;
     }
 
+    ensure_not_stopped("git reset")?;
     reset_curated_plugins_checkout(staged_repo_dir.path(), git_binary)?;
     let fetched_sha = git_head_sha(staged_repo_dir.path(), git_binary)?;
     if fetched_sha != remote_sha {
@@ -224,6 +301,9 @@ fn sync_openai_plugins_repo_via_git(
     }
 
     ensure_marketplace_manifest_exists(staged_repo_dir.path())?;
+    // Last stop point: activation is a short local rename and is never
+    // interrupted once begun.
+    ensure_not_stopped("activating the curated plugins checkout")?;
     activate_curated_repo(&repo_path, staged_repo_dir)?;
     write_curated_plugins_sha(&sha_path, &remote_sha)?;
     Ok(remote_sha)
@@ -316,8 +396,11 @@ fn sync_openai_plugins_repo_via_http(
         .build()
         .map_err(|err| format!("failed to create curated plugins sync runtime: {err}"))?;
     let http_clients = StartupSyncHttpClient::new(http_client_factory);
-    let remote_sha =
-        runtime.block_on(fetch_curated_repo_remote_sha(&http_clients, api_base_url))?;
+    let remote_sha = runtime.block_on(with_step_budget(
+        CURATED_PLUGINS_HTTP_TIMEOUT,
+        "GitHub curated plugins SHA request",
+        fetch_curated_repo_remote_sha(&http_clients, api_base_url),
+    ))?;
     let local_sha = read_sha_file(&sha_path);
 
     if local_sha.as_deref() == Some(remote_sha.as_str()) && repo_path.is_dir() {
@@ -325,10 +408,11 @@ fn sync_openai_plugins_repo_via_http(
     }
 
     let staged_repo_dir = prepare_curated_repo_parent_and_temp_dir(&repo_path)?;
-    let zipball_bytes = runtime.block_on(fetch_curated_repo_zipball(
-        &http_clients,
-        api_base_url,
-        &remote_sha,
+    ensure_not_stopped("the GitHub zipball download")?;
+    let zipball_bytes = runtime.block_on(with_step_budget(
+        CURATED_PLUGINS_HTTP_TIMEOUT,
+        "GitHub curated plugins zipball download",
+        fetch_curated_repo_zipball(&http_clients, api_base_url, &remote_sha),
     ))?;
     extract_zipball_to_dir(&zipball_bytes, staged_repo_dir.path())?;
     ensure_marketplace_manifest_exists(staged_repo_dir.path())?;
@@ -350,9 +434,10 @@ fn sync_openai_plugins_repo_via_backup_archive(
         .map_err(|err| format!("failed to create curated plugins sync runtime: {err}"))?;
     let staged_repo_dir = prepare_curated_repo_parent_and_temp_dir(&repo_path)?;
     let http_clients = StartupSyncHttpClient::new(http_client_factory);
-    let zipball_bytes = runtime.block_on(fetch_curated_repo_backup_archive_zip(
-        &http_clients,
-        backup_archive_api_url,
+    let zipball_bytes = runtime.block_on(with_step_budget(
+        CURATED_PLUGINS_BACKUP_ARCHIVE_TIMEOUT,
+        "curated plugins export archive download",
+        fetch_curated_repo_backup_archive_zip(&http_clients, backup_archive_api_url),
     ))?;
     extract_zipball_to_dir(&zipball_bytes, staged_repo_dir.path())?;
     ensure_marketplace_manifest_exists(staged_repo_dir.path())?;
@@ -521,6 +606,7 @@ fn ensure_marketplace_manifest_exists(repo_path: &Path) -> Result<(), String> {
 }
 
 fn activate_curated_repo(repo_path: &Path, staged_repo_dir: TempDir) -> Result<(), String> {
+    ensure_not_stopped("activating the curated plugins checkout")?;
     let staged_repo_path = staged_repo_dir.path();
     if repo_path.exists() {
         let parent = repo_path.parent().ok_or_else(|| {
@@ -685,6 +771,18 @@ fn run_git_command_with_timeout(
     context: &str,
     timeout: Duration,
 ) -> Result<Output, String> {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        let stop = crate::retirement::current_worker_stop();
+        if stop.is_managed() {
+            return crate::owned_process::run_output(command, context, timeout, stop);
+        }
+    }
+    // Unmanaged execution (and the not-yet-ported Windows managed backend)
+    // keeps the original command/timeout semantics below.
+    // min(step cap, owner remaining): the step never outlives the deadline.
+    let timeout = step_budget(timeout);
+    ensure_not_stopped(context)?;
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -704,7 +802,11 @@ fn run_git_command_with_timeout(
             Err(err) => return Err(format!("failed to poll {context}: {err}")),
         }
 
-        if start.elapsed() >= timeout {
+        // Cooperative cancellation of OWNED work: this git child belongs only
+        // to this worker. Killing it at the deadline is the same path as the
+        // existing step timeout and never touches the active checkout (see
+        // the shutdown audit for the justification).
+        if start.elapsed() >= timeout || sync_stopped() {
             match child.try_wait() {
                 Ok(Some(_)) => {
                     return child
@@ -1031,6 +1133,7 @@ fn read_sha_file(sha_path: &Path) -> Option<String> {
 }
 
 fn extract_zipball_to_dir(bytes: &[u8], destination: &Path) -> Result<(), String> {
+    ensure_not_stopped("curated archive extraction")?;
     std::fs::create_dir_all(destination).map_err(|err| {
         format!(
             "failed to create curated plugins extraction directory {}: {err}",
@@ -1043,13 +1146,16 @@ fn extract_zipball_to_dir(bytes: &[u8], destination: &Path) -> Result<(), String
         .map_err(|err| format!("failed to open curated plugins zip archive: {err}"))?;
 
     for index in 0..archive.len() {
+        ensure_not_stopped("the next curated archive entry")?;
         let mut entry = archive
             .by_index(index)
             .map_err(|err| format!("failed to read curated plugins zip entry: {err}"))?;
         let Some(relative_path) = entry.enclosed_name() else {
+            let name = entry
+                .name()
+                .map_err(|err| format!("invalid curated plugins zip entry {index}: {err}"))?;
             return Err(format!(
-                "curated plugins zip entry `{}` escapes extraction root",
-                entry.name()
+                "curated plugins zip entry `{name}` escapes extraction root"
             ));
         };
 
@@ -1093,38 +1199,43 @@ fn extract_zipball_to_dir(bytes: &[u8], destination: &Path) -> Result<(), String
                 output_path.display()
             )
         })?;
-        std::io::copy(&mut entry, &mut output).map_err(|err| {
-            format!(
-                "failed to write curated plugins file {}: {err}",
-                output_path.display()
-            )
-        })?;
-        apply_zip_permissions(&entry, &output_path)?;
+        use std::io::Read;
+        use std::io::Write;
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            ensure_not_stopped("the next curated archive data chunk")?;
+            let count = entry.read(&mut buffer).map_err(|err| {
+                format!(
+                    "failed to read curated plugins file {}: {err}",
+                    output_path.display()
+                )
+            })?;
+            if count == 0 {
+                break;
+            }
+            output.write_all(&buffer[..count]).map_err(|err| {
+                format!(
+                    "failed to write curated plugins file {}: {err}",
+                    output_path.display()
+                )
+            })?;
+        }
+        #[cfg(unix)]
+        if let Some(mode) = entry.unix_mode() {
+            use std::os::unix::fs::PermissionsExt;
+
+            // zip strips setuid, setgid, and sticky bits from the archive's Unix mode.
+            output
+                .set_permissions(std::fs::Permissions::from_mode(mode))
+                .map_err(|err| {
+                    format!(
+                        "failed to set permissions on curated plugins file {}: {err}",
+                        output_path.display()
+                    )
+                })?;
+        }
     }
 
-    Ok(())
-}
-
-#[cfg(unix)]
-fn apply_zip_permissions(entry: &zip::read::ZipFile<'_>, output_path: &Path) -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt;
-
-    let Some(mode) = entry.unix_mode() else {
-        return Ok(());
-    };
-    std::fs::set_permissions(output_path, std::fs::Permissions::from_mode(mode)).map_err(|err| {
-        format!(
-            "failed to set permissions on curated plugins file {}: {err}",
-            output_path.display()
-        )
-    })
-}
-
-#[cfg(not(unix))]
-fn apply_zip_permissions(
-    _entry: &zip::read::ZipFile<'_>,
-    _output_path: &Path,
-) -> Result<(), String> {
     Ok(())
 }
 

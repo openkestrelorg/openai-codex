@@ -4,8 +4,8 @@
 use crate::account_operation_work::AccountOperationWork;
 use crate::account_turn_work::AccountTurnSession;
 use crate::account_turn_work::AccountTurnWork;
-use crate::managed_transition::AccountWorkPermitGuard;
-use crate::managed_transition::AccountWorkPermits;
+use crate::account_work_permits::AccountWorkPermitGuard;
+use crate::account_work_permits::AccountWorkPermits;
 use crate::turn_admission::TurnAdmission;
 use codex_extension_api::ExtensionData;
 use codex_extension_api::ExtensionFuture;
@@ -51,6 +51,7 @@ pub(crate) struct AccountTurnAdmission {
     pub(crate) shutdown: TurnAdmission,
     pub(crate) permits: AccountWorkPermits,
     pub(crate) work: AccountTurnWork,
+    pub(crate) auth_tasks: Option<crate::processor_task_retirement::ProcessorTaskTicket>,
 }
 
 impl std::fmt::Debug for AccountTurnAdmission {
@@ -83,6 +84,7 @@ impl TurnStartAdmission for AccountTurnAdmission {
         Ok(Some(Box::new(AccountOperationWork {
             permit: self.acquire_fresh_work()?,
             turns: self.work.clone(),
+            auth_tasks: self.auth_tasks.clone(),
         })))
     }
 
@@ -100,6 +102,7 @@ impl TurnStartAdmission for AccountTurnAdmission {
         Ok(Some(Box::new(AccountOperationWork {
             permit,
             turns: self.work.clone(),
+            auth_tasks: self.auth_tasks.clone(),
         })))
     }
 
@@ -110,6 +113,7 @@ impl TurnStartAdmission for AccountTurnAdmission {
             Box::new(AccountOperationWork {
                 permit,
                 turns: self.work.clone(),
+                auth_tasks: self.auth_tasks.clone(),
             }) as Box<dyn HostOperationWork>
         }))
     }

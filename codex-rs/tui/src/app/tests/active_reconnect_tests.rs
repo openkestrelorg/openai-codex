@@ -12,7 +12,23 @@ use tokio::net::TcpListener;
 use super::disconnect::serve_reconnect_requests;
 
 #[tokio::test]
-async fn reconnect_restores_history_permissions_and_keeps_old_input_paused() -> Result<()> {
+async fn reconnect_restores_launch_reviewer_without_a_profile_override() -> Result<()> {
+    let (mut app, _events, _ops) = make_test_app_with_channels().await;
+    let mut cached = test_thread_session(ThreadId::new(), app.config.cwd.to_path_buf());
+    cached.approvals_reviewer = ApprovalsReviewer::AutoReview;
+    app.primary_thread_id = Some(cached.thread_id);
+    app.config.approvals_reviewer = ApprovalsReviewer::AutoReview;
+    app.harness_overrides.approvals_reviewer = Some(ApprovalsReviewer::AutoReview);
+    app.remember_launch_permissions();
+    let mut resumed = cached.clone();
+    resumed.approvals_reviewer = ApprovalsReviewer::User;
+    app.restore_runtime_permissions(&mut resumed, &cached);
+    assert_eq!(resumed, cached);
+    Ok(())
+}
+
+#[tokio::test]
+async fn reconnect_restores_history_permissions_and_resumes_unsent_input() -> Result<()> {
     for (recovered_queue, edit_offline, resume_error_code, deferred_notice, notice_enabled) in [
         (true, false, -32603, false, false),
         (true, false, -32603, false, true),
@@ -112,7 +128,7 @@ async fn reconnect_restores_history_permissions_and_keeps_old_input_paused() -> 
             "id": id, "sessionId": id, "preview": "only once", "ephemeral": false,
             "modelProvider": "test-provider", "createdAt": 1, "updatedAt": 2,
             "status": {"type": "idle"}, "cwd": cwd, "cliVersion": "0.0.0", "source": "cli",
-            "turns": [test_turn("accepted", TurnStatus::Completed, vec![ThreadItem::UserMessage {
+            "turns": [test_turn("accepted", TurnStatus::Completed, vec![ThreadItemPayload::UserMessage {
                 id: "input-1".into(), client_id: None, content: vec![UserInput::Text { text: "only once".into(), text_elements: Vec::new() }],
             }])]
         });
@@ -143,9 +159,9 @@ async fn reconnect_restores_history_permissions_and_keeps_old_input_paused() -> 
                     "thread/list" | "thread/loaded/list" => Some(json!({"result": {"data": [], "nextCursor": null}})),
                     "thread/goal/get" => Some(json!({"result": {"goal": null}})),
                     "turn/start" => {
-                        assert!(!recovered_queue);
+                        assert!(!edit_offline);
                         let params = request.params.as_ref().unwrap();
-                        assert_eq!(params["input"][0]["text"], "fresh follow-up");
+                        assert_eq!(params["input"][0]["text"], if recovered_queue { "old queued input" } else { "fresh follow-up" });
                         assert_eq!(params["approvalPolicy"], if pending_profile { "never" } else { "on-request" });
                         assert_eq!(params["sandboxPolicy"]["type"], if pending_profile { json!(null) } else { json!("readOnly") });
                         assert_eq!(params["collaborationMode"], json!(expected_submitted_mode));
@@ -168,9 +184,10 @@ async fn reconnect_restores_history_permissions_and_keeps_old_input_paused() -> 
             crate::dynamic_tools_mcp::DynamicToolMcpServer::start(
                 session.request_handle(),
                 codex_app_server_protocol::ThreadStartParams::default(),
+                app.config.features.get().clone(),
                 app.app_event_tx.clone(),
                 app.dynamic_tool_status_updates.clone(),
-                /*managed_requirement*/ None,
+                /*worktrees*/ None,
             )
             .await?,
         ));
@@ -205,7 +222,8 @@ async fn reconnect_restores_history_permissions_and_keeps_old_input_paused() -> 
             );
         let mut tui = crate::tui::test_support::make_test_tui()?;
         if pending_profile {
-            app.pending_server_profiles.insert(
+            app.runtime_approvals_reviewer_override = Some(ApprovalsReviewer::User);
+            app.agents_overview.requested_permission_profiles.insert(
                 id,
                 PermissionProfileSelection {
                     profile_id: "server-only".into(),
@@ -273,7 +291,9 @@ async fn reconnect_restores_history_permissions_and_keeps_old_input_paused() -> 
             .unwrap()
             .creating_worktree = true;
         let old_sender = app.app_event_tx.clone();
+        let backend_id = session.backend_id();
         let connected = reconnect(
+            session.backend_id(),
             app.app_server_target.clone(),
             app.config.clone(),
             app.local_settings.clone(),
@@ -281,6 +301,7 @@ async fn reconnect_restores_history_permissions_and_keeps_old_input_paused() -> 
             /*remote_cwd*/ None,
             transport,
             ReconnectPresentation::Conversation,
+            session.worker_custody().unwrap_or_default(),
         )
         .await?;
         let paused = call_mcp().send().await?.text().await?;
@@ -290,6 +311,7 @@ async fn reconnect_restores_history_permissions_and_keeps_old_input_paused() -> 
         );
         app.finish_reconnect(&mut tui, &mut session, &mut events, connected, "2.1.0")
             .await?;
+        assert_eq!(session.backend_id(), backend_id);
         if edit_offline {
             assert!(!app.chat_widget.has_active_view());
             assert!(
@@ -302,6 +324,16 @@ async fn reconnect_restores_history_permissions_and_keeps_old_input_paused() -> 
             );
         }
         assert!(app.pending_server_profiles.is_empty());
+        assert!(app.agents_overview.requested_permission_profiles.is_empty());
+        if pending_profile {
+            assert_eq!(
+                app.resume_permission_overrides(&app.config),
+                crate::resume_permissions::ResumePermissions {
+                    approvals_reviewer: true,
+                    ..Default::default()
+                }
+            );
+        }
         assert!(!app.pending_managed_worktree_creation);
         assert!(
             !app.agents_overview
@@ -323,8 +355,9 @@ async fn reconnect_restores_history_permissions_and_keeps_old_input_paused() -> 
         );
         assert!(app.agent_navigation.begin_picker_refresh(id).is_some());
         assert!(
-            !app.agent_navigation
+            app.agent_navigation
                 .finish_picker_refresh(id, stale_picker_refresh)
+                .is_none()
         );
         // Let the rebound timer become due without depending on machine uptime.
         tokio::time::pause();
@@ -379,42 +412,41 @@ async fn reconnect_restores_history_permissions_and_keeps_old_input_paused() -> 
         let notices = history
             .lines()
             .filter(|line| {
-                line.contains("Reconnected.") || line.contains("background Codex service")
+                line.contains("Couldn't confirm whether")
+                    || line.contains("background Codex service")
             })
             .collect::<Vec<_>>()
             .join("\n");
         if deferred_notice {
             assert_snapshot!(notices, @r###"
-• Reconnected. No input was resent. Review uncertain submissions before retrying; recovered queues remain paused.
 ⚠ A background Codex service is running v2.0.0, older than your Codex CLI
 "###);
+        } else if edit_offline {
+            assert!(notices.contains("unacknowledged prompt"));
         } else {
-            insta::allow_duplicates! {
-                assert_snapshot!(notices, @"• Reconnected. No input was resent. Review uncertain submissions before retrying; recovered queues remain paused.");
-            }
+            assert_eq!(notices, "");
         }
         assert_eq!(history.matches("only once").count(), 1);
-        if recovered_queue {
+        if edit_offline {
             assert!(app.chat_widget.has_queued_follow_up_messages());
             assert!(!app.chat_widget.maybe_send_next_queued_input());
-            if edit_offline {
-                app.handle_tui_event(
-                    &mut tui,
-                    &mut session,
-                    TuiEvent::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT)),
-                )
-                .await?;
-                assert_eq!(
-                    app.chat_widget.composer_text_with_pending(),
-                    "unacknowledged prompt"
-                );
-                assert!(ops.try_recv().is_err());
-            } else {
-                assert_snapshot!(
-                    "restored_conversation",
-                    render_bottom_popup(&app.chat_widget, /*width*/ 80)
-                );
-            }
+            app.handle_tui_event(
+                &mut tui,
+                &mut session,
+                TuiEvent::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT)),
+            )
+            .await?;
+            assert_eq!(
+                app.chat_widget.composer_text_with_pending(),
+                "unacknowledged prompt"
+            );
+            assert!(ops.try_recv().is_err());
+        } else if recovered_queue {
+            assert!(!app.chat_widget.has_queued_follow_up_messages());
+            assert_snapshot!(
+                "restored_conversation",
+                render_bottom_popup(&app.chat_widget, /*width*/ 80)
+            );
         } else {
             app.chat_widget
                 .handle_key_event(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
@@ -425,6 +457,9 @@ async fn reconnect_restores_history_permissions_and_keeps_old_input_paused() -> 
             while let Ok(event) = events.try_recv() {
                 app.handle_event(&mut tui, &mut session, event).await?;
             }
+        }
+        while let Ok(event) = events.try_recv() {
+            app.handle_event(&mut tui, &mut session, event).await?;
         }
         session.shutdown().await?;
         let methods = server.await??;
@@ -440,7 +475,7 @@ async fn reconnect_restores_history_permissions_and_keeps_old_input_paused() -> 
                 .iter()
                 .filter(|method| *method == "turn/start")
                 .count(),
-            usize::from(!recovered_queue)
+            usize::from(!edit_offline)
         );
     }
     Ok(())
@@ -516,7 +551,7 @@ async fn reconnect_reconciles_offscreen_pending_profile_before_restoring_permiss
                 "thread/read" => json!({"result": {"thread": thread(primary)}}),
                 "turn/start" => {
                     let params = request.params.as_ref().unwrap();
-                    assert_eq!(params["permissions"], "server-only");
+                    assert_eq!(params["permissions"], serde_json::Value::Null);
                     assert_eq!(params["approvalPolicy"], "on-request");
                     assert_eq!(params["sandboxPolicy"], json!(null));
                     json!({"result": {"turn": {"id": "fresh", "items": [], "status": "inProgress"}}})
@@ -533,6 +568,7 @@ async fn reconnect_reconciles_offscreen_pending_profile_before_restoring_permiss
     let mut tui = crate::tui::test_support::make_test_tui()?;
     app.begin_reconnect();
     let connected = reconnect(
+        session.backend_id(),
         app.app_server_target.clone(),
         app.config.clone(),
         app.local_settings.clone(),
@@ -540,6 +576,7 @@ async fn reconnect_reconciles_offscreen_pending_profile_before_restoring_permiss
         /*remote_cwd*/ None,
         session.thread_tool_transport(),
         ReconnectPresentation::Conversation,
+        session.worker_custody().unwrap_or_default(),
     )
     .await?;
     app.finish_reconnect(
@@ -603,27 +640,36 @@ async fn reconnect_exhaustion_and_unknown_initial_thread_stay_offline() -> Resul
     drop(listener);
     tokio::time::pause();
     let start = tokio::time::Instant::now();
-    for id in [Some(ThreadId::new()), None] {
-        assert!(
-            reconnect(
-                app.app_server_target.clone(),
-                app.config.clone(),
-                app.local_settings.clone(),
-                id,
-                /*remote_cwd*/ None,
-                crate::dynamic_tools_mcp::ThreadToolTransport::Dynamic,
-                ReconnectPresentation::Conversation
-            )
-            .await
-            .is_err()
-        );
-    }
+    let reconnect_thread = |id| {
+        reconnect(
+            crate::backend_id::BackendId::new(),
+            app.app_server_target.clone(),
+            app.config.clone(),
+            app.local_settings.clone(),
+            id,
+            /*remote_cwd*/ None,
+            crate::dynamic_tools_mcp::ThreadToolTransport::Dynamic,
+            ReconnectPresentation::Conversation,
+            std::sync::Arc::default(),
+        )
+    };
+    assert!(reconnect_thread(None).await.is_err());
+    let error = reconnect_thread(Some(ThreadId::new()))
+        .await
+        .err()
+        .expect("reconnect should time out");
     assert_eq!(start.elapsed().as_secs(), 120);
     app.begin_reconnect();
     app.chat_widget.reconnect_failed();
     assert_snapshot!(
         "reconnect_failed",
-        render_bottom_popup(&app.chat_widget, /*width*/ 80)
+        format!(
+            "{error}\n{}",
+            super::disconnect::normalize_reconnect_status(&render_bottom_popup(
+                &app.chat_widget,
+                /*width*/ 80
+            ))
+        )
     );
     tokio::time::resume();
     Ok(())
@@ -645,10 +691,13 @@ async fn reconnect_allows_slow_hydration_but_bounds_a_stalled_server() -> Result
             serve_reconnect_requests(
                 tokio_tungstenite::accept_async(stream).await?,
                 move |request| async move {
-                    assert_eq!(request.method, "thread/resume");
-                    tokio::time::pause();
-                    tokio::time::sleep(Duration::from_secs(delay)).await;
-                    tokio::time::resume();
+                    if request.method == "thread/resume" {
+                        tokio::time::pause();
+                        tokio::time::sleep(Duration::from_secs(delay)).await;
+                        tokio::time::resume();
+                    } else {
+                        assert_eq!(request.method, "thread/read");
+                    }
                     Some(json!({"error": {"code": -32600, "message": "thread no longer exists"}}))
                 },
             )
@@ -656,6 +705,7 @@ async fn reconnect_allows_slow_hydration_but_bounds_a_stalled_server() -> Result
         });
         let start = tokio::time::Instant::now();
         let result = reconnect(
+            crate::backend_id::BackendId::new(),
             AppServerTarget::Remote {
                 endpoint: endpoint.clone(),
             },
@@ -665,6 +715,7 @@ async fn reconnect_allows_slow_hydration_but_bounds_a_stalled_server() -> Result
             /*remote_cwd*/ None,
             crate::dynamic_tools_mcp::ThreadToolTransport::Dynamic,
             ReconnectPresentation::Conversation,
+            std::sync::Arc::default(),
         )
         .await;
         let elapsed = start.elapsed().as_secs();
@@ -727,7 +778,10 @@ async fn reconnect_allows_slow_hydration_but_bounds_a_stalled_server() -> Result
             );
         } else {
             tokio::time::resume();
-            assert!(result.is_err());
+            assert_eq!(
+                result.err().expect("resume should time out").to_string(),
+                "Automatic reconnect timed out while resuming the conversation."
+            );
             assert_eq!(elapsed, 120);
             server.abort();
         }
@@ -742,13 +796,10 @@ pub(super) async fn drain_history(
     events: &mut mpsc::UnboundedReceiver<AppEvent>,
 ) -> Result<String> {
     while let Ok(event) = events.try_recv() {
-        assert!(!matches!(
-            event,
-            AppEvent::CodexOp(AppCommand::UserTurn { .. })
-        ));
         if matches!(
             event,
             AppEvent::InsertHistoryCell(_)
+                | AppEvent::CodexOp(AppCommand::UserTurn { .. })
                 | AppEvent::BeginThreadSwitchHistoryReplayBuffer
                 | AppEvent::EndInitialHistoryReplayBuffer
         ) {
@@ -761,4 +812,168 @@ pub(super) async fn drain_history(
             .flat_map(|cell| cell.transcript_lines(/*width*/ 80))
             .collect::<Vec<_>>(),
     ))
+}
+
+#[tokio::test]
+async fn production_reconnect_adopts_only_the_installed_writable_view() -> Result<()> {
+    boxed_future!(production_reconnect_retention_scenario()).await
+}
+
+async fn production_reconnect_retention_scenario() -> Result<()> {
+    use crate::app::reconnect::ReconnectAttachment;
+    use crate::app::reconnect::reconnect_with_adoption;
+    use codex_app_server_protocol::JSONRPCMessage;
+    use codex_app_server_protocol::JSONRPCRequest;
+    use futures::SinkExt;
+    use futures::StreamExt;
+    use tokio_tungstenite::tungstenite::Message;
+    for external in [false, true] {
+        let (mut app, mut events, _ops) = make_test_app_with_channels().await;
+        app.config
+            .features
+            .set_enabled(codex_features::Feature::Plugins, false)?;
+        let id = ThreadId::new();
+        let cwd = app.config.cwd.clone();
+        app.primary_thread_id = Some(id);
+        app.active_thread_id = Some(id);
+        let cached = test_thread_session(id, cwd.to_path_buf());
+        app.ensure_thread_channel(id)
+            .store
+            .lock()
+            .await
+            .set_session(cached.clone(), Vec::new());
+        app.chat_widget.handle_thread_session(cached);
+        if external {
+            app.ensure_thread_channel(id).mark_external_writer();
+            app.chat_widget.show_external_writer_thread();
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        app.app_server_target = AppServerTarget::Remote {
+            endpoint: crate::resolve_remote_addr(&format!("ws://{}", listener.local_addr()?))?,
+        };
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await?;
+            let mut socket = tokio_tungstenite::accept_async(stream).await?;
+            let Message::Text(text) = socket.next().await.expect("initialize frame")? else {
+                panic!("expected initialize text");
+            };
+            let JSONRPCMessage::Request(initialize) = serde_json::from_str(&text)? else {
+                panic!("expected initialize request");
+            };
+            assert_eq!(initialize.method, "initialize");
+            assert_eq!(
+                initialize.params.as_ref().unwrap()["capabilities"]["experimentalApi"],
+                true
+            );
+            socket
+                .send(Message::Text(
+                    json!({
+                        "id": initialize.id, "result": {"userAgent": "reconnect-test/2.0.0"}
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await?;
+            let mut resumes = 0;
+            let methods = serve_reconnect_requests(socket, |request: JSONRPCRequest| {
+                let thread = json!({
+                    "id": id, "sessionId": id, "preview": "retained", "ephemeral": false,
+                    "modelProvider": "test-provider", "createdAt": 1, "updatedAt": 2,
+                    "status": {"type": "idle"}, "cwd": cwd, "cliVersion": "0.0.0",
+                    "source": "cli", "turns": []
+                });
+                std::future::ready(Some(match request.method.as_str() {
+                    "thread/resume" => {
+                        let params = request.params.as_ref().unwrap();
+                        assert_eq!(params["threadId"], id.to_string());
+                        assert_eq!(params["retainForConnection"].as_bool().unwrap_or(false), !external);
+                        let mut response = json!({"thread": thread, "model": "gpt-test",
+                            "modelProvider": "test-provider", "cwd": cwd, "approvalPolicy": "never",
+                            "approvalsReviewer": "user", "sandbox": {"type": "dangerFullAccess"},
+                            "reasoningEffort": null});
+                        if !external {
+                            let status = if resumes == 0 { "acquired" } else {
+                                "alreadyHeld"
+                            };
+                            response["retention"] = json!({"status": status, "grantId": "new-connection-grant"});
+                        }
+                        resumes += 1;
+                        json!({"result": response})
+                    }
+                    "thread/retention/acquire" => {
+                        assert!(!external, "external writer never acquires");
+                        json!({"result": {"status": "alreadyHeld", "grantId": "new-connection-grant"}})
+                    }
+                    "thread/retention/release" => panic!("a committed or observed view must not abandon a grant"),
+                    "thread/read" => json!({"result": {"thread": thread}}),
+                    "thread/list" | "thread/loaded/list" => json!({"result": {"data": [], "nextCursor": null}}),
+                    "thread/goal/get" => json!({"result": {"goal": null}}),
+                    method => panic!("unexpected reconnect method: {method}"),
+                }))
+            }).await?;
+            assert_eq!(resumes, if external { 1 } else { 2 });
+            Ok::<_, color_eyre::Report>(methods)
+        });
+        let mut session = crate::start_embedded_app_server_for_picker(&app.config).await?;
+        let mut tui = crate::tui::test_support::make_test_tui()?;
+        app.begin_reconnect();
+        let connected = Box::pin(reconnect_with_adoption(
+            session.backend_id(),
+            app.app_server_target.clone(),
+            app.config.clone(),
+            app.local_settings.clone(),
+            Some(id),
+            None,
+            session.thread_tool_transport(),
+            ReconnectPresentation::Conversation,
+            session.worker_custody().unwrap_or_default(),
+            if external {
+                ReconnectAttachment::ExternalWriter
+            } else {
+                ReconnectAttachment::Writable
+            },
+        ))
+        .await?;
+        Box::pin(app.finish_reconnect(
+            &mut tui,
+            &mut session,
+            &mut events,
+            connected,
+            CODEX_CLI_VERSION,
+        ))
+        .await?;
+        assert_eq!(app.current_displayed_thread_id(), Some(id));
+        assert_eq!(app.chat_widget.is_external_writer_view(), external);
+        if external {
+            assert_eq!(
+                app.thread_event_channels[&id].attachment(),
+                ThreadEventAttachment::ExternalWriter
+            );
+        } else {
+            // The same new connection revalidates AlreadyHeld under its settlement
+            // lock. This cannot race past an earlier abandoned preparation release.
+            let (_, probe) = session
+                .prepare_retained_resume(
+                    &app.local_settings,
+                    app.config.clone(),
+                    id,
+                    crate::app_server_session::ResumeModelSettings::PreserveExistingThread,
+                    crate::resume_permissions::ResumePermissions::default(),
+                )
+                .await?;
+            assert!(probe.is_some());
+            drop(probe); // AlreadyHeld is not ours to release.
+        }
+        session.shutdown().await?;
+        let methods = server.await??;
+        assert_eq!(
+            methods
+                .iter()
+                .filter(|m| m.as_str() == "thread/retention/acquire")
+                .count(),
+            usize::from(!external)
+        );
+        assert!(!methods.iter().any(|m| m == "thread/retention/release"));
+    }
+    Ok(())
 }

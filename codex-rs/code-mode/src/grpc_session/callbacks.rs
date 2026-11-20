@@ -1,7 +1,6 @@
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::sync::PoisonError;
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use codex_code_mode_protocol::CellId;
@@ -55,15 +54,11 @@ impl SessionInner {
                         }
                     }
                     Ok(None) => {
-                        if !inner.shutdown_requested.load(Ordering::Acquire) {
-                            inner.fail(format!("gRPC code-mode {stream_name} closed unexpectedly"));
-                        }
+                        inner.fail(format!("gRPC code-mode {stream_name} closed unexpectedly"));
                         return;
                     }
                     Err(error) => {
-                        if !inner.shutdown_requested.load(Ordering::Acquire) {
-                            inner.fail(deadline::failure(stream_name, error));
-                        }
+                        inner.fail(deadline::failure(stream_name, error));
                         return;
                     }
                 }
@@ -114,22 +109,7 @@ impl SessionInner {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .admit_invocation(&call)?;
-        let parent = call.traceparent.as_ref().and_then(|traceparent| {
-            codex_otel::context_from_w3c_trace_context(&W3cTraceContext {
-                traceparent: Some(traceparent.clone()),
-                tracestate: None,
-            })
-        });
-        let callback_span = codex_otel::span_with_parent_context(parent, || {
-            tracing::info_span!(
-                "code_mode.grpc.callback",
-                otel.name = "code_mode.grpc.callback",
-                session.id = %call.session_id,
-                execution.id = %call.execution_id,
-                cell.id = %call.cell_id,
-                invocation.id = %call.invocation_id,
-            )
-        });
+        let callback_span = callback_span(&call);
         let invocation_id = call.invocation_id.clone();
         let cancellation = match admission {
             CallbackAdmission::Active(cancellation, delegate) => Ok((cancellation, delegate)),
@@ -188,16 +168,22 @@ impl SessionInner {
         result: Result<serde_json::Value, String>,
     ) {
         let request = completion::request(&self.id, &invocation_id, result);
-        let mut client = self.client();
         tokio::select! {
             biased;
             _ = cancellation.cancelled() => {}
-            result = deadline::request(
-                self,
-                "tool invocation completion",
-                Duration::ZERO,
-                client.complete_tool_call(request),
-            ) => {
+            // NotFound can mean an invocation in a live session was canceled.
+            // Check cancellation before treating a completion error as fatal.
+            result = async {
+                let _permit = self.completion_permits.acquire().await
+                    .map_err(|_| "code-mode completion queue is closed".to_string())?;
+                let mut client = self.client()?;
+                deadline::request(
+                    self,
+                    "tool invocation completion",
+                    Duration::ZERO,
+                    client.complete_tool_call(self.request(request)),
+                ).await
+            } => {
                 if let Err(error) = result
                     && !cancellation.is_cancelled()
                     && !self.stopped.is_cancelled()
@@ -265,3 +251,31 @@ impl SessionInner {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "callbacks_tests.rs"]
+mod tests;
+
+// Select the incoming context before managed telemetry eagerly builds the span.
+fn callback_span(call: &grpc::ToolCall) -> tracing::Span {
+    let parent = call.traceparent.as_ref().and_then(|traceparent| {
+        codex_otel::context_from_w3c_trace_context(&W3cTraceContext {
+            traceparent: Some(traceparent.clone()),
+            tracestate: None,
+        })
+    });
+    codex_otel::span_with_parent_context(parent, || {
+        tracing::info_span!(
+            "code_mode.grpc.callback",
+            otel.name = "code_mode.grpc.callback",
+            session.id = %call.session_id,
+            execution.id = %call.execution_id,
+            cell.id = %call.cell_id,
+            invocation.id = %call.invocation_id,
+        )
+    })
+}
+
+#[cfg(test)]
+#[path = "callbacks_managed_trace_parent_tests.rs"]
+mod managed_trace_parent_tests;

@@ -25,7 +25,7 @@ impl ThreadManager {
     /// Resumed threads are excluded because they can refer to another owner's live runtime.
     pub async fn start_thread_until(
         self: &Arc<Self>,
-        options: StartThreadOptions,
+        mut options: StartThreadOptions,
         until: impl Future<Output = ()> + Send + 'static,
         tasks: &TaskTracker,
     ) -> CodexResult<NewThread> {
@@ -47,6 +47,9 @@ impl ThreadManager {
                 "owned thread startup requires explicit session isolation".to_owned(),
             ));
         }
+        // Observe the caller's request before task creation. Preserve an empty
+        // observation too: the spawned lifetime has no inherited request scope.
+        let captured_account_work = self.state.capture_construction_work(&mut options)?;
         let task = tasks.token();
         let manager = Arc::clone(self);
         let state = Arc::downgrade(&self.state);
@@ -54,7 +57,7 @@ impl ThreadManager {
         let abandoned = CancellationToken::new();
         let handoff = abandoned.clone().drop_guard();
         tokio::spawn(async move {
-            let _task = task;
+            let task: Box<dyn Send> = Box::new(task);
             let startup = Arc::new(SessionStartup::default());
             tokio::pin!(until);
             // Finish cancellation inside the retained constructor before cleanup.
@@ -64,6 +67,8 @@ impl ThreadManager {
                     options,
                     /*forked_from_thread_id*/ None,
                     Some(Arc::clone(&startup)),
+                    Some(captured_account_work),
+                    /*deferred_clear_session_start*/ None,
                 );
                 tokio::pin!(start);
                 tokio::select! {
@@ -98,18 +103,25 @@ impl ThreadManager {
                     let _ = sender.send(Err(error));
                 }
             }
-            startup.cleanup().await;
+            // After proven registry/custody expiry this only inspects; an
+            // unreceipted start keeps this lifetime's task token in custody.
+            let _task = startup.cleanup_with_owner(task).await;
             if let Some(state) = state.upgrade()
                 && let Some(session) = startup.session.get()
             {
                 let mut threads = state.threads.write().await;
                 let thread_id = session.thread_id();
-                if threads
+                let removed = if threads
                     .get(&thread_id)
                     .is_some_and(|thread| Arc::ptr_eq(&thread.session, session))
                 {
-                    threads.remove(&thread_id);
-                }
+                    threads.remove(&thread_id)
+                } else {
+                    None
+                };
+                drop(threads);
+                // Outside the lookup guard; releases only proven-clean custody.
+                state.constructions.release_removed(removed.as_ref());
             }
         });
         let thread = receiver.await.map_err(|_| CodexErr::InternalAgentDied)??;

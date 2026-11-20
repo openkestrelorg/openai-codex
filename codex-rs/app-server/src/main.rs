@@ -21,10 +21,6 @@ use std::path::PathBuf;
 ))]
 #[global_allocator]
 static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
-#[cfg(all(debug_assertions, unix))]
-use futures::SinkExt;
-#[cfg(all(debug_assertions, unix))]
-use futures::StreamExt;
 
 // Debug-only test hook: lets integration tests point the server at a temporary
 // managed config file without writing to /etc.
@@ -34,6 +30,9 @@ const DISABLE_MANAGED_CONFIG_ENV_VAR: &str = "CODEX_APP_SERVER_DISABLE_MANAGED_C
 #[derive(Debug, Parser)]
 #[command(version)]
 struct AppServerArgs {
+    /// Load frozen cloud skills from a JSON snapshot instead of a live skill service.
+    #[arg(long, value_name = "PATH")]
+    cloud_skills_snapshot: Option<PathBuf>,
     #[command(flatten)]
     config_overrides: CliConfigOverrides,
 
@@ -71,19 +70,6 @@ struct AppServerArgs {
     #[arg(long = "disable-plugin-startup-tasks-for-tests", hide = true)]
     disable_plugin_startup_tasks_for_tests: bool,
 
-    /// Hidden helper used only by the Unix-peer entitlement integration test.
-    /// It connects through the production protocol as this exact binary.
-    #[cfg(all(debug_assertions, unix))]
-    #[arg(long = "interactive-subscription-peer-helper", hide = true)]
-    interactive_subscription_peer_helper: Option<PathBuf>,
-
-    #[cfg(all(debug_assertions, unix))]
-    #[arg(
-        long = "interactive-subscription-peer-helper-expect-unproven",
-        hide = true
-    )]
-    interactive_subscription_peer_helper_expect_unproven: bool,
-
     /// Enable remote control for this app-server process without changing persistence.
     #[arg(long = "remote-control", hide = true)]
     remote_control: bool,
@@ -97,6 +83,7 @@ fn main() -> anyhow::Result<()> {
     let remote_control_disabled = codex_app_server::take_remote_control_disabled_env();
     arg0_dispatch_or_else(move |arg0_paths: Arg0DispatchPaths| async move {
         let AppServerArgs {
+            cloud_skills_snapshot,
             config_overrides,
             code_mode_host,
             listen,
@@ -105,22 +92,9 @@ fn main() -> anyhow::Result<()> {
             strict_config,
             #[cfg(debug_assertions)]
             disable_plugin_startup_tasks_for_tests,
-            #[cfg(all(debug_assertions, unix))]
-            interactive_subscription_peer_helper,
-            #[cfg(all(debug_assertions, unix))]
-            interactive_subscription_peer_helper_expect_unproven,
             remote_control,
             managed_daemon,
         } = AppServerArgs::parse();
-        #[cfg(all(debug_assertions, unix))]
-        if let Some(socket_path) = interactive_subscription_peer_helper {
-            return run_interactive_subscription_peer_helper(
-                socket_path,
-                interactive_subscription_peer_helper_expect_unproven,
-            )
-            .await;
-        }
-
         let loader_overrides = if disable_managed_config_from_debug_env() {
             LoaderOverrides::without_managed_config_for_tests()
         } else {
@@ -131,6 +105,7 @@ fn main() -> anyhow::Result<()> {
         let transport = listen;
         let auth = auth.try_into_settings()?;
         let mut runtime_options = AppServerRuntimeOptions {
+            cloud_skills_snapshot,
             code_mode_host_transport: code_mode_host.into(),
             managed_daemon,
             ..Default::default()
@@ -162,100 +137,8 @@ fn main() -> anyhow::Result<()> {
             // Runtime teardown can wait forever for blocked rollout I/O.
             std::process::exit(0);
         }
-        Ok(())
+        exit.into_shutdown_result().map_err(Into::into)
     })
-}
-
-#[cfg(all(debug_assertions, unix))]
-async fn run_interactive_subscription_peer_helper(
-    socket_path: PathBuf,
-    expect_unproven: bool,
-) -> anyhow::Result<()> {
-    use tokio_tungstenite::client_async;
-    use tokio_tungstenite::tungstenite::Message;
-
-    let stream = tokio::net::UnixStream::connect(socket_path).await?;
-    let (mut websocket, response) = client_async("ws://localhost/rpc", stream).await?;
-    anyhow::ensure!(
-        response.status() == tokio_tungstenite::tungstenite::http::StatusCode::SWITCHING_PROTOCOLS,
-        "peer helper upgrade failed: status={}, headers={:?}",
-        response.status(),
-        response.headers()
-    );
-
-    async fn request(
-        websocket: &mut tokio_tungstenite::WebSocketStream<tokio::net::UnixStream>,
-        id: i64,
-        method: &str,
-        params: serde_json::Value,
-    ) -> anyhow::Result<serde_json::Value> {
-        websocket
-            .send(Message::Text(
-                serde_json::json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params})
-                    .to_string()
-                    .into(),
-            ))
-            .await?;
-        while let Some(message) = websocket.next().await {
-            let Message::Text(text) = message? else {
-                continue;
-            };
-            let value: serde_json::Value = serde_json::from_str(&text)?;
-            if value.get("id") == Some(&serde_json::json!(id)) {
-                return value
-                    .get("result")
-                    .cloned()
-                    .ok_or_else(|| anyhow::anyhow!("{method} failed: {value}"));
-            }
-        }
-        anyhow::bail!("connection closed while waiting for {method}")
-    }
-
-    let _ = request(
-        &mut websocket,
-        1,
-        "initialize",
-        serde_json::json!({
-            "clientInfo": {"name": "codex-tui", "version": "test"},
-            "capabilities": {"experimentalApi": true, "interactiveClient": true}
-        }),
-    )
-    .await?;
-    websocket
-        .send(Message::Text(
-            serde_json::json!({"jsonrpc":"2.0", "method":"initialized"})
-                .to_string()
-                .into(),
-        ))
-        .await?;
-    let started = request(
-        &mut websocket,
-        2,
-        "thread/start",
-        serde_json::json!({"ephemeral": true}),
-    )
-    .await?;
-    let thread_id = started["thread"]["id"]
-        .as_str()
-        .ok_or_else(|| anyhow::anyhow!("thread/start did not return a thread id"))?;
-    let snapshot = request(
-        &mut websocket,
-        3,
-        "kcf/thread/interactiveSubscription/list",
-        serde_json::json!({}),
-    )
-    .await?;
-    let entries = snapshot["entries"]
-        .as_array()
-        .ok_or_else(|| anyhow::anyhow!("subscription list did not return entries"))?;
-    let contains_thread = entries
-        .iter()
-        .any(|entry| entry["threadId"].as_str() == Some(thread_id));
-    anyhow::ensure!(
-        contains_thread != expect_unproven,
-        "unexpected subscription entitlement: expect_unproven={expect_unproven}, entries={entries:?}"
-    );
-    Ok(())
 }
 
 fn disable_managed_config_from_debug_env() -> bool {

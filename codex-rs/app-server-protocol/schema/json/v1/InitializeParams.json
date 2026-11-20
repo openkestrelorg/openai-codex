@@ -43,7 +43,7 @@
           ]
         },
         "interactiveClient": {
-          "description": "Requests classification as an interactive app-server client. This is a request only; the server must independently establish entitlement.",
+          "description": "Requests interactive-client classification; the server independently verifies entitlement.",
           "type": "boolean"
         },
         "mcpServerOpenaiFormElicitation": {
@@ -63,6 +63,10 @@
         "requestAttestation": {
           "default": false,
           "description": "Opt into `attestation/generate` requests for upstream `x-oai-attestation`.",
+          "type": "boolean"
+        },
+        "requiredHumanApproval": {
+          "description": "Present `humanCommand` approvals to a person and return only a one-time decision. Requires `experimentalApi`. Pending requests can be replayed to compatible clients.",
           "type": "boolean"
         }
       },

@@ -1,11 +1,14 @@
+use crate::mcp_config_identity::AppliedMcpConfigIdentity;
+use crate::mcp_config_identity::McpConfigIdentity;
+use codex_app_server_protocol::ApplicationStorageRequirements;
 use std::sync::Arc;
 
 use crate::config_manager::ConfigManager;
 use crate::config_manager_service::ConfigManagerError;
 use crate::error_code::internal_error;
 use crate::error_code::invalid_request;
-use crate::mcp_config_identity::AppliedMcpConfigIdentity;
-use crate::mcp_config_identity::McpConfigIdentity;
+use crate::model_catalog::ModelCatalog;
+use crate::otel_config::map_otel_requirements_to_api;
 use crate::outgoing_message::ConnectionRequestId;
 use crate::outgoing_message::OutgoingMessageSender;
 use codex_analytics::AnalyticsEventsClient;
@@ -66,11 +69,15 @@ const BACKGROUND_PAGINATED_ROLLOUT_MIGRATION_FEATURE: &str =
     "background_paginated_rollout_migration";
 
 const SUPPORTED_EXPERIMENTAL_FEATURE_ENABLEMENT: &[&str] = &[
+    "api_key_cyber_access_programs",
     "api_key_model_discovery",
     "auth_elicitation",
     BACKGROUND_PAGINATED_ROLLOUT_MIGRATION_FEATURE,
     "codex_apps_mcp_2026_07_28",
+    "daybreak_program_propagation",
     "mcp_2026_07_28",
+    "mcp_connection_sharing",
+    "mcp_lazy_stdio_startup",
     "memories",
     "mentions_v2",
     "remote_control",
@@ -80,27 +87,64 @@ const SUPPORTED_EXPERIMENTAL_FEATURE_ENABLEMENT: &[&str] = &[
 ];
 
 #[derive(Clone)]
+pub(crate) struct WeakConfigRequestProcessor {
+    outgoing: Arc<OutgoingMessageSender>,
+    config_manager: ConfigManager,
+    applied_mcp_config_identity: AppliedMcpConfigIdentity,
+    thread_manager: std::sync::Weak<ThreadManager>,
+    model_catalog: Arc<ModelCatalog>,
+    analytics_events_client: AnalyticsEventsClient,
+}
+
+impl WeakConfigRequestProcessor {
+    pub(crate) fn upgrade(&self) -> Option<ConfigRequestProcessor> {
+        Some(ConfigRequestProcessor {
+            outgoing: Arc::clone(&self.outgoing),
+            config_manager: self.config_manager.clone(),
+            applied_mcp_config_identity: self.applied_mcp_config_identity.clone(),
+            thread_manager: self.thread_manager.upgrade()?,
+            model_catalog: Arc::clone(&self.model_catalog),
+            analytics_events_client: self.analytics_events_client.clone(),
+        })
+    }
+}
+
+#[derive(Clone)]
 pub(crate) struct ConfigRequestProcessor {
     outgoing: Arc<OutgoingMessageSender>,
     config_manager: ConfigManager,
-    thread_manager: Arc<ThreadManager>,
     applied_mcp_config_identity: AppliedMcpConfigIdentity,
+    thread_manager: Arc<ThreadManager>,
+    model_catalog: Arc<ModelCatalog>,
     analytics_events_client: AnalyticsEventsClient,
 }
 
 impl ConfigRequestProcessor {
+    pub(crate) fn downgrade(&self) -> WeakConfigRequestProcessor {
+        WeakConfigRequestProcessor {
+            outgoing: Arc::clone(&self.outgoing),
+            config_manager: self.config_manager.clone(),
+            applied_mcp_config_identity: self.applied_mcp_config_identity.clone(),
+            thread_manager: Arc::downgrade(&self.thread_manager),
+            model_catalog: Arc::clone(&self.model_catalog),
+            analytics_events_client: self.analytics_events_client.clone(),
+        }
+    }
+
     pub(crate) fn new(
         outgoing: Arc<OutgoingMessageSender>,
         config_manager: ConfigManager,
-        thread_manager: Arc<ThreadManager>,
         applied_mcp_config_identity: AppliedMcpConfigIdentity,
+        thread_manager: Arc<ThreadManager>,
+        model_catalog: Arc<ModelCatalog>,
         analytics_events_client: AnalyticsEventsClient,
     ) -> Self {
         Self {
             outgoing,
             config_manager,
-            thread_manager,
             applied_mcp_config_identity,
+            thread_manager,
+            model_catalog,
             analytics_events_client,
         }
     }
@@ -147,7 +191,10 @@ impl ConfigRequestProcessor {
             self.thread_manager.auth_manager().allowed_login_methods(),
         );
 
-        Ok(ConfigRequirementsReadResponse { requirements })
+        Ok(ConfigRequirementsReadResponse {
+            supports_independent_speed_modes: Some(true),
+            requirements,
+        })
     }
 
     pub(crate) async fn value_write(
@@ -179,7 +226,12 @@ impl ConfigRequestProcessor {
         if !session_defaults_only {
             self.handle_config_mutation().await;
             if should_reload {
-                self.reload_user_config().await;
+                reload_user_config(
+                    &self.config_manager,
+                    &self.thread_manager,
+                    &self.applied_mcp_config_identity,
+                )
+                .await;
             }
         }
         Ok(ClientResponsePayload::ConfigBatchWrite(response))
@@ -194,7 +246,12 @@ impl ConfigRequestProcessor {
             .handle_config_mutation_result(self.set_experimental_feature_enablement(params).await)
             .await?;
         if !response.enablement.is_empty() {
-            self.reload_user_config().await;
+            reload_user_config(
+                &self.config_manager,
+                &self.thread_manager,
+                &self.applied_mcp_config_identity,
+            )
+            .await;
         }
         self.outgoing
             .send_response_as(
@@ -205,6 +262,33 @@ impl ConfigRequestProcessor {
         Ok(None)
     }
 
+    pub(crate) async fn model_provider_list(
+        &self,
+        params: codex_app_server_protocol::ModelProviderListParams,
+    ) -> Result<codex_app_server_protocol::ModelProviderListResponse, JSONRPCErrorError> {
+        self.config_manager
+            .model_provider_list(params)
+            .await
+            .map_err(map_error)
+    }
+
+    pub(crate) async fn model_provider_config_write(
+        &self,
+        params: codex_app_server_protocol::ModelProviderConfigWriteParams,
+    ) -> Result<codex_app_server_protocol::ModelProviderConfigWriteResponse, JSONRPCErrorError>
+    {
+        let result = self
+            .config_manager
+            .model_provider_config_write(params)
+            .await
+            .map_err(map_error);
+        let response = self.handle_config_mutation_result(result).await?;
+        self.model_catalog
+            .invalidate_if_current_provider(&response.provider.id)
+            .await;
+        Ok(response)
+    }
+
     pub(crate) async fn model_provider_capabilities_read(
         &self,
     ) -> Result<ModelProviderCapabilitiesReadResponse, JSONRPCErrorError> {
@@ -212,7 +296,6 @@ impl ConfigRequestProcessor {
         let provider = create_model_provider(config.model_provider, /*auth_manager*/ None);
         let capabilities = provider.capabilities();
         Ok(ModelProviderCapabilitiesReadResponse {
-            namespace_tools: capabilities.namespace_tools,
             image_generation: capabilities.image_generation,
             web_search: capabilities.web_search,
         })
@@ -325,25 +408,14 @@ impl ConfigRequestProcessor {
             .map_err(|_| internal_error("failed to update feature enablement"))?;
 
         let config = self.load_latest_config(/*fallback_cwd*/ None).await?;
-        self.thread_manager
-            .get_models_manager()
-            .set_api_key_model_discovery_enabled(
-                config.features.enabled(Feature::ApiKeyModelDiscovery),
-            );
+        self.thread_manager.set_api_key_model_discovery_enabled(
+            config.features.enabled(Feature::ApiKeyModelDiscovery),
+        );
         if should_start_background_rollout_migration && config.features.enabled(feature) {
             self.thread_manager.start_background_rollout_migration();
         }
 
         Ok(ExperimentalFeatureEnablementSetResponse { enablement })
-    }
-
-    async fn reload_user_config(&self) {
-        reload_user_config(
-            &self.config_manager,
-            &self.thread_manager,
-            &self.applied_mcp_config_identity,
-        )
-        .await;
     }
 
     async fn emit_plugin_toggle_events(
@@ -372,49 +444,88 @@ pub(super) async fn reload_user_config(
     thread_manager: &ThreadManager,
     applied_mcp_config_identity: &AppliedMcpConfigIdentity,
 ) {
+    // Reload owns several config snapshots; do not inline that future into dispatch.
+    Box::pin(reload_user_config_inner(
+        config_manager,
+        thread_manager,
+        applied_mcp_config_identity,
+    ))
+    .await;
+}
+
+/// Bounded publication attempts for one thread's user reload. Stale owners
+/// reload from the current owner; an MCP requirement promotion consumes one
+/// attempt before the user update is reloaded from the promoted owner.
+const USER_RELOAD_ATTEMPTS: usize = 4;
+
+async fn reload_user_config_inner(
+    config_manager: &ConfigManager,
+    thread_manager: &ThreadManager,
+    applied_mcp_config_identity: &AppliedMcpConfigIdentity,
+) {
+    // The host owns this whole runtime transition (KESTREL-CODEX-011). Holding
+    // the gate serializes it with core-initiated reloads and MCP reloads, and
+    // every thread's expected owner below is captured under this same gate.
     let _apply_guard = applied_mcp_config_identity.lock_apply().await;
-    let refreshed_config = match config_manager
-        .load_latest_config(/*fallback_cwd*/ None)
-        .await
-    {
-        Ok(config) => config,
+    // Validate host layers without materializing a host-level `Config`: thread
+    // overrides may supply settings, such as a model provider, that the host
+    // configuration alone would reject.
+    let host_layers = match config_manager.load_config_layers(/*cwd*/ None).await {
+        Ok(layers) => layers,
         Err(err) => {
-            tracing::warn!("failed to rebuild user config for runtime refresh: {}", err);
+            tracing::warn!("failed to rebuild user config for runtime refresh: {err}");
+            for thread_id in thread_manager.list_thread_ids().await {
+                if let Ok(thread) = thread_manager.get_thread(thread_id).await {
+                    thread.disable_mcp_enterprise_auth().await;
+                }
+            }
+            // No thread received a user-layer change, so the retained applied
+            // identity remains truthful.
             return;
         }
     };
-    let candidate_identity = match McpConfigIdentity::from_config(&refreshed_config) {
+    let candidate_identity = match McpConfigIdentity::from_layers(&host_layers) {
         Ok(identity) => identity,
         Err(err) => {
             tracing::warn!(%err, "failed to identify user config for runtime refresh");
             return;
         }
     };
-    let mut refreshes = Vec::new();
+
+    // Plan every thread before publishing any user-layer change. Each expected
+    // owner is the snapshot observed under the held gate; publication later
+    // compares and swaps against exactly that snapshot.
+    let mut complete = true;
+    let mut planned = Vec::new();
     for thread_id in thread_manager.list_thread_ids().await {
         let thread = match thread_manager.get_thread(thread_id).await {
             Ok(thread) => thread,
             Err(err) => {
                 tracing::warn!(%thread_id, %err, "failed to load thread for runtime refresh");
-                return;
+                complete = false;
+                continue;
             }
         };
-        let current_config = thread.config().await;
+        let expected_config = thread.config().await;
         let next_config = match config_manager
             .load_latest_config_with_session_layers(
-                &current_config.config_layer_stack,
-                &current_config.cwd,
+                &expected_config.config_layer_stack,
+                &expected_config.cwd,
             )
             .await
         {
             Ok(config) => config,
             Err(err) => {
                 tracing::warn!(%thread_id, %err, "failed to reload thread configuration");
-                return;
+                thread.disable_mcp_enterprise_auth().await;
+                complete = false;
+                continue;
             }
         };
         match McpConfigIdentity::from_config(&next_config) {
-            Ok(identity) if identity == candidate_identity => refreshes.push((thread, next_config)),
+            Ok(identity) if identity == candidate_identity => {
+                planned.push((thread_id, thread, expected_config, next_config));
+            }
             Ok(_) => {
                 tracing::warn!(%thread_id, "selected MCP configuration changed while reloading runtime config");
                 return;
@@ -425,13 +536,119 @@ pub(super) async fn reload_user_config(
             }
         }
     }
-    for (thread, config) in refreshes {
-        Box::pin(thread.refresh_runtime_config_from_host(config)).await;
+
+    if planned.is_empty() && !complete {
+        // All failures so far were planning failures or user-layer-neutral
+        // enterprise revocations. With no identity-bearing publication ahead,
+        // the last applied baseline is still truthful and must be retained.
+        return;
     }
-    applied_mcp_config_identity.replace(candidate_identity);
+
+    // Thread configuration can change from here on. Withdraw the applied
+    // identity first so an incomplete or cancelled transition fails closed; it
+    // is restored only after every thread published the candidate layers.
+    applied_mcp_config_identity.invalidate();
+    for (thread_id, thread, expected_config, next_config) in planned {
+        let published = Box::pin(publish_thread_user_config(
+            config_manager,
+            thread.as_ref(),
+            thread_id,
+            &candidate_identity,
+            expected_config,
+            next_config,
+        ))
+        .await;
+        complete &= published;
+    }
+    if complete {
+        applied_mcp_config_identity.replace(candidate_identity);
+    } else {
+        tracing::warn!(
+            "user configuration reload was not published to every thread; the applied MCP configuration identity stays unavailable until a complete reload"
+        );
+    }
 }
 
-fn map_requirements_to_api(
+/// Publishes one planned thread reload through the host-gated compare-and-swap
+/// path. Returns true only when the candidate user layers were published; a
+/// stale, rejected, or exhausted refresh never reports success.
+async fn publish_thread_user_config(
+    config_manager: &ConfigManager,
+    thread: &codex_core::CodexThread,
+    thread_id: codex_protocol::ThreadId,
+    candidate_identity: &Option<McpConfigIdentity>,
+    expected_config: Arc<codex_core::config::Config>,
+    next_config: codex_core::config::Config,
+) -> bool {
+    let mut planned = Some((expected_config, next_config));
+    for attempt in 0..USER_RELOAD_ATTEMPTS {
+        let (expected_config, next_config) = match planned.take() {
+            Some(planned) => planned,
+            None => {
+                // Re-capture the current owner under the same host gate.
+                let expected_config = thread.config().await;
+                let next_config = match config_manager
+                    .load_latest_config_with_session_layers(
+                        &expected_config.config_layer_stack,
+                        &expected_config.cwd,
+                    )
+                    .await
+                {
+                    Ok(config) => config,
+                    Err(err) => {
+                        tracing::warn!(%thread_id, %err, "failed to reload thread configuration");
+                        thread.disable_mcp_enterprise_auth().await;
+                        return false;
+                    }
+                };
+                match McpConfigIdentity::from_config(&next_config) {
+                    Ok(identity) if identity == *candidate_identity => {}
+                    Ok(_) => {
+                        tracing::warn!(%thread_id, "selected MCP configuration changed while reloading runtime config");
+                        return false;
+                    }
+                    Err(err) => {
+                        tracing::warn!(%thread_id, %err, "failed to identify thread runtime configuration");
+                        return false;
+                    }
+                }
+                (expected_config, next_config)
+            }
+        };
+        let current_requirements = expected_config.config_layer_stack.requirements();
+        let next_requirements = next_config.config_layer_stack.requirements();
+        let promote_mcp = current_requirements.mcp_servers != next_requirements.mcp_servers
+            || current_requirements.plugins != next_requirements.plugins
+            || current_requirements.feature_requirements != next_requirements.feature_requirements;
+        let outcome = if promote_mcp {
+            // Keep the loaded MCP map and its requirements under one owner,
+            // then reload the user update from that owner.
+            Box::pin(thread.refresh_mcp_config(expected_config, next_config)).await
+        } else {
+            // Keep runtime refresh state off the request dispatcher's stack.
+            Box::pin(thread.refresh_runtime_config_from_host(expected_config, next_config)).await
+        };
+        match outcome {
+            codex_core::ConfigRefreshOutcome::Published => {
+                if !promote_mcp {
+                    return true;
+                }
+            }
+            codex_core::ConfigRefreshOutcome::Stale => {}
+            codex_core::ConfigRefreshOutcome::Rejected => {
+                tracing::warn!(%thread_id, "stopped user configuration reload after rejected refresh");
+                return false;
+            }
+        }
+        if attempt + 1 == USER_RELOAD_ATTEMPTS {
+            thread.disable_mcp_enterprise_auth().await;
+            tracing::warn!(%thread_id, "configuration kept changing during user reload; enterprise MCP disabled");
+        }
+    }
+    false
+}
+
+pub(crate) fn map_requirements_to_api(
     requirements: Option<ConfigRequirementsToml>,
     allowed_login_methods: Vec<ForcedLoginMethod>,
 ) -> Option<ConfigRequirements> {
@@ -442,6 +659,12 @@ fn map_requirements_to_api(
         }
         None => ConfigRequirementsToml::default(),
     };
+    let network = requirements
+        .permissions
+        .as_ref()
+        .and_then(|permissions| permissions.network.as_deref())
+        .cloned()
+        .or_else(|| requirements.network.clone());
 
     Some(ConfigRequirements {
         model_provider: requirements.model_provider,
@@ -454,6 +677,14 @@ fn map_requirements_to_api(
         allowed_login_methods: Some(allowed_login_methods),
         application: requirements.application.map(|application| {
             codex_app_server_protocol::ApplicationRequirements {
+                storage: application
+                    .storage
+                    .map(|storage| ApplicationStorageRequirements {
+                        default_project_parent: storage.default_project_parent.map(Into::into),
+                        projectless_workspace_root: storage
+                            .projectless_workspace_root
+                            .map(Into::into),
+                    }),
                 network: application.network.map(|network| {
                     codex_app_server_protocol::ApplicationNetworkRequirements {
                         enabled: network.enabled,
@@ -552,11 +783,14 @@ fn map_requirements_to_api(
         feature_requirements: requirements
             .feature_requirements
             .map(|requirements| requirements.entries),
-        hooks: requirements.hooks.map(map_hooks_requirements_to_api),
+        hooks: requirements
+            .hooks
+            .map(map_hooks_requirements_to_api)
+            .map(Box::new),
         enforce_residency: requirements
             .enforce_residency
             .map(map_residency_requirement_to_api),
-        network: requirements.network.map(map_network_requirements_to_api),
+        network: network.map(map_network_requirements_to_api),
         auto_review: requirements
             .auto_review
             .map(|auto_review| AutoReviewRequirements {
@@ -570,6 +804,9 @@ fn map_requirements_to_api(
                 service_tier: new_thread.service_tier,
             }),
         }),
+        otel: requirements
+            .otel
+            .map(|otel| map_otel_requirements_to_api(*otel)),
         sqlite_home: requirements.sqlite_home.map(Into::into),
         log_dir: requirements.log_dir.map(Into::into),
         model_catalog_json: requirements.model_catalog_json.map(Into::into),
@@ -631,6 +868,19 @@ fn map_browser_use_requirements_to_api(
     browser_use: codex_config::BrowserUseRequirementsToml,
 ) -> BrowserUseRequirements {
     BrowserUseRequirements {
+        extension: browser_use.extension.map(|extension| {
+            codex_app_server_protocol::BrowserUseExtensionRequirements {
+                request_headers: extension.request_headers.map(|headers| {
+                    headers
+                        .into_iter()
+                        .map(|header| codex_app_server_protocol::RequestHeader {
+                            name: header.name,
+                            value: header.value,
+                        })
+                        .collect()
+                }),
+            }
+        }),
         allow_webmcp: browser_use.allow_webmcp,
         allow_history_access: browser_use.allow_history_access,
         disable_auto_review: browser_use.disable_auto_review,
@@ -694,6 +944,8 @@ fn map_hooks_requirements_to_api(hooks: ManagedHooksRequirementsToml) -> Managed
         hooks,
     } = hooks;
     let HookEventsToml {
+        pre_model_request,
+        post_model_request,
         pre_tool_use,
         permission_request,
         post_tool_use,
@@ -706,11 +958,13 @@ fn map_hooks_requirements_to_api(hooks: ManagedHooksRequirementsToml) -> Managed
         subagent_stop,
         stop,
         interrupt,
-    } = hooks;
+    } = *hooks;
 
     ManagedHooksRequirements {
         managed_dir,
         windows_managed_dir,
+        pre_model_request: map_hook_matcher_groups_to_api(pre_model_request),
+        post_model_request: map_hook_matcher_groups_to_api(post_model_request),
         pre_tool_use: map_hook_matcher_groups_to_api(pre_tool_use),
         permission_request: map_hook_matcher_groups_to_api(permission_request),
         post_tool_use: map_hook_matcher_groups_to_api(post_tool_use),
@@ -831,6 +1085,7 @@ fn map_network_requirements_to_api(
                 })
                 .collect()
         }),
+        review_domains: network.review_domains,
         managed_allowed_domains_only: network.managed_allowed_domains_only,
         allowed_domains,
         denied_domains,
@@ -884,7 +1139,9 @@ fn config_write_error(code: ConfigWriteErrorCode, message: impl Into<String>) ->
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::map_requirements_to_api;
+    use super::reload_user_config;
+    use crate::config_manager::ConfigManager;
     use codex_app_server_protocol::AllowDenyRequirement;
     use codex_app_server_protocol::AutoReviewRequirements;
     use codex_app_server_protocol::BrowserUseAccessApprovalLifetime;
@@ -901,18 +1158,19 @@ mod tests {
     use codex_config::BrowserUseAccessApprovalLifetimeToml;
     use codex_config::BrowserUseOriginPolicyToml;
     use codex_config::BrowserUseRequirementsToml;
+    use codex_config::CloudConfigBundleLoader;
     use codex_config::ComputerUseMacosRequirementsToml;
     use codex_config::ComputerUseRequirementsToml;
     use codex_config::ComputerUseWindowsExeRequirementToml;
     use codex_config::ComputerUseWindowsRequirementsToml;
     use codex_config::ConfigRequirementsToml;
+    use codex_config::LoaderOverrides;
     use codex_config::ModelsRequirementsToml;
     use codex_config::NewThreadModelDefaultsToml;
     use codex_config::WindowsRequirementsToml;
     use codex_config::types::FeedbackConfigToml;
-    use codex_core::config::ConfigBuilder;
-    use codex_core::test_support::EmptyUserInstructionsProvider;
-    use codex_login::AuthManager;
+    use codex_config::types::ToolSuggestDisabledTool;
+    use codex_exec_server::EnvironmentManager;
     use codex_login::CodexAuth;
     use codex_protocol::config_types::ForcedLoginMethod;
     use codex_protocol::openai_models::ReasoningEffort;
@@ -921,7 +1179,84 @@ mod tests {
     use pretty_assertions::assert_eq;
     use std::collections::BTreeMap;
     use std::sync::Arc;
-    use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn reload_user_config_preserves_promoted_mcp_allowlist_denial() -> anyhow::Result<()> {
+        let home = tempfile::tempdir()?;
+        let managed_config_path = home.path().join("managed_config.toml");
+        std::fs::write(
+            &managed_config_path,
+            r#"
+[features]
+use_xaa = true
+[mcp_enterprise_managed_auth.idp]
+issuer = "https://idp.example"
+client_id = "idp-client"
+[mcp_servers.enterprise]
+url = "https://resource.example/mcp"
+auth = "ema_auth"
+oauth_resource = "https://resource.example/mcp"
+[mcp_servers.enterprise.oauth]
+client_id = "mcp-client"
+"#,
+        )?;
+        let requirements_path = home.path().join("requirements.toml");
+        std::fs::write(
+            &requirements_path,
+            "[mcp_servers.enterprise.identity]\nurl = 'https://resource.example/mcp'\n",
+        )?;
+        let config_manager = ConfigManager::new_for_tests(
+            home.path().to_path_buf(),
+            Vec::new(),
+            LoaderOverrides::with_managed_config_path_for_tests(managed_config_path),
+            CloudConfigBundleLoader::default(),
+        );
+        let initial = config_manager
+            .load_latest_config(Some(home.path().to_path_buf()))
+            .await?;
+        let thread_manager = codex_core::test_support::thread_manager_with_models_provider_and_home(
+            CodexAuth::from_api_key("dummy"),
+            initial.model_provider.clone(),
+            initial.codex_home.to_path_buf(),
+            Arc::new(EnvironmentManager::default_for_tests()),
+        );
+        let thread = thread_manager
+            .start_thread(codex_core::StartThreadOptions::new(
+                initial, /*control_endpoint*/ None,
+            ))
+            .await?
+            .thread;
+        assert!(thread.config().await.mcp_servers.get()["enterprise"].enabled);
+
+        std::fs::write(&requirements_path, "[mcp_servers]\n")?;
+        std::fs::write(
+            home.path().join(codex_config::CONFIG_TOML_FILE),
+            "[tool_suggest]\ndisabled_tools = [{ type = 'connector', id = 'calendar' }]\n",
+        )?;
+        reload_user_config(
+            &config_manager,
+            &thread_manager,
+            &crate::mcp_config_identity::AppliedMcpConfigIdentity::default(),
+        )
+        .await;
+
+        let refreshed = thread.config().await;
+        assert_eq!(
+            refreshed
+                .config_layer_stack
+                .requirements()
+                .mcp_servers
+                .as_ref()
+                .map(|requirements| &requirements.value),
+            Some(&BTreeMap::new())
+        );
+        assert!(!refreshed.mcp_servers.get()["enterprise"].enabled);
+        assert_eq!(
+            refreshed.tool_suggest.disabled_tools,
+            vec![ToolSuggestDisabledTool::connector("calendar")]
+        );
+        Ok(())
+    }
 
     fn map_test_requirements(
         requirements: ConfigRequirementsToml,
@@ -942,63 +1277,6 @@ mod tests {
 
         assert_eq!(mapped.allow_managed_hooks_only, Some(true));
         assert_eq!(mapped.hooks, None);
-    }
-
-    #[tokio::test]
-    async fn runtime_reload_planning_failure_retains_applied_mcp_identity() -> anyhow::Result<()> {
-        let home = tempdir()?;
-        let config_path = home.path().join(codex_config::CONFIG_TOML_FILE);
-        std::fs::write(
-            &config_path,
-            "[mcp_servers.initial]\ncommand = \"initial\"\n",
-        )?;
-        let config = ConfigBuilder::default()
-            .codex_home(home.path().to_path_buf())
-            .build()
-            .await?;
-        let config_manager =
-            ConfigManager::without_managed_config_for_tests(home.path().to_path_buf());
-        let applied = AppliedMcpConfigIdentity::from_startup_config(&config);
-        let before = applied.current().expect("startup identity");
-        let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("test"));
-        let thread_manager = Arc::new(ThreadManager::new(
-            &config,
-            Arc::clone(&auth_manager),
-            codex_core::build_models_manager(&config, auth_manager),
-            codex_core::CodexAppsToolsCache::default(),
-            codex_protocol::protocol::SessionSource::Exec,
-            Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
-            codex_extension_api::empty_extension_registry(),
-            Arc::new(EmptyUserInstructionsProvider),
-            /*analytics_events_client*/ None,
-            codex_core::passthrough_image_store(),
-            codex_core::thread_store_from_config(&config, /*state_db*/ None),
-            /*agent_graph_store*/ None,
-            "test-installation".to_string(),
-            /*attestation_provider*/ None,
-            /*external_time_provider*/ None,
-        ));
-        let (outgoing_tx, _outgoing_rx) = tokio::sync::mpsc::channel(1);
-        let processor = ConfigRequestProcessor::new(
-            Arc::new(OutgoingMessageSender::new(
-                outgoing_tx,
-                AnalyticsEventsClient::disabled(),
-            )),
-            config_manager,
-            thread_manager,
-            applied.clone(),
-            AnalyticsEventsClient::disabled(),
-        );
-
-        std::fs::write(&config_path, "[mcp_servers.invalid\n")?;
-        processor.reload_user_config().await;
-
-        assert_eq!(
-            applied.current(),
-            Some(before),
-            "a failed reload before the first thread mutation retains the last complete applied identity"
-        );
-        Ok(())
     }
 
     #[test]
@@ -1085,6 +1363,12 @@ mod tests {
         let mapped = map_test_requirements(ConfigRequirementsToml {
             allow_browser_and_computer_use: Some(false),
             browser_use: Some(BrowserUseRequirementsToml {
+                extension: Some(codex_config::BrowserUseExtensionRequirementsToml {
+                    request_headers: Some(vec![codex_config::RequestHeaderToml {
+                        name: "x-browser-agent".into(),
+                        value: "ChatGPT/{{session_id}}".into(),
+                    }]),
+                }),
                 allow_webmcp: Some(true),
                 allow_history_access: Some(false),
                 disable_auto_review: Some(true),
@@ -1143,6 +1427,12 @@ mod tests {
         assert_eq!(
             mapped.browser_use,
             Some(BrowserUseRequirements {
+                extension: Some(codex_app_server_protocol::BrowserUseExtensionRequirements {
+                    request_headers: Some(vec![codex_app_server_protocol::RequestHeader {
+                        name: "x-browser-agent".into(),
+                        value: "ChatGPT/{{session_id}}".into()
+                    }]),
+                }),
                 allow_webmcp: Some(true),
                 allow_history_access: Some(false),
                 disable_auto_review: Some(true),
@@ -1206,6 +1496,8 @@ mod tests {
                     codex_config::WindowsSandboxImplementationToml::Elevated,
                     codex_config::WindowsSandboxImplementationToml::Unelevated,
                 ]),
+                allow_mxc: None,
+                require_mxc: None,
             }),
             ..ConfigRequirementsToml::default()
         });

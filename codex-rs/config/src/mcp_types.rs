@@ -18,6 +18,7 @@ use serde::Serialize;
 use serde::de::Error as SerdeError;
 
 use crate::McpEmaRegistration;
+use crate::McpEmaTokenEndpointAuthMethod;
 use crate::RequirementSource;
 
 /// Effective MCP environment id when config omits `environment_id`.
@@ -61,19 +62,17 @@ pub enum McpServerDisabledReason {
     Unknown,
     /// The server was disabled by config requirements from the given source.
     Requirements { source: RequirementSource },
-    /// Enterprise authorization was rejected for this registration, not its name.
-    EmaRegistration,
+    /// An explicit disable is also denied by requirements.
+    ExplicitAndRequirements { source: RequirementSource },
 }
 
 impl fmt::Display for McpServerDisabledReason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             McpServerDisabledReason::Unknown => write!(f, "unknown"),
-            McpServerDisabledReason::Requirements { source } => {
+            McpServerDisabledReason::Requirements { source }
+            | McpServerDisabledReason::ExplicitAndRequirements { source } => {
                 write!(f, "requirements ({source})")
-            }
-            McpServerDisabledReason::EmaRegistration => {
-                write!(f, "invalid enterprise registration")
             }
         }
     }
@@ -169,6 +168,11 @@ pub struct McpServerOAuthConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_secret: Option<RedactedString>,
 
+    /// Registered EMA client authentication method. Defaults to client_secret_basic
+    /// when a secret is configured; requires a client secret.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_endpoint_auth_method: Option<McpEmaTokenEndpointAuthMethod>,
+
     /// Registered callback URL associated with this OAuth client.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub callback_url: Option<String>,
@@ -185,11 +189,6 @@ pub struct McpServerOAuthConfig {
     #[serde(skip)]
     #[schemars(skip)]
     pub ema_registration: Option<McpEmaRegistration>,
-
-    /// Host-policy rejection retained until catalog finalization; never deserialized.
-    #[serde(skip)]
-    #[schemars(skip)]
-    pub ema_registration_error: Option<&'static str>,
 }
 
 /// Authentication flow for an HTTP MCP server. Explicit credentials take
@@ -259,24 +258,18 @@ pub struct McpServerConfig {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub supports_parallel_tool_calls: bool,
 
+    /// Opt in to capability-gated, connection-scoped canonical thread binding.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub thread_identity_eligible: bool,
+
+    /// Opt in to capability-gated disclosure of the hosting control endpoint.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub control_endpoint_eligible: bool,
+
     /// UTF-8 byte threshold for compacting each ordinary MCP tool input schema. Defaults to 5,000 bytes.
     /// Code Mode also uses an explicitly configured limit when rendering each tool's input type.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_input_schema_max_bytes: Option<NonZeroUsize>,
-    /// When `true`, Codex may disclose the canonical thread identity to this
-    /// server via the `codex/thread-identity` capability-gated bind
-    /// handshake, per `kcf-runtime/04-mcp-thread-identity-contract.md`.
-    /// Default `false`: no server is eligible for thread-identity binding
-    /// unless explicitly opted in.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub thread_identity_eligible: bool,
-
-    /// When `true`, Codex may disclose the hosting app-server control endpoint
-    /// through the capability-gated `codex/control-endpoint` handshake.
-    /// Default `false`: no server receives the endpoint unless explicitly
-    /// opted in.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub control_endpoint_eligible: bool,
 
     /// Model-facing surfaces from which this server's tools must be omitted.
     /// `None` leaves lower-priority configuration unchanged; an empty list clears it.
@@ -329,6 +322,27 @@ pub struct McpServerConfig {
 }
 
 impl McpServerConfig {
+    /// Disables this registration without losing an existing explicit disable.
+    pub fn disable_by_requirements(&mut self, source: RequirementSource) {
+        let explicitly_disabled = match self.disabled_reason {
+            Some(McpServerDisabledReason::Requirements { .. }) => false,
+            Some(McpServerDisabledReason::ExplicitAndRequirements { .. }) => true,
+            Some(McpServerDisabledReason::Unknown) | None => !self.enabled,
+        };
+        self.enabled = false;
+        self.disabled_reason = Some(if explicitly_disabled {
+            McpServerDisabledReason::ExplicitAndRequirements { source }
+        } else {
+            McpServerDisabledReason::Requirements { source }
+        });
+    }
+
+    /// Whether a regular chat may defer this server when its tool catalog is cached.
+    pub fn can_defer_stdio_startup(&self) -> bool {
+        matches!(&self.transport, McpServerTransportConfig::Stdio { .. })
+            && (!self.required || self.startup_readiness == McpStartupReadiness::Catalog)
+    }
+
     pub fn is_local_environment(&self) -> bool {
         self.environment_id == DEFAULT_MCP_SERVER_ENVIRONMENT_ID
     }
@@ -431,16 +445,16 @@ pub struct RawMcpServerConfig {
     pub startup_readiness: Option<McpStartupReadiness>,
     #[serde(default)]
     pub supports_parallel_tool_calls: Option<bool>,
+    #[serde(default)]
+    pub thread_identity_eligible: Option<bool>,
+    #[serde(default)]
+    pub control_endpoint_eligible: Option<bool>,
     /// UTF-8 byte threshold for compacting each ordinary MCP tool input schema. Defaults to 5,000 bytes.
     /// Code Mode also uses an explicitly configured limit when rendering each tool's input type.
     /// Larger limits preserve more parameter descriptions.
     #[serde(default)]
     #[schemars(range(min = 1))]
     pub tool_input_schema_max_bytes: Option<NonZeroUsize>,
-    #[serde(default)]
-    pub thread_identity_eligible: Option<bool>,
-    #[serde(default)]
-    pub control_endpoint_eligible: Option<bool>,
     #[serde(default)]
     pub omit_tools_from: Option<Vec<ToolExposureSurface>>,
     #[serde(default)]
@@ -487,9 +501,9 @@ impl TryFrom<RawMcpServerConfig> for McpServerConfig {
             required,
             startup_readiness,
             supports_parallel_tool_calls,
-            tool_input_schema_max_bytes,
             thread_identity_eligible,
             control_endpoint_eligible,
+            tool_input_schema_max_bytes,
             omit_tools_from,
             default_tools_approval_mode,
             enabled_tools,
@@ -590,6 +604,20 @@ impl TryFrom<RawMcpServerConfig> for McpServerConfig {
                 return Err("oauth.client_secret requires oauth.client_id".to_string());
             }
         }
+        if let Some(oauth) = &oauth
+            && oauth.token_endpoint_auth_method.is_some()
+        {
+            if !matches!(auth, McpServerAuth::EmaAuth) {
+                return Err(
+                    "oauth.token_endpoint_auth_method requires auth = \"ema_auth\"".to_string(),
+                );
+            }
+            if oauth.client_secret.is_none() {
+                return Err(
+                    "oauth.token_endpoint_auth_method requires oauth.client_secret".to_string(),
+                );
+            }
+        }
         if !matches!(auth, McpServerAuth::EmaAuth)
             && oauth
                 .as_ref()
@@ -610,9 +638,9 @@ impl TryFrom<RawMcpServerConfig> for McpServerConfig {
             required: required.unwrap_or_default(),
             startup_readiness: startup_readiness.unwrap_or_default(),
             supports_parallel_tool_calls: supports_parallel_tool_calls.unwrap_or_default(),
-            tool_input_schema_max_bytes,
             thread_identity_eligible: thread_identity_eligible.unwrap_or_default(),
             control_endpoint_eligible: control_endpoint_eligible.unwrap_or_default(),
+            tool_input_schema_max_bytes,
             omit_tools_from,
             disabled_reason: None,
             default_tools_approval_mode,

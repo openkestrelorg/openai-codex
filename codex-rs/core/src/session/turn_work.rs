@@ -51,10 +51,14 @@ impl Session {
         &self,
         termination: BoxFuture<'static, ()>,
     ) -> Result<Option<Box<dyn HostTurnWork>>, TurnWorkRefused> {
-        match &self.services.host_admission {
-            Some(host) => host.admit_turn_work(&self.services.thread_extension_data, termination),
-            None => Ok(None),
+        let Some(host) = &self.services.host_admission else {
+            return Ok(None);
+        };
+        let work = host.admit_turn_work(&self.services.thread_extension_data, termination)?;
+        if work.is_none() && host.requires_account_work() {
+            return Err(TurnWorkRefused::Unavailable);
         }
+        Ok(work)
     }
 
     pub(crate) fn finish_isolated_turn_work(&self, turn_id: &str) {

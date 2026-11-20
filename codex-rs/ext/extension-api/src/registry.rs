@@ -5,6 +5,7 @@ use crate::ConfigContributor;
 use crate::ContextContributor;
 use crate::ExtensionEventSink;
 use crate::McpServerContributor;
+use crate::MessageLifecycleContributor;
 use crate::ModelRequestContributor;
 use crate::NoopExtensionEventSink;
 use crate::SkillInvocationContributor;
@@ -40,6 +41,7 @@ impl<C: Sync> Default for ExtensionRegistryBuilder<C> {
                 tool_contributors: Vec::new(),
                 tool_lifecycle_contributors: Vec::new(),
                 model_request_contributors: Vec::new(),
+                message_observers: Vec::new(),
                 turn_item_contributors: Vec::new(),
             },
         }
@@ -144,6 +146,11 @@ impl<C: Sync> ExtensionRegistryBuilder<C> {
         self.registry.turn_item_contributors.push(contributor);
     }
 
+    /// Registers a synchronous direct-message observer.
+    pub fn message_lifecycle_contributor(&mut self, hook: Arc<dyn MessageLifecycleContributor>) {
+        self.registry.message_observers.push(hook);
+    }
+
     /// Finishes construction and returns the immutable registry.
     pub fn build(self) -> ExtensionRegistry<C> {
         self.registry
@@ -165,6 +172,7 @@ pub struct ExtensionRegistry<C: Sync> {
     tool_contributors: Vec<Arc<dyn ToolContributor>>,
     tool_lifecycle_contributors: Vec<Arc<dyn ToolLifecycleContributor>>,
     model_request_contributors: Vec<Arc<dyn ModelRequestContributor>>,
+    message_observers: Vec<Arc<dyn MessageLifecycleContributor>>,
     turn_item_contributors: Vec<Arc<dyn TurnItemContributor>>,
     approval_review_contributors: Vec<Arc<dyn ApprovalReviewContributor>>,
 }
@@ -187,10 +195,16 @@ impl<C: Sync> ExtensionRegistry<C> {
                 tool_contributors: self.tool_contributors.clone(),
                 tool_lifecycle_contributors: self.tool_lifecycle_contributors.clone(),
                 model_request_contributors: self.model_request_contributors.clone(),
+                message_observers: self.message_observers.clone(),
                 turn_item_contributors: self.turn_item_contributors.clone(),
                 approval_review_contributors: self.approval_review_contributors.clone(),
             },
         }
+    }
+
+    /// Finite operation admission remains attached even for isolated contributors.
+    pub fn host_admission(&self) -> Option<Arc<dyn crate::TurnStartAdmission>> {
+        self.turn_start_admission.clone()
     }
 
     /// Acquires the host's turn-start permit, or an empty permit for ungated hosts.
@@ -199,49 +213,6 @@ impl<C: Sync> ExtensionRegistry<C> {
         match &self.turn_start_admission {
             Some(admission) => admission.admit_turn_start(),
             None => Some(Box::new(())),
-        }
-    }
-
-    /// Host admission is independent of contributor isolation. Constructors
-    /// retain this handle even when a child receives an empty extension registry.
-    pub fn host_admission(&self) -> Option<Arc<dyn crate::TurnStartAdmission>> {
-        self.turn_start_admission.clone()
-    }
-
-    /// Acquire account-work custody without changing Core's shutdown gate.
-    pub fn admit_turn_work(
-        &self,
-        thread_store: &crate::ExtensionData,
-        termination: crate::ExtensionFuture<'static, ()>,
-    ) -> Result<Option<Box<dyn codex_protocol::host_turn_work::HostTurnWork>>, crate::TurnWorkRefused>
-    {
-        match &self.turn_start_admission {
-            Some(admission) => admission.admit_turn_work(thread_store, termination),
-            None => Ok(None),
-        }
-    }
-
-    /// Derive child custody from a live parent turn without reopening admission.
-    pub fn derive_turn_work(
-        &self,
-        parent_store: &crate::ExtensionData,
-        parent_turn_id: &str,
-        child_store: &crate::ExtensionData,
-        termination: crate::ExtensionFuture<'static, ()>,
-    ) -> Result<Option<Box<dyn codex_protocol::host_turn_work::HostTurnWork>>, crate::TurnWorkRefused>
-    {
-        match &self.turn_start_admission {
-            Some(admission) => {
-                admission.derive_turn_work(parent_store, parent_turn_id, child_store, termination)
-            }
-            None => Ok(None),
-        }
-    }
-
-    /// Forward terminal evidence from an existing child event consumer.
-    pub fn turn_work_terminal(&self, thread_store: &crate::ExtensionData, turn_id: &str) {
-        if let Some(admission) = &self.turn_start_admission {
-            admission.turn_work_terminal(thread_store, turn_id);
         }
     }
 
@@ -317,6 +288,11 @@ impl<C: Sync> ExtensionRegistry<C> {
     /// Returns the registered native tool contributors.
     pub fn tool_contributors(&self) -> &[Arc<dyn ToolContributor>] {
         &self.tool_contributors
+    }
+
+    /// Returns direct-message observers in registration order.
+    pub fn message_lifecycle_contributors(&self) -> &[Arc<dyn MessageLifecycleContributor>] {
+        &self.message_observers
     }
 
     /// Returns response interceptor contributors in registration order.

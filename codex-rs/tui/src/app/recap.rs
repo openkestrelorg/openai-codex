@@ -10,10 +10,12 @@ use crate::app_event::AppEvent;
 use crate::app_event::RecapTrigger;
 use crate::app_event_sender::AppEventSender;
 use crate::app_server_session::AppServerSession;
+use crate::app_server_session::ThreadSettingsOwner;
 use crate::history_cell::ThreadRecapHistoryCell;
 use crate::history_cell::ThreadRecapLoadingCell;
 use crate::pager_overlay::Overlay;
 use crate::temporary_structured_request::TemporaryStructuredThreadOptions;
+use crate::temporary_structured_request::TemporaryThread;
 use crate::temporary_structured_request::run_temporary_structured_turn;
 use crate::temporary_structured_request::start_temporary_thread;
 use crate::temporary_structured_request::unsubscribe_temporary_thread;
@@ -39,6 +41,8 @@ const RECAP_RETRY_DELAY: Duration = Duration::from_secs(/*secs*/ 30);
 const MANUAL_RECAP_FAILURE_MESSAGE: &str = "Could not generate a recap. Please try again.";
 const MANUAL_RECAP_IN_PROGRESS_MESSAGE: &str = "A recap is already being generated.";
 const MANUAL_RECAP_EMPTY_HISTORY_MESSAGE: &str = "There is no conversation history to recap.";
+const CLOUD_RECAP_UNAVAILABLE_MESSAGE: &str =
+    "Conversation recaps are not available for cloud conversations.";
 #[cfg(test)]
 pub(super) const RECAP_PROMPT_MAX_BYTES: usize = RecapPrompt::MAX_BYTES;
 
@@ -55,7 +59,10 @@ struct GeneratedRecap {
 }
 
 fn recap_prompt(history: &str) -> String {
-    RecapPrompt::new(history).render()
+    RecapPrompt::new(history)
+        .render()
+        .into_text()
+        .unwrap_or_default()
 }
 
 fn recap_output_schema() -> Value {
@@ -181,6 +188,13 @@ impl App {
         thread_id: ThreadId,
         trigger: RecapTrigger,
     ) {
+        if app_server.thread_params_mode().settings_owner() == ThreadSettingsOwner::Server {
+            if matches!(trigger, RecapTrigger::Manual) {
+                self.chat_widget
+                    .add_error_message(CLOUD_RECAP_UNAVAILABLE_MESSAGE.to_string());
+            }
+            return;
+        }
         if !self.recap_trigger_enabled(trigger) {
             return;
         }
@@ -232,13 +246,12 @@ impl App {
                 .permissions
                 .active_permission_profile()
                 .map(|profile| profile.id),
-            mcp_server_names: config.mcp_servers.get().keys().cloned().collect(),
         };
         let event_sender = self.app_event_tx.clone();
         let task = tokio::spawn(async move {
             let result = start_temporary_thread(&request_handle, options)
                 .await
-                .map(|thread| thread.thread.id)
+                .map(crate::temporary_structured_request::StartedTemporaryThread::into_thread)
                 .map_err(|error| error.to_string());
 
             event_sender.send(AppEvent::RecapStarted {
@@ -262,7 +275,7 @@ impl App {
         app_server: &AppServerSession,
         request: RecapRequest,
         history: String,
-        result: Result<String, String>,
+        result: Result<TemporaryThread, String>,
     ) {
         let RecapRequest {
             thread_id,
@@ -318,7 +331,9 @@ impl App {
             }
             let request_handle = app_server.request_handle();
             tokio::spawn(async move {
-                unsubscribe_temporary_thread(&request_handle, temporary_thread_id_text).await;
+                let TemporaryThread { id, retention } = temporary_thread_id_text;
+                drop(retention);
+                unsubscribe_temporary_thread(&request_handle, id).await;
             });
             return;
         }

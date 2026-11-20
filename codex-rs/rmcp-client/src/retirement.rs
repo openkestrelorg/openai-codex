@@ -7,8 +7,11 @@ use std::ops::Deref;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::Weak;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering as AtomicOrdering;
 
-use crate::stdio_server_launcher::StdioServerProcessHandle;
+use crate::stdio_server_launcher::StdioProcessRef;
+use crate::stdio_server_launcher::StdioTermination;
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use futures::future::Shared;
@@ -21,6 +24,7 @@ use rmcp::service::RunningServiceCancellationToken;
 use rmcp::service::RxJsonRpcMessage;
 use rmcp::service::TxJsonRpcMessage;
 use rmcp::transport::Transport;
+use rmcp::transport::worker::CloseDeadline;
 use tokio::sync::watch;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -60,12 +64,54 @@ struct RegistryState {
     closed: bool,
     shutdown: CancellationToken,
     attempts: Vec<Arc<Attempt>>,
+    /// Shared with every rmcp worker this registry's transports spawn, so their
+    /// exit cleanup ends by the earliest retirement deadline. Its own mutex is
+    /// a leaf: it is taken after this registry lock or alone, never before it.
+    close_deadline: CloseDeadline,
+    /// Set only by a complete `shutdown_until` census of a closed registry.
+    /// Shared with observers so the proof outlives the registry itself.
+    proven: Arc<AtomicBool>,
 }
 
 /// Allocate before constructing the first transport and retain through retirement.
 #[derive(Clone, Default)]
 pub struct RmcpClientRetirement {
     state: Arc<Mutex<RegistryState>>,
+}
+
+/// Observation handle that never extends a registry's lifetime. Custody stays
+/// with the owning runtime; this only lets an exact-endpoint retirement find it.
+#[derive(Clone)]
+pub struct WeakRmcpClientRetirement {
+    state: Weak<Mutex<RegistryState>>,
+}
+
+impl WeakRmcpClientRetirement {
+    pub fn upgrade(&self) -> Option<RmcpClientRetirement> {
+        self.state
+            .upgrade()
+            .map(|state| RmcpClientRetirement { state })
+    }
+
+    pub fn is_dropped(&self) -> bool {
+        self.state.strong_count() == 0
+    }
+
+    /// Identity of the exact registry, not of an equal-looking one.
+    pub fn same_registry(&self, other: &Self) -> bool {
+        Weak::ptr_eq(&self.state, &other.state)
+    }
+}
+
+/// Cached terminal evidence: true only after a complete physical retirement
+/// census was observed for the whole, closed registry. Never set otherwise.
+#[derive(Clone)]
+pub struct RetirementProof(Arc<AtomicBool>);
+
+impl RetirementProof {
+    pub fn is_proven(&self) -> bool {
+        self.0.load(AtomicOrdering::Acquire)
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -86,8 +132,8 @@ struct AttemptState {
     startup: Vec<Shared<BoxFuture<'static, ()>>>,
     active: usize,
     receipt: Option<TransportCloseReceipt>,
-    service: Option<Arc<ManagedRunningService>>,
-    process: Option<StdioServerProcessHandle>,
+    service: Option<Arc<dyn RetainedService>>,
+    process: Option<StdioProcessRef>,
     no_resource: bool,
 }
 
@@ -97,6 +143,9 @@ pub(crate) struct PhysicalAttemptTicket {
     attempt: Weak<Attempt>,
     registry: Weak<Mutex<RegistryState>>,
     pub(crate) shutdown: CancellationToken,
+    /// Cloned from the registry at reservation, so reading it never takes the
+    /// registry lock. It holds no registry reference, so no ownership cycle.
+    close_deadline: CloseDeadline,
 }
 
 impl PhysicalAttemptTicket {
@@ -172,7 +221,7 @@ impl PhysicalAttemptTicket {
     pub(crate) fn attach_transport(
         &self,
         receipt: TransportCloseReceipt,
-        process: Option<StdioServerProcessHandle>,
+        process: Option<StdioProcessRef>,
     ) {
         if let Some(attempt) = self.attempt.upgrade() {
             let mut state = attempt
@@ -188,7 +237,16 @@ impl PhysicalAttemptTicket {
         }
     }
 
-    pub(crate) fn attach_service(&self, service: Arc<ManagedRunningService>) {
+    /// The registry's retirement deadline, for an rmcp worker to read when its
+    /// exit cleanup starts. Takes no lock.
+    pub(crate) fn close_deadline(&self) -> CloseDeadline {
+        self.close_deadline.clone()
+    }
+
+    pub(crate) fn attach_service<S: Service<RoleClient> + 'static>(
+        &self,
+        service: Arc<ManagedRunningService<S>>,
+    ) {
         if let Some(attempt) = self.attempt.upgrade() {
             let mut state = attempt
                 .state
@@ -214,6 +272,71 @@ impl PhysicalAttemptTicket {
 }
 
 impl RmcpClientRetirement {
+    #[cfg(test)]
+    pub(crate) fn attached_service_count(&self) -> usize {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state
+            .attempts
+            .iter()
+            .filter(|attempt| {
+                attempt
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .service
+                    .is_some()
+            })
+            .count()
+    }
+
+    pub fn downgrade(&self) -> WeakRmcpClientRetirement {
+        WeakRmcpClientRetirement {
+            state: Arc::downgrade(&self.state),
+        }
+    }
+
+    /// Earliest deadline any owner has latched for this registry's workers.
+    pub fn latched_deadline(&self) -> Option<Instant> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .close_deadline
+            .get()
+    }
+
+    /// Observes under `min(deadline, latched)`, retaining a latched deadline
+    /// even when it has already expired: an expired latch yields no cleanup
+    /// work at all. Plain `shutdown_until` keeps its retry-with-fresh-budget
+    /// semantics for owners that explicitly retry.
+    pub async fn shutdown_within_latched(&self, deadline: Instant) -> PhysicalRetirementReport {
+        let effective = self
+            .latched_deadline()
+            .map_or(deadline, |latched| latched.min(deadline));
+        self.shutdown_until(effective).await
+    }
+
+    pub fn retirement_proof(&self) -> RetirementProof {
+        RetirementProof(Arc::clone(
+            &self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .proven,
+        ))
+    }
+
+    pub(crate) fn close_registration_until(&self, deadline: Instant) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .close_deadline
+            .latch(deadline);
+        self.close_registration();
+    }
+
     /// Close launch admission before the upper owner cancels/drains its tasks.
     /// Already-started phases may still attach their owned resources; dormant
     /// phases are atomically skipped and can never begin a transport launch.
@@ -259,6 +382,7 @@ impl RmcpClientRetirement {
             attempt: Arc::downgrade(&attempt),
             registry: Arc::downgrade(&self.state),
             shutdown: registry.shutdown.clone(),
+            close_deadline: registry.close_deadline.clone(),
         };
         registry.attempts.push(attempt);
         Ok(ticket)
@@ -281,6 +405,22 @@ impl RmcpClientRetirement {
 
     /// Cancelled callers leave every original launch/close future retained.
     pub async fn shutdown_until(&self, deadline: Instant) -> PhysicalRetirementReport {
+        self.shutdown_for_until(StdioTermination::Shutdown, deadline)
+            .await
+    }
+
+    pub(crate) async fn shutdown_for_until(
+        &self,
+        reason: StdioTermination,
+        deadline: Instant,
+    ) -> PhysicalRetirementReport {
+        // Latch before closing registration, which can already start a close.
+        // Latching keeps the earliest deadline, so a later call never extends it.
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .close_deadline
+            .latch(deadline);
         self.close_registration();
         let attempts = {
             let state = self
@@ -289,18 +429,29 @@ impl RmcpClientRetirement {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             state.attempts.clone()
         };
-        let outcomes = futures::future::join_all(
-            attempts
-                .into_iter()
-                .enumerate()
-                .map(|(id, attempt)| async move { (id, retire_attempt(attempt, deadline).await) }),
-        )
+        let outcomes = futures::future::join_all(attempts.into_iter().enumerate().map(
+            |(id, attempt)| async move { (id, retire_attempt(attempt, reason, deadline).await) },
+        ))
         .await;
-        PhysicalRetirementReport { attempts: outcomes }
+        let report = PhysicalRetirementReport { attempts: outcomes };
+        if report.is_complete() {
+            // Registration is closed, so this census covers every attempt
+            // that can ever exist for this registry.
+            self.state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .proven
+                .store(true, AtomicOrdering::Release);
+        }
+        report
     }
 }
 
-async fn retire_attempt(attempt: Arc<Attempt>, deadline: Instant) -> PhysicalRetirementOutcome {
+async fn retire_attempt(
+    attempt: Arc<Attempt>,
+    reason: StdioTermination,
+    deadline: Instant,
+) -> PhysicalRetirementOutcome {
     let startup = {
         let state = attempt
             .state
@@ -346,9 +497,15 @@ async fn retire_attempt(attempt: Arc<Attempt>, deadline: Instant) -> PhysicalRet
             }
             // Process termination must progress even while admitted startup is
             // stuck. The independent ticket is safe to retry after cancellation.
+            if let Some(service) = &service {
+                service.request_close();
+            }
             let process_close = async {
                 match process {
-                    Some(process) => process.terminate_until(deadline).await.map_err(|_| ()),
+                    Some(process) => process
+                        .terminate_until(reason, deadline)
+                        .await
+                        .map_err(|_| ()),
                     None => Ok(()),
                 }
             };
@@ -578,10 +735,30 @@ impl<T: Transport<RoleClient> + 'static> ReturnedTransportOwner for TransportLea
 /// Records the real close result before rmcp can discard it.
 pub(crate) struct AcknowledgedTransport<T> {
     inner: Option<T>,
+    on_return: Option<fn(&mut T)>,
     lease: Arc<TransportLease<T>>,
 }
 
 impl<T: Transport<RoleClient> + 'static> AcknowledgedTransport<T> {
+    #[expect(
+        clippy::expect_used,
+        reason = "inner is taken only by Drop, after these borrows end"
+    )]
+    pub(crate) fn inner_mut(&mut self) -> &mut T {
+        self.inner.as_mut().expect("live transport")
+    }
+    #[expect(
+        clippy::expect_used,
+        reason = "inner is taken only by Drop, after these borrows end"
+    )]
+    pub(crate) fn inner(&self) -> &T {
+        self.inner.as_ref().expect("live transport")
+    }
+    pub(crate) fn with_on_return(mut self, callback: fn(&mut T)) -> Self {
+        self.on_return = Some(callback);
+        self
+    }
+
     pub(crate) fn new(inner: T) -> (Self, TransportCloseReceipt) {
         let (closed, state) = watch::channel(CloseState::Pending);
         let lease = Arc::new(TransportLease {
@@ -591,6 +768,7 @@ impl<T: Transport<RoleClient> + 'static> AcknowledgedTransport<T> {
         (
             Self {
                 inner: Some(inner),
+                on_return: None,
                 lease: Arc::clone(&lease),
             },
             TransportCloseReceipt {
@@ -603,7 +781,12 @@ impl<T: Transport<RoleClient> + 'static> AcknowledgedTransport<T> {
 
 impl<T> Drop for AcknowledgedTransport<T> {
     fn drop(&mut self) {
-        if let Some(transport) = self.inner.take() {
+        if let Some(mut transport) = self.inner.take() {
+            if *self.lease.closed.borrow() == CloseState::Pending
+                && let Some(on_return) = self.on_return.take()
+            {
+                on_return(&mut transport);
+            }
             *self
                 .lease
                 .state
@@ -683,7 +866,7 @@ struct ServiceLeaseOwner<S: Service<RoleClient>> {
     changed: watch::Sender<usize>,
 }
 
-struct ServiceOperationLease<S: Service<RoleClient>> {
+pub(crate) struct ServiceOperationLease<S: Service<RoleClient>> {
     service: Option<Arc<RunningService<RoleClient, S>>>,
     owner: Arc<ServiceLeaseOwner<S>>,
 }
@@ -722,63 +905,29 @@ impl<S: Service<RoleClient>> ServiceLeaseOwner<S> {
     }
 }
 
-/// Erases the local handler type while retaining a lease across tool continuations.
-trait ServiceOperations: Send + Sync {
-    fn close_gate(&self);
-    fn call_tool(
-        &self,
-        params: rmcp::model::CallToolRequestParams,
-    ) -> BoxFuture<'_, Result<rmcp::model::CallToolResult, rmcp::service::ServiceError>>;
-    fn read_resource(
-        &self,
-        params: rmcp::model::ReadResourceRequestParams,
-    ) -> BoxFuture<'_, Result<rmcp::model::ReadResourceResult, rmcp::service::ServiceError>>;
+impl<S: Service<RoleClient>> ServiceOperationLease<S> {
+    pub(crate) fn reacquire(&self) -> Result<Arc<Self>, rmcp::service::ServiceError> {
+        self.owner.acquire().map(Arc::new)
+    }
 }
 
-impl<S: Service<RoleClient>> ServiceOperations for Arc<ServiceLeaseOwner<S>> {
-    fn close_gate(&self) {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .closing = true;
+impl<S: Service<RoleClient>> Deref for ServiceOperationLease<S> {
+    type Target = RunningService<RoleClient, S>;
+    fn deref(&self) -> &Self::Target {
+        let Some(service) = self.service.as_ref() else {
+            panic!("lease retains its service until drop");
+        };
+        service
     }
-    #[expect(
-        clippy::expect_used,
-        reason = "acquire initializes the lease service, which is taken only when the lease drops"
-    )]
-    fn call_tool(
+}
+
+/// The registry erases only terminal observation, never request execution.
+trait RetainedService: Send + Sync {
+    fn request_close(&self);
+    fn wait_until(
         &self,
-        params: rmcp::model::CallToolRequestParams,
-    ) -> BoxFuture<'_, Result<rmcp::model::CallToolResult, rmcp::service::ServiceError>> {
-        async move {
-            let lease = self.acquire()?;
-            crate::tool_input::call_tool(
-                lease.service.as_ref().expect("live operation lease"),
-                params,
-            )
-            .await
-        }
-        .boxed()
-    }
-    #[expect(
-        clippy::expect_used,
-        reason = "acquire initializes the lease service, which is taken only when the lease drops"
-    )]
-    fn read_resource(
-        &self,
-        params: rmcp::model::ReadResourceRequestParams,
-    ) -> BoxFuture<'_, Result<rmcp::model::ReadResourceResult, rmcp::service::ServiceError>> {
-        async move {
-            let lease = self.acquire()?;
-            lease
-                .service
-                .as_ref()
-                .expect("live operation lease")
-                .read_resource(params)
-                .await
-        }
-        .boxed()
-    }
+        deadline: Instant,
+    ) -> BoxFuture<'_, Result<LogicalCloseAck, LogicalCloseError>>;
 }
 
 /// Owns the original service join future, while requests use its cloned peer.
@@ -788,18 +937,18 @@ impl<S: Service<RoleClient>> ServiceOperations for Arc<ServiceLeaseOwner<S>> {
 /// Cancelling or timing out an observer drops only a shared clone, preserving the
 /// original join future for another attempt. Never wrap rmcp's `close()` itself
 /// in a timeout: that method takes and can then detach its private join handle.
-pub(crate) struct ManagedRunningService {
+pub(crate) struct ManagedRunningService<S: Service<RoleClient>> {
     peer: Peer<RoleClient>,
     cancellation: Mutex<Option<RunningServiceCancellationToken>>,
-    operations: Box<dyn ServiceOperations>,
+    owner: Arc<ServiceLeaseOwner<S>>,
     completion: Completion,
     // Completion futures release their captures once resolved. Keep the
     // returned transport owned even when the cached result is failure.
     _receipt: TransportCloseReceipt,
 }
 
-impl ManagedRunningService {
-    pub(crate) fn new<S>(
+impl<S: Service<RoleClient> + 'static> ManagedRunningService<S> {
+    pub(crate) fn new(
         service: RunningService<RoleClient, S>,
         receipt: TransportCloseReceipt,
     ) -> Self
@@ -818,7 +967,7 @@ impl ManagedRunningService {
             }),
             changed,
         });
-        let operations: Box<dyn ServiceOperations> = Box::new(Arc::clone(&owner));
+        let retained_owner = Arc::clone(&owner);
         let completion = async move {
             let service = loop {
                 changes.borrow_and_update();
@@ -860,10 +1009,22 @@ impl ManagedRunningService {
         Self {
             peer,
             cancellation,
-            operations,
+            owner: retained_owner,
             completion,
             _receipt: retained_receipt,
         }
+    }
+
+    /// A request keeps the original typed service alive through every upstream
+    /// continuation, cancellation and request-scoped input path.
+    pub(crate) fn lease(
+        &self,
+    ) -> Result<Arc<ServiceOperationLease<S>>, rmcp::service::ServiceError> {
+        self.owner.acquire().map(Arc::new)
+    }
+
+    pub(crate) fn owns(&self, lease: &ServiceOperationLease<S>) -> bool {
+        Arc::ptr_eq(&self.owner, &lease.owner)
     }
 
     pub(crate) fn peer(&self) -> &Peer<RoleClient> {
@@ -872,7 +1033,11 @@ impl ManagedRunningService {
 
     /// Request cancellation synchronously; this is not a terminal receipt.
     pub(crate) fn request_close(&self) {
-        self.operations.close_gate();
+        self.owner
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .closing = true;
         let token = self
             .cancellation
             .lock()
@@ -883,18 +1048,12 @@ impl ManagedRunningService {
         }
     }
 
+    #[cfg(test)]
     pub(crate) async fn call_tool(
         &self,
         params: rmcp::model::CallToolRequestParams,
     ) -> Result<rmcp::model::CallToolResult, rmcp::service::ServiceError> {
-        self.operations.call_tool(params).await
-    }
-
-    pub(crate) async fn read_resource(
-        &self,
-        params: rmcp::model::ReadResourceRequestParams,
-    ) -> Result<rmcp::model::ReadResourceResult, rmcp::service::ServiceError> {
-        self.operations.read_resource(params).await
+        self.lease()?.call_tool(params).await
     }
 
     /// Diagnostic compatibility only; retirement must use `wait_until`.
@@ -918,17 +1077,32 @@ impl ManagedRunningService {
         if Instant::now() >= deadline {
             return Err(LogicalCloseError::TimedOut);
         }
+        // A direct observer has the same cancellation semantics as the
+        // registry path. Expired observers above still initiate no work.
+        self.request_close();
         tokio::time::timeout_at(deadline, self.completion.clone())
             .await
             .map_err(|_| LogicalCloseError::TimedOut)?
     }
 }
 
-impl Deref for ManagedRunningService {
+impl<S: Service<RoleClient> + 'static> Deref for ManagedRunningService<S> {
     type Target = Peer<RoleClient>;
 
     fn deref(&self) -> &Self::Target {
         self.peer()
+    }
+}
+
+impl<S: Service<RoleClient> + 'static> RetainedService for ManagedRunningService<S> {
+    fn request_close(&self) {
+        ManagedRunningService::request_close(self);
+    }
+    fn wait_until(
+        &self,
+        deadline: Instant,
+    ) -> BoxFuture<'_, Result<LogicalCloseAck, LogicalCloseError>> {
+        ManagedRunningService::wait_until(self, deadline).boxed()
     }
 }
 

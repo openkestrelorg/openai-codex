@@ -16,6 +16,7 @@ async fn reset_preserves_same_owner_and_observes_a_previously_replaced_owner() {
     let shutdown = CancellationToken::new();
     let (task, handle) = start_remote_control(
         RemoteControlStartConfig {
+            runtime_auth: None,
             remote_control_url: "http://127.0.0.1:1".into(),
             installation_id: "reset-test".into(),
             policy: RemoteControlPolicy::Allowed,
@@ -88,6 +89,7 @@ async fn reset_timeout_retains_previously_retired_work_for_retry() {
     let shutdown = CancellationToken::new();
     let (task, handle) = start_remote_control(
         RemoteControlStartConfig {
+            runtime_auth: None,
             remote_control_url: "http://127.0.0.1:1".into(),
             installation_id: "timeout-test".into(),
             policy: RemoteControlPolicy::Allowed,

@@ -1,19 +1,25 @@
-//! Plugin catalog listing interface and the MCP context used to request snapshots.
+//! Plugin catalog listing interface and source inputs used to request snapshots.
 
 use crate::ExecutorPluginProviderError;
 use crate::PluginCatalog;
+use codex_exec_server::ExecutorCapabilityDiscoveryV2Snapshot;
 use codex_mcp::McpResourceClient;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use thiserror::Error;
 
-/// Turn identifiers and MCP client used to request one catalog snapshot.
+/// Identifiers, MCP client, and executor inventories used to request one catalog snapshot.
 #[derive(Clone, Debug)]
-pub struct PluginListQuery {
+pub struct PluginListQuery<'a> {
+    /// Borrowed invocation authority; providers must pass it to authority-aware MCP calls.
+    /// Never retain this authority in catalog snapshots or idle clients.
+    pub mcp_access: codex_mcp::McpAttemptAccess<'a>,
     pub thread_id: String,
     pub turn_id: String,
     pub mcp_resources: Option<Arc<McpResourceClient>>,
+    /// Already-acquired V2 inventories; empty for cloud listing.
+    pub snapshots: Vec<ExecutorCapabilityDiscoveryV2Snapshot>,
 }
 
 /// Failure to list plugin metadata.
@@ -35,8 +41,9 @@ pub type PluginProviderFuture<'a, T> =
 /// Cloud providers implement `list`; executor listing is not yet supported.
 /// Package access uses [`crate::ExecutorPluginProvider::resolve_bound`] directly.
 pub trait PluginProvider: Send + Sync {
-    /// Returns a complete snapshot; on error, callers retain the previous snapshot.
-    fn list(&self, _query: PluginListQuery) -> PluginProviderFuture<'_, PluginCatalog> {
+    /// Returns a snapshot; on error, callers retain the previous snapshot.
+    /// Providers set `is_partial` when listing omits entries; warnings are diagnostic only.
+    fn list<'a>(&'a self, _query: PluginListQuery<'a>) -> PluginProviderFuture<'a, PluginCatalog> {
         Box::pin(async { Ok(PluginCatalog::default()) })
     }
 }

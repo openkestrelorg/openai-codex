@@ -11,12 +11,15 @@ use rmcp::transport::streamable_http_client::StreamableHttpError;
 use tokio::time;
 use tracing::warn;
 
+use crate::elicitation_client_service::ElicitationClientService;
 use crate::http_client_adapter::StreamableHttpClientAdapterError;
 use crate::oauth::OAuthRuntime;
 
 use super::InitializeContext;
-use super::PendingConnection;
+use super::PendingTransport;
+use super::RegisteredTransport;
 use super::RmcpClient;
+use super::create_registered_transport;
 
 const JSON_RPC_INTERNAL_ERROR_CODE: i64 = -32603;
 pub(super) const STREAMABLE_HTTP_RETRY_DELAYS_MS: [u64; 2] = [250, 1_000];
@@ -24,11 +27,19 @@ pub(super) const STREAMABLE_HTTP_RETRY_DELAYS_MS: [u64; 2] = [250, 1_000];
 impl RmcpClient {
     pub(super) async fn connect_pending_transport_with_initialize_retries(
         &self,
-        initial_transport: PendingConnection,
+        initial_transport: RegisteredTransport,
         initialize_context: &InitializeContext,
-    ) -> Result<(Arc<ManagedRunningService>, Option<OAuthRuntime>)> {
+    ) -> Result<(
+        Arc<ManagedRunningService<ElicitationClientService>>,
+        Option<OAuthRuntime>,
+    )> {
         let timeout = initialize_context.timeout;
-        let should_retry = initial_transport.retryable;
+        let should_retry = match &initial_transport.transport {
+            PendingTransport::InProcess { .. } | PendingTransport::Stdio { .. } => false,
+            PendingTransport::StreamableHttp { .. }
+            | PendingTransport::StreamableHttpWithOAuth { .. }
+            | PendingTransport::StreamableHttpWithAccessTokenOnly { .. } => true,
+        };
         let mut retry_deadline = timeout.map(|duration| Instant::now() + duration);
         let mut pending_transport = Some(initial_transport);
 
@@ -46,16 +57,16 @@ impl RmcpClient {
                     match remaining {
                         Some(remaining) => time::timeout(
                             remaining,
-                            Self::create_registered_transport(
-                                &self.transport_recipe,
+                            create_registered_transport(
+                                self.transport_recipe.clone(),
                                 &self.retirement,
                             ),
                         )
                         .await
                         .map_err(|_| initialize_timeout_error(timeout, remaining))??,
                         None => {
-                            Self::create_registered_transport(
-                                &self.transport_recipe,
+                            create_registered_transport(
+                                self.transport_recipe.clone(),
                                 &self.retirement,
                             )
                             .await?
@@ -63,7 +74,9 @@ impl RmcpClient {
                     }
                 }
             };
-            if let Some(oauth_runtime) = &transport.oauth {
+            if let PendingTransport::StreamableHttpWithOAuth { oauth_runtime, .. } =
+                &transport.transport
+            {
                 // OAuth refresh has its own lock and provider request bounds. Exclude it from the
                 // MCP handshake budget, and finish persistence before attempting initialize.
                 let refresh_started_at = Instant::now();
@@ -151,6 +164,9 @@ impl RmcpClient {
         error: &StreamableHttpError<StreamableHttpClientAdapterError>,
     ) -> bool {
         match error {
+            StreamableHttpError::Client(StreamableHttpClientAdapterError::Auth(
+                codex_api::AuthError::Transient(_),
+            )) => true,
             StreamableHttpError::Client(StreamableHttpClientAdapterError::HttpRequest(
                 ExecServerError::HttpRequest(_),
             )) => true,
@@ -171,6 +187,9 @@ impl RmcpClient {
             | StreamableHttpError::UnexpectedContentType(_)
             | StreamableHttpError::ServerDoesNotSupportSse
             | StreamableHttpError::Deserialize(_)
+            | StreamableHttpError::Client(StreamableHttpClientAdapterError::Auth(
+                codex_api::AuthError::Build(_),
+            ))
             | StreamableHttpError::Client(StreamableHttpClientAdapterError::SessionExpired404)
             | StreamableHttpError::Client(StreamableHttpClientAdapterError::Header(_)) => false,
             _ => false,

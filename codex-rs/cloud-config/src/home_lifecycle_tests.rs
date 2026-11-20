@@ -85,7 +85,7 @@ async fn reset_waits_for_an_admitted_publication_even_after_its_caller_drops() {
 }
 
 #[tokio::test]
-async fn global_replacement_cancellation_is_clean_but_panic_fails_retirement() {
+async fn lifetime_cancellation_is_clean_but_panic_fails_retirement() {
     let lifecycle = HomeLifecycle::default();
     let refresher = tokio::spawn(std::future::pending::<()>());
     let abort = refresher.abort_handle();
@@ -94,12 +94,12 @@ async fn global_replacement_cancellation_is_clean_but_panic_fails_retirement() {
         .lock()
         .expect("owners")
         .tasks
-        .push(refresher);
+        .push(CloudRefreshTask::new(refresher));
     abort.abort();
     lifecycle
         .retire_owners()
         .await
-        .expect("replacement cancellation is clean");
+        .expect("lifetime cancellation is clean");
 
     let panicked = tokio::spawn(async { panic!("fixture owner panic") });
     while !panicked.is_finished() {
@@ -110,7 +110,7 @@ async fn global_replacement_cancellation_is_clean_but_panic_fails_retirement() {
         .lock()
         .expect("owners")
         .tasks
-        .push(panicked);
+        .push(CloudRefreshTask::new(panicked));
     assert!(lifecycle.retire_owners().await.is_err());
     assert!(lifecycle.owners.lock().expect("owners").retiring);
     lifecycle
@@ -130,4 +130,91 @@ fn uncreated_home_aliases_share_the_same_custody() {
     let first = home_lifecycle(&real.join("new-home")).expect("first");
     let second = home_lifecycle(&alias.join("new-home")).expect("second");
     assert!(Arc::ptr_eq(&first, &second));
+}
+
+#[tokio::test]
+async fn exhausted_generation_still_cancels_getters_and_joins_originals() {
+    let lifecycle = Arc::new(HomeLifecycle::default());
+    lifecycle.generation.store(u64::MAX, Ordering::Release);
+    let original = CloudRefreshTask::new(tokio::spawn(std::future::pending()));
+    lifecycle
+        .owners
+        .lock()
+        .unwrap()
+        .tasks
+        .push(original.clone());
+    let (entered, started) = tokio::sync::oneshot::channel();
+    let (release, held) = tokio::sync::oneshot::channel::<()>();
+    let owner = Arc::clone(&lifecycle);
+    let getter = tokio::spawn(async move {
+        owner
+            .load(u64::MAX, async {
+                entered.send(()).unwrap();
+                let _ = held.await;
+                Ok(None)
+            })
+            .await
+    });
+    started.await.unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), lifecycle.retire_owners())
+            .await
+            .unwrap()
+            .is_err()
+    );
+    assert!(original.await.unwrap_err().is_cancelled());
+    assert!(getter.await.unwrap().is_err());
+    assert!(release.send(()).is_err());
+    let owners = lifecycle.owners.lock().unwrap();
+    assert!(owners.retiring && owners.tasks.is_empty());
+    assert_eq!(owners.active_getters, 0);
+    assert_eq!(lifecycle.generation.load(Ordering::Acquire), u64::MAX);
+}
+
+#[tokio::test]
+async fn panic_payload_drops_outside_census_and_is_not_retained_by_unused_observer() {
+    struct Probe {
+        home: std::sync::Weak<HomeLifecycle>,
+        observed: Arc<std::sync::atomic::AtomicBool>,
+        _marker: Arc<()>,
+    }
+    impl Drop for Probe {
+        fn drop(&mut self) {
+            let home = self.home.upgrade().unwrap();
+            self.observed
+                .store(home.owners.try_lock().is_ok(), Ordering::SeqCst);
+        }
+    }
+    let lifecycle = Arc::new(HomeLifecycle::default());
+    let observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let marker = Arc::new(());
+    let weak = Arc::downgrade(&marker);
+    let probe = Probe {
+        home: Arc::downgrade(&lifecycle),
+        observed: Arc::clone(&observed),
+        _marker: marker,
+    };
+    let original = CloudRefreshTask::new(tokio::spawn(async move {
+        std::panic::panic_any(probe);
+    }));
+    let unused = original.clone();
+    lifecycle
+        .owners
+        .lock()
+        .unwrap()
+        .tasks
+        .push(original.clone());
+    assert_eq!(
+        original.await,
+        Err(crate::refresh_task::CloudRefreshJoinError::Panicked)
+    );
+    assert!(weak.upgrade().is_some());
+    lifecycle.reap_finished().unwrap();
+    assert!(observed.load(Ordering::SeqCst));
+    assert!(weak.upgrade().is_none());
+    assert_eq!(
+        unused.await,
+        Err(crate::refresh_task::CloudRefreshJoinError::Panicked)
+    );
+    assert!(lifecycle.owners.lock().unwrap().failed_owner);
 }

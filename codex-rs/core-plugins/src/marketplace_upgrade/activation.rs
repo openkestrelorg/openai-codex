@@ -1,10 +1,10 @@
 use super::ConfiguredGitMarketplace;
+use super::git::CloneReference;
 use codex_config::types::MarketplaceSourceType;
 use serde::Deserialize;
 use serde::Serialize;
 use std::path::Path;
 use std::path::PathBuf;
-use tempfile::TempDir;
 use tracing::warn;
 
 const MARKETPLACE_INSTALL_METADATA_FILE: &str = ".codex-marketplace-install.json";
@@ -73,6 +73,43 @@ pub(super) fn installed_marketplace_metadata_matches(
     snapshot.metadata.as_ref() == Some(&installed_marketplace_metadata(marketplace, revision))
 }
 
+impl InstalledMarketplaceSnapshot {
+    /// Selects a self-contained Git object store and the commit Codex installed from this source.
+    pub(super) fn git_reference(
+        &self,
+        root: &Path,
+        marketplace: &ConfiguredGitMarketplace,
+        resolved_source: &str,
+    ) -> Option<CloneReference<'_>> {
+        let metadata = self.metadata.as_ref()?;
+        // A plain local clone already hard-links objects from the source.
+        if metadata.source_type != MarketplaceSourceType::Git
+            || metadata.source != marketplace.source
+            || metadata.sparse_paths != marketplace.sparse_paths
+            || Path::new(resolved_source).is_dir()
+        {
+            return None;
+        }
+        let revision = metadata.revision.as_str();
+        if !matches!(revision.len(), 40 | 64)
+            || !revision.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return None;
+        }
+
+        let git_dir = root.join(".git");
+        let objects = git_dir.join("objects");
+        let standalone = [root, &git_dir, &objects].into_iter().all(|dir| {
+            dir.symlink_metadata()
+                .is_ok_and(|metadata| metadata.is_dir())
+        }) && !objects.join("info/alternates").exists();
+        standalone.then_some(CloneReference {
+            git_dir,
+            installed_revision: revision,
+        })
+    }
+}
+
 pub(super) fn write_installed_marketplace_metadata(
     root: &Path,
     marketplace: &ConfiguredGitMarketplace,
@@ -87,11 +124,11 @@ pub(super) fn write_installed_marketplace_metadata(
 
 pub(super) fn activate_marketplace_root(
     destination: &Path,
-    staged_dir: TempDir,
+    staged_root: &Path,
     previous_snapshot: &InstalledMarketplaceSnapshot,
     after_activate: impl FnOnce() -> Result<(), String>,
 ) -> Result<(), String> {
-    let staged_root = staged_dir.path();
+    crate::retirement::ensure_worker_running("marketplace activation")?;
     let Some(parent) = destination.parent() else {
         return Err(format!(
             "failed to determine marketplace install parent for {}",
@@ -221,4 +258,36 @@ fn installed_marketplace_metadata(
 
 fn installed_marketplace_metadata_path(root: &Path) -> PathBuf {
     root.join(MARKETPLACE_INSTALL_METADATA_FILE)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn expired_activation_never_moves_original_or_staging() {
+        let home = tempfile::tempdir().unwrap();
+        let destination = home.path().join("installed");
+        let staging = home.path().join("staged");
+        std::fs::create_dir_all(&destination).unwrap();
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(destination.join("data"), "original").unwrap();
+        std::fs::write(staging.join("data"), "replacement").unwrap();
+        let snapshot = read_installed_marketplace_snapshot(&destination, "debug");
+        let registry = crate::PluginTaskRegistry::default();
+        registry.shutdown_until(tokio::time::Instant::now()).await;
+        let _scope = crate::retirement::WorkerStopScope::enter(registry.worker_stop());
+        let called = std::sync::atomic::AtomicBool::new(false);
+        let error = activate_marketplace_root(&destination, &staging, &snapshot, || {
+            called.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(error.contains("shutdown deadline"));
+        assert!(!called.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(
+            std::fs::read(destination.join("data")).unwrap(),
+            b"original"
+        );
+        assert_eq!(std::fs::read(staging.join("data")).unwrap(), b"replacement");
+    }
 }

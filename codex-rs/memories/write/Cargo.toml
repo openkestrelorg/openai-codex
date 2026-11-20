@@ -18,6 +18,7 @@ chrono = { workspace = true }
 codex-backend-client = { workspace = true }
 codex-core = { workspace = true }
 codex-config = { workspace = true }
+codex-extension-api = { workspace = true }
 codex-features = { workspace = true }
 codex-git-utils = { workspace = true }
 codex-login = { workspace = true }
@@ -40,6 +41,8 @@ tracing = { workspace = true, features = ["log"] }
 uuid = { workspace = true, features = ["v4", "v5"] }
 
 [dev-dependencies]
+base64 = { workspace = true }
+codex-runtime-agent-instance = { workspace = true }
 codex-model-provider-info = { workspace = true }
 codex-models-manager = { workspace = true }
 core_test_support = { workspace = true }

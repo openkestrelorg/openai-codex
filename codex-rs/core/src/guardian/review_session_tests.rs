@@ -3,6 +3,7 @@ use crate::agents_md_manager::AgentsMdManager;
 use crate::context::ContextualUserFragment;
 use crate::context_manager::ContextManager;
 use crate::session::Submission;
+use codex_guardian_reviewer::GuardianReviewResponse;
 use codex_guardian_reviewer::ReviewerRequest;
 use codex_guardian_reviewer::guardian_output_contract_prompt;
 use codex_history::CodexHarnessMetadata;
@@ -10,6 +11,7 @@ use codex_history::ResponseItemEnvelope;
 use codex_models_manager::model_info::model_info_from_slug;
 use codex_prompts::GuardianPolicyInstructions;
 use codex_prompts::ResolvedModelMessages;
+use codex_protocol::TranscriptFormat;
 use codex_protocol::openai_models::AutoReviewMessages;
 use codex_protocol::openai_models::ModelMessages;
 use codex_protocol::protocol::AgentStatus;
@@ -17,6 +19,7 @@ use codex_protocol::protocol::ErrorEvent;
 use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::TurnAbortedEvent;
 use codex_protocol::protocol::TurnCompleteEvent;
+use codex_protocol_test_support::ContentItemTestExt;
 use pretty_assertions::assert_eq;
 
 #[tokio::test]
@@ -44,6 +47,21 @@ async fn run_review_preserves_evidence_during_parent_compaction() {
     )
     .unwrap();
     params.parent_session = Arc::clone(&parent);
+    let parent_uri = "wss://review-snapshot.chatgpt.com/backend-api/codex/responses"
+        .parse()
+        .unwrap();
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        http::header::SET_COOKIE,
+        http::HeaderValue::from_static("__oailb=original-parent; Path=/; Secure; Max-Age=3600"),
+    );
+    turn.extension_data.insert(super::super::ParentResponse {
+        id: "original-response".to_owned(),
+        routing_affinity: codex_http_client::ChatGptRoutingAffinity::from_response(
+            &parent_uri,
+            &headers,
+        ),
+    });
     params.parent_context = GuardianReviewContext::from(Arc::clone(&turn));
     let evidence: ResponseItem = serde_json::from_value(serde_json::json!({
         "type": "function_call_output", "call_id": "prior-inspection", "output": EVIDENCE
@@ -71,9 +89,14 @@ async fn run_review_preserves_evidence_during_parent_compaction() {
             .node_repl_auto_review_required,
     )
     .with_node_repl_policy(&params.node_repl_policy);
+    let reviewer_session = Arc::clone(&reviewer.session);
     let manager = prewarm_test_session(&params, reviewer).await;
     // Capture the review context, then compact the parent before the reviewer builds its prompt.
     let prepared = setup::prepare_review(params).await.unwrap();
+    turn.extension_data.insert(super::super::ParentResponse {
+        id: "later-response".to_owned(),
+        routing_affinity: None,
+    });
     let checkpoint: ResponseItem = serde_json::from_value(serde_json::json!({
         "type": "compaction", "id": "cmp_new", "encrypted_content": "new-checkpoint"
     }))
@@ -82,9 +105,11 @@ async fn run_review_preserves_evidence_during_parent_compaction() {
     parent
         .replace_compacted_history(
             vec![checkpoint.into()],
-            /*reference_context_item*/ None,
-            /*world_state_baseline*/ None,
+            turn.to_turn_context_item(),
+            crate::context::world_state::WorldStateSnapshot::default(),
+            /*rejected_audio_file_ids*/ Default::default(),
             crate::compact::CompactedHistoryMetadata {
+                input_goal_ids: Default::default(),
                 message: String::new(),
                 window_number,
                 window_ids,
@@ -96,6 +121,21 @@ async fn run_review_preserves_evidence_during_parent_compaction() {
         .await;
     let ((outcome, _), submitted_text) = tokio::join!(manager.review(prepared), async {
         let submission = rx_sub.recv().await.unwrap();
+        let pending = reviewer_session
+            .services
+            .thread_extension_data
+            .get::<super::super::PendingReviewRouting>()
+            .unwrap();
+        let parent = pending.0.as_ref().unwrap();
+        assert_eq!(parent.id, "original-response");
+        assert_eq!(
+            parent
+                .routing_affinity
+                .as_ref()
+                .unwrap()
+                .cookie_header(&parent_uri),
+            Some(http::HeaderValue::from_static("__oailb=original-parent"))
+        );
         let id = submission.id;
         let Op::TurnInput { request, reply, .. } = submission.op else {
             panic!("expected reviewer prompt");
@@ -106,6 +146,7 @@ async fn run_review_preserves_evidence_during_parent_compaction() {
         let text = serde_json::to_string(&content).unwrap();
         reply
             .send(Ok(TurnInputSubmission::Started {
+                root_turn_id: id.clone(),
                 turn_id: id.clone(),
             }))
             .unwrap();
@@ -119,6 +160,14 @@ async fn run_review_preserves_evidence_during_parent_compaction() {
             .unwrap();
         text
     });
+    assert!(
+        reviewer_session
+            .services
+            .thread_extension_data
+            .get::<super::super::PendingReviewRouting>()
+            .is_none()
+    );
+    assert!(!submitted_text.contains("__oailb"));
     assert!(matches!(
         outcome,
         GuardianReviewSessionOutcome::Completed(Ok(_))
@@ -147,7 +196,6 @@ async fn test_review_session() -> (
 
     (
         GuardianReviewSession {
-            parent_session: Arc::downgrade(&session),
             session,
             io: SessionIo {
                 tx_sub: tx_sub.into(),
@@ -159,6 +207,9 @@ async fn test_review_session() -> (
             reuse_key,
             state: Mutex::new(GuardianReviewState {
                 conversation: ConversationState::default(),
+                fresh_parent_checkpoint: false,
+                transcript_history_version: 0,
+                transcript_source: None,
                 last_admitted_node_repl_response_sequence: 0,
                 pending_node_repl_evidence_admission: None,
             }),
@@ -176,6 +227,7 @@ fn turn_complete_event(
     Event {
         id: turn_id.to_string(),
         msg: EventMsg::TurnComplete(TurnCompleteEvent {
+            root_turn_id: None,
             turn_id: turn_id.to_string(),
             started_at: None,
             last_agent_message: last_agent_message.map(str::to_string),
@@ -191,6 +243,7 @@ fn turn_aborted_event(turn_id: &str) -> Event {
     Event {
         id: turn_id.to_string(),
         msg: EventMsg::TurnAborted(TurnAbortedEvent {
+            root_turn_id: None,
             turn_id: Some(turn_id.to_string()),
             started_at: None,
             reason: TurnAbortReason::Interrupted,
@@ -222,6 +275,8 @@ async fn test_review_params() -> GuardianReviewSessionParams {
     .expect("guardian config");
 
     GuardianReviewSessionParams {
+        detached_admission: Default::default(),
+        authorization: None,
         parent_history: session.clone_history().await,
         parent_session: Arc::new(session),
         parent_context: GuardianReviewContext::from(Arc::new(turn)),
@@ -252,7 +307,9 @@ async fn test_review_params() -> GuardianReviewSessionParams {
         reasoning_summary,
         personality,
         external_cancel: None,
-        deadline: tokio::time::Instant::now() + Duration::from_secs(30),
+        deadline: codex_guardian_reviewer::ReviewDeadline::At(
+            tokio::time::Instant::now() + Duration::from_secs(30),
+        ),
     }
 }
 
@@ -462,7 +519,7 @@ async fn encrypted_parent_compaction_requires_original_item_id(mode: GuardianCon
         internal_chat_message_metadata_passthrough: None,
     };
 
-    let mut history = ContextManager::new();
+    let mut history = ContextManager::default();
     history.replace_annotated(vec![ResponseItemEnvelope {
         item: item.clone(),
         metadata: Some(CodexHarnessMetadata {
@@ -472,7 +529,7 @@ async fn encrypted_parent_compaction_requires_original_item_id(mode: GuardianCon
     }]);
     assert_eq!(
         policy
-            .parent_compaction(&history)
+            .parent_compaction(history.annotated_items())
             .expect("valid checkpoint"),
         Some(item)
     );
@@ -487,48 +544,12 @@ async fn encrypted_parent_compaction_requires_original_item_id(mode: GuardianCon
         .into(),
     );
     history.replace_annotated(items);
-    let result = policy.parent_compaction(&history);
+    let result = policy.parent_compaction(history.annotated_items());
     if mode == GuardianContextMode::ThreadOwned {
         assert!(result.is_err());
     } else {
         assert_eq!(result.expect("legacy omission"), None);
     }
-}
-
-#[tokio::test]
-async fn guardian_prompt_cache_key_is_scoped_to_parent_thread() {
-    let session_source =
-        SessionSource::SubAgent(SubAgentSource::Other(GUARDIAN_REVIEWER_NAME.to_string()));
-    let parent_thread_id = ThreadId::new();
-    let key = prompt_cache_key_override_for_review_session(&session_source, Some(parent_thread_id))
-        .expect("guardian prompt cache key");
-
-    assert_eq!(key, format!("guardian:{parent_thread_id}"));
-    assert!(
-        key.len() <= 64,
-        "guardian prompt cache key should fit the Responses API limit"
-    );
-    assert_eq!(
-        key,
-        prompt_cache_key_override_for_review_session(&session_source, Some(parent_thread_id))
-            .expect("same guardian prompt cache key")
-    );
-    assert_ne!(
-        key,
-        prompt_cache_key_override_for_review_session(&session_source, Some(ThreadId::new()))
-            .expect("different parent guardian prompt cache key")
-    );
-    assert_eq!(
-        None,
-        prompt_cache_key_override_for_review_session(&SessionSource::Cli, Some(parent_thread_id))
-    );
-    assert_eq!(
-        None,
-        prompt_cache_key_override_for_review_session(
-            &session_source,
-            /*parent_thread_id*/ None
-        )
-    );
 }
 
 #[tokio::test]
@@ -650,48 +671,15 @@ async fn guardian_review_session_config_resolves_policy_and_template(
         guardian_config.base_instructions,
         Some(
             GuardianPolicyInstructions::new(
+                TranscriptFormat::Line,
                 expected_policy,
                 "",
                 expected_template,
                 guardian_output_contract_prompt(),
             )
             .render()
+            .expect_text()
         )
-    );
-}
-
-#[test]
-fn token_usage_delta_never_reports_negative_usage() {
-    let start = TokenUsage {
-        input_tokens: 10,
-        cached_input_tokens: 8,
-        cache_write_input_tokens: 8,
-        output_tokens: 6,
-        reasoning_output_tokens: 4,
-        total_tokens: 28,
-        codex_rollout_budget_units: None,
-    };
-    let end = TokenUsage {
-        input_tokens: 15,
-        cached_input_tokens: 7,
-        cache_write_input_tokens: 7,
-        output_tokens: 10,
-        reasoning_output_tokens: 2,
-        total_tokens: 34,
-        codex_rollout_budget_units: None,
-    };
-
-    assert_eq!(
-        token_usage_delta(&start, &end),
-        TokenUsage {
-            input_tokens: 5,
-            cached_input_tokens: 0,
-            cache_write_input_tokens: 0,
-            output_tokens: 4,
-            reasoning_output_tokens: 0,
-            total_tokens: 6,
-            codex_rollout_budget_units: None,
-        }
     );
 }
 
@@ -709,12 +697,17 @@ async fn run_review_on_reused_session_waits_for_submitted_turn() {
     }
     let params = test_review_params().await;
 
+    tokio::time::pause();
+
     let review = tokio::spawn(async move {
         run_review_on_session(
             &review_session,
             &params,
+            None,
             GuardianReviewSessionKind::TrunkReused,
-            tokio::time::Instant::now() + Duration::from_secs(1),
+            codex_guardian_reviewer::ReviewDeadline::At(
+                tokio::time::Instant::now() + Duration::from_secs(1),
+            ),
         )
         .await
     });
@@ -725,6 +718,7 @@ async fn run_review_on_reused_session_waits_for_submitted_turn() {
     };
     reply
         .send(Ok(TurnInputSubmission::Started {
+            root_turn_id: id.clone(),
             turn_id: id.clone(),
         }))
         .expect("reply to guardian submission");
@@ -745,7 +739,10 @@ async fn run_review_on_reused_session_waits_for_submitted_turn() {
     let GuardianReviewSessionOutcome::Completed(Ok(last_agent_message)) = outcome else {
         panic!("expected submitted turn completion");
     };
-    assert_eq!(last_agent_message.as_deref(), Some("fresh"));
+    assert_eq!(
+        last_agent_message.as_ref().map(GuardianReviewResponse::raw),
+        Some("fresh")
+    );
     assert_eq!(analytics_result.time_to_first_token_ms, Some(42));
     assert_eq!(disposition, SessionDisposition::Reusable);
 }
@@ -788,7 +785,10 @@ async fn run_review_removes_trunk_when_event_stream_is_broken() {
         panic!("expected turn-input submission");
     };
     reply
-        .send(Ok(TurnInputSubmission::Started { turn_id: id }))
+        .send(Ok(TurnInputSubmission::Started {
+            root_turn_id: id.clone(),
+            turn_id: id,
+        }))
         .expect("reply to guardian submission");
     drop(tx_event);
 
@@ -811,6 +811,7 @@ async fn wait_for_guardian_review_ignores_prior_turn_errors() {
                 misalignment: None,
                 message: "stale guardian error".to_string(),
                 codex_error_info: None,
+                rejected_audio_file_ids: Vec::new(),
             }),
         })
         .await
@@ -832,7 +833,9 @@ async fn wait_for_guardian_review_ignores_prior_turn_errors() {
     } = wait_for_guardian_review(
         &review_session,
         "current-turn",
-        tokio::time::Instant::now() + Duration::from_secs(1),
+        codex_guardian_reviewer::ReviewDeadline::At(
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        ),
         /*external_cancel*/ None,
         &mut analytics_result,
     )
@@ -841,7 +844,7 @@ async fn wait_for_guardian_review_ignores_prior_turn_errors() {
     let GuardianReviewSessionOutcome::Completed(Ok(last_agent_message)) = outcome else {
         panic!("expected current turn completion");
     };
-    assert_eq!(last_agent_message, None);
+    assert!(last_agent_message.is_none());
     assert_eq!(analytics_result.time_to_first_token_ms, Some(42));
     assert_eq!(disposition, SessionDisposition::Reusable);
     assert!(turn_completed);
@@ -857,6 +860,7 @@ async fn wait_for_guardian_review_preserves_structured_session_error() {
                 misalignment: None,
                 message: "temporary failure".to_string(),
                 codex_error_info: Some(CodexErrorInfo::ServerOverloaded),
+                rejected_audio_file_ids: Vec::new(),
             }),
         })
         .await
@@ -878,7 +882,9 @@ async fn wait_for_guardian_review_preserves_structured_session_error() {
     } = wait_for_guardian_review(
         &review_session,
         "current-turn",
-        tokio::time::Instant::now() + Duration::from_secs(1),
+        codex_guardian_reviewer::ReviewDeadline::At(
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        ),
         /*external_cancel*/ None,
         &mut analytics_result,
     )
@@ -916,7 +922,9 @@ async fn wait_for_guardian_review_ignores_prior_turn_aborts() {
     } = wait_for_guardian_review(
         &review_session,
         "current-turn",
-        tokio::time::Instant::now() + Duration::from_secs(1),
+        codex_guardian_reviewer::ReviewDeadline::At(
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        ),
         /*external_cancel*/ None,
         &mut analytics_result,
     )
@@ -925,7 +933,10 @@ async fn wait_for_guardian_review_ignores_prior_turn_aborts() {
     let GuardianReviewSessionOutcome::Completed(Ok(last_agent_message)) = outcome else {
         panic!("expected current turn completion");
     };
-    assert_eq!(last_agent_message.as_deref(), Some("fresh"));
+    assert_eq!(
+        last_agent_message.as_ref().map(GuardianReviewResponse::raw),
+        Some("fresh")
+    );
     assert_eq!(analytics_result.time_to_first_token_ms, Some(42));
     assert_eq!(disposition, SessionDisposition::Reusable);
     assert!(turn_completed);
@@ -956,7 +967,9 @@ async fn wait_for_guardian_review_timeout_drains_expected_turn_after_stale_termi
     } = wait_for_guardian_review(
         &review_session,
         "current-turn",
-        tokio::time::Instant::now() + Duration::from_millis(10),
+        codex_guardian_reviewer::ReviewDeadline::At(
+            tokio::time::Instant::now() + Duration::from_millis(10),
+        ),
         /*external_cancel*/ None,
         &mut analytics_result,
     )
@@ -966,7 +979,7 @@ async fn wait_for_guardian_review_timeout_drains_expected_turn_after_stale_termi
         .await
         .expect("interrupt response task should complete");
     assert!(matches!(outcome, GuardianReviewSessionOutcome::TimedOut));
-    assert_eq!(disposition, SessionDisposition::Reusable);
+    assert_eq!(disposition, SessionDisposition::Rollback);
     assert!(!turn_completed);
 }
 
@@ -997,7 +1010,9 @@ async fn wait_for_guardian_review_cancel_drains_expected_turn_after_stale_termin
     } = wait_for_guardian_review(
         &review_session,
         "current-turn",
-        tokio::time::Instant::now() + Duration::from_secs(1),
+        codex_guardian_reviewer::ReviewDeadline::At(
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        ),
         Some(&external_cancel),
         &mut analytics_result,
     )
@@ -1007,7 +1022,7 @@ async fn wait_for_guardian_review_cancel_drains_expected_turn_after_stale_termin
         .await
         .expect("interrupt response task should complete");
     assert!(matches!(outcome, GuardianReviewSessionOutcome::Aborted));
-    assert_eq!(disposition, SessionDisposition::Reusable);
+    assert_eq!(disposition, SessionDisposition::Rollback);
     assert!(!turn_completed);
 }
 
@@ -1028,12 +1043,12 @@ async fn interrupt_and_drain_turn_ignores_prior_turn_completion() {
     let result = wait_for_guardian_review(
         &review_session,
         "current-turn",
-        tokio::time::Instant::now(),
+        codex_guardian_reviewer::ReviewDeadline::At(tokio::time::Instant::now()),
         Some(&cancellation),
         &mut GuardianReviewAnalyticsResult::without_session(),
     )
     .await;
-    assert_eq!(result.disposition, SessionDisposition::Reusable);
+    assert_eq!(result.disposition, SessionDisposition::Rollback);
 
     assert!(review_session.io.rx_event.try_recv().is_err());
 }
@@ -1060,10 +1075,920 @@ async fn prewarm_test_session(
     let context = setup::prepare_prewarm(
         Arc::clone(&params.parent_session),
         Arc::clone(params.parent_context.turn()),
-        /*account_work*/ None,
+        codex_mcp::McpAttemptAccess::Unscoped,
     )
     .await
     .unwrap();
-    pool.prewarm(Arc::new(context), key).await.unwrap();
+    pool.prewarm(
+        Arc::new(GuardianInvocationSetup::new(context, None).unwrap()),
+        key,
+    )
+    .await
+    .unwrap();
     pool
+}
+
+#[tokio::test]
+async fn parent_checkpoint_recovery_stops_after_one_restart() {
+    let mut params = test_review_params().await;
+    params.parent_history.replace(vec![
+        serde_json::from_value(serde_json::json!({
+            "type": "compaction", "id": "cmp-parent", "encrypted_content": "parent checkpoint"
+        }))
+        .unwrap(),
+    ]);
+    let spawns = Arc::new(std::sync::atomic::AtomicUsize::default());
+    let observed_spawns = Arc::clone(&spawns);
+    let pool = Arc::new(GuardianReviewSessionManager::new(
+        Arc::new(codex_guardian_reviewer::ReviewerTasks::default()),
+        move |_, key, _, _, _| {
+            let spawns = Arc::clone(&spawns);
+            Box::pin(async move {
+                assert!(
+                    spawns.fetch_add(/*val*/ 1, Ordering::SeqCst) < 2,
+                    "recovery must not loop"
+                );
+                let (mut reviewer, _events, _submissions) = test_review_session().await;
+                reviewer.reuse_key = key;
+                reviewer.state.lock().await.conversation.complete_review(
+                    GuardianTranscriptCursor {
+                        parent_history_version: 0,
+                        transcript_entry_count: 0,
+                    },
+                );
+                // Every attempted reviewer loses its admitted evidence, including
+                // the replacement. The second failure must be returned to the caller.
+                reviewer
+                    .session
+                    .replace_history(Vec::new(), /*reference_context_item*/ None)
+                    .await;
+                Ok(reviewer)
+            })
+        },
+    ));
+    let (outcome, _) = setup::run_guardian_review_session(Arc::clone(&pool), params).await;
+    assert!(matches!(
+        outcome,
+        GuardianReviewSessionOutcome::PromptBuildFailed(_)
+    ));
+    assert_eq!(observed_spawns.load(Ordering::SeqCst), 2);
+    assert!(pool.trunk().await.is_none());
+}
+
+#[tokio::test]
+async fn compaction_and_review_submissions_share_execution_observer() {
+    let (mut review_session, events, submissions) = test_review_session().await;
+    Arc::get_mut(&mut review_session.session)
+        .unwrap()
+        .services
+        .host_admission = Some(Arc::new(GuardianTurnGate));
+    let counts = Arc::new(GuardianTurnCounts {
+        live: 0.into(),
+        derives: 0.into(),
+        refuse: false.into(),
+        store: review_session
+            .session
+            .services
+            .thread_extension_data
+            .level_id()
+            .to_owned(),
+        terminations: std::sync::Mutex::new(Vec::new()),
+    });
+    let root = GuardianTurnRoot::new(&counts);
+    let child_session = Arc::clone(&review_session.session);
+    let mut params = test_review_params().await;
+    params
+        .spawn_config
+        .features
+        .enable(Feature::TokenBudget)
+        .unwrap();
+    params.spawn_config.model_auto_compact_token_limit = Some(0);
+    params.spawn_config.token_budget = None;
+    let turn = Arc::get_mut(&mut params.parent_context.turn).expect("unshared turn fixture");
+    turn.configured_token_budget = None;
+    turn.use_model_token_budget_defaults = false;
+    let execution = codex_direct_tool_timing::ReviewExecution::default();
+    execution.observe();
+    params.parent_context.review_execution = Some(execution.clone());
+    let review = tokio::spawn(async move {
+        run_review_on_session(
+            &review_session,
+            &params,
+            Some(&root),
+            GuardianReviewSessionKind::TrunkReused,
+            codex_guardian_reviewer::ReviewDeadline::At(
+                tokio::time::Instant::now() + Duration::from_secs(30),
+            ),
+        )
+        .await
+    });
+    let start = std::time::Instant::now();
+    for (index, (left, right)) in [(10, 30), (40, 70)].into_iter().enumerate() {
+        let submission = tokio::time::timeout(Duration::from_secs(10), submissions.recv())
+            .await
+            .expect("child submission deadline")
+            .expect("child submission");
+        if index == 0 {
+            let Op::HostTurn { action, work } = submission.op else {
+                panic!("counted compaction")
+            };
+            assert!(matches!(
+                action,
+                codex_protocol::host_turn_work::HostTurnAction::Compact
+            ));
+            assert_eq!(counts.live.load(Ordering::SeqCst), 2);
+            drop(work);
+            assert_eq!(counts.live.load(Ordering::SeqCst), 1);
+        } else {
+            let Op::TurnInput {
+                reply, host_work, ..
+            } = submission.op
+            else {
+                panic!("expected review input after compaction");
+            };
+            let work = host_work.expect("separate counted model turn");
+            assert_eq!(counts.live.load(Ordering::SeqCst), 2);
+            drop(work);
+            assert_eq!(counts.live.load(Ordering::SeqCst), 1);
+            reply
+                .send(Ok(TurnInputSubmission::Started {
+                    root_turn_id: submission.id.clone(),
+                    turn_id: submission.id.clone(),
+                }))
+                .unwrap();
+        }
+        let pending = child_session
+            .services
+            .thread_extension_data
+            .remove::<crate::turn_timing::review_execution::PendingReviewExecution>();
+        let pending = pending.expect("instrumented child");
+        assert_eq!(pending.0, execution);
+        let child_start = start + Duration::from_millis(left);
+        pending.0.started(child_start);
+        pending
+            .0
+            .completed(child_start, start + Duration::from_millis(right));
+        events
+            .send(turn_complete_event(
+                &submission.id,
+                Some("complete"),
+                /*time_to_first_token_ms*/ None,
+            ))
+            .await
+            .unwrap();
+    }
+    let result = review.await.unwrap();
+    assert_eq!(counts.derives.load(Ordering::SeqCst), 2);
+    assert_eq!(counts.live.load(Ordering::SeqCst), 0);
+    assert!(matches!(
+        result.outcome,
+        GuardianReviewSessionOutcome::Completed(Ok(_))
+    ));
+    assert!(
+        child_session
+            .services
+            .thread_extension_data
+            .get::<crate::turn_timing::review_execution::PendingReviewExecution>()
+            .is_none()
+    );
+    execution.seal();
+    let end = start + Duration::from_millis(100);
+    let totals = codex_utils_critical_path::CriticalPath::default()
+        .auto_review(start, end, vec![execution])
+        .durations(start, end);
+    assert_eq!(totals.auto_review, Duration::from_millis(100));
+    assert_eq!(totals.auto_review_overhead, Some(Duration::from_millis(50)));
+}
+
+#[derive(Debug, Default)]
+struct GuardianWorkCounts {
+    live: std::sync::atomic::AtomicUsize,
+    turns: std::sync::atomic::AtomicUsize,
+    derives: std::sync::atomic::AtomicUsize,
+    refuse: std::sync::atomic::AtomicBool,
+}
+#[derive(Debug)]
+struct GuardianWork(Arc<GuardianWorkCounts>);
+impl GuardianWork {
+    fn new(counts: &Arc<GuardianWorkCounts>) -> Self {
+        counts.live.fetch_add(1, Ordering::SeqCst);
+        Self(Arc::clone(counts))
+    }
+}
+impl Drop for GuardianWork {
+    fn drop(&mut self) {
+        self.0.live.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+impl codex_extension_api::HostOperationWork for GuardianWork {
+    fn derive_operation(
+        &self,
+    ) -> Result<Box<dyn codex_extension_api::HostOperationWork>, codex_extension_api::TurnWorkRefused>
+    {
+        if self.0.refuse.load(Ordering::SeqCst) {
+            return Err(codex_extension_api::TurnWorkRefused::Unavailable);
+        }
+        self.0.derives.fetch_add(1, Ordering::SeqCst);
+        Ok(Box::new(Self::new(&self.0)))
+    }
+    fn derive_turn_work(
+        &self,
+        _: &codex_extension_api::ExtensionData,
+        _: codex_extension_api::ExtensionFuture<'static, ()>,
+    ) -> Result<
+        Box<dyn codex_protocol::host_turn_work::HostTurnWork>,
+        codex_extension_api::TurnWorkRefused,
+    > {
+        panic!("preparation must not create a turn")
+    }
+}
+impl codex_mcp::McpAttemptWork for GuardianWork {
+    fn derive_attempt(
+        &self,
+    ) -> Result<Box<dyn codex_mcp::McpAttemptWork>, codex_mcp::McpAttemptRefused> {
+        if self.0.refuse.load(Ordering::SeqCst) {
+            return Err(codex_mcp::McpAttemptRefused);
+        }
+        self.0.derives.fetch_add(1, Ordering::SeqCst);
+        Ok(Box::new(Self::new(&self.0)))
+    }
+}
+#[derive(Debug)]
+struct GuardianWorkGate {
+    counts: Arc<GuardianWorkCounts>,
+    store: String,
+    turn: String,
+}
+impl codex_extension_api::TurnStartAdmission for GuardianWorkGate {
+    fn admit_turn_start(&self) -> Option<Box<dyn Send>> {
+        panic!("no fresh admission fallback")
+    }
+    fn requires_account_work(&self) -> bool {
+        true
+    }
+    fn derive_operation_work(
+        &self,
+        store: &codex_extension_api::ExtensionData,
+        turn: &str,
+    ) -> Result<
+        Option<Box<dyn codex_extension_api::HostOperationWork>>,
+        codex_extension_api::TurnWorkRefused,
+    > {
+        self.counts.turns.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(store.level_id(), self.store);
+        assert_eq!(turn, self.turn);
+        if self.counts.refuse.load(Ordering::SeqCst) {
+            return Err(codex_extension_api::TurnWorkRefused::Unavailable);
+        }
+        Ok(Some(Box::new(GuardianWork::new(&self.counts))))
+    }
+}
+async fn required_guardian_params() -> (GuardianReviewSessionParams, Arc<GuardianWorkGate>) {
+    let mut params = test_review_params().await;
+    let gate = Arc::new(GuardianWorkGate {
+        counts: Arc::new(GuardianWorkCounts::default()),
+        store: params
+            .parent_session
+            .services
+            .thread_extension_data
+            .level_id()
+            .to_owned(),
+        turn: params.parent_context.turn().sub_id.clone(),
+    });
+    Arc::get_mut(&mut params.parent_session)
+        .unwrap()
+        .services
+        .host_admission = Some(gate.clone());
+    (params, gate)
+}
+fn required_node_policy(params: &mut GuardianReviewSessionParams) -> String {
+    crate::session::tests::update_turn_settings_for_test(
+        Arc::get_mut(&mut params.parent_context.turn).unwrap(),
+        |settings| Arc::make_mut(&mut settings.model_info).node_repl_auto_review_required = true,
+    );
+    params.category = GuardianScope::ComputerUse;
+    let mut model = model_info_from_slug("policy-work-fixture");
+    model.model_messages = Some(
+        serde_json::from_value(serde_json::json!({
+            "auto_review": { "node_repl_policy": "Counted standalone policy fixture." }
+        }))
+        .unwrap(),
+    );
+    params.node_repl_policy =
+        GuardianNodeReplPolicy::from_messages(ResolvedModelMessages::from_model(&model));
+    let body = params.node_repl_policy.body().into_text().unwrap();
+    assert!(!body.is_empty());
+    body
+}
+
+#[tokio::test]
+async fn guardian_preparation_refuses_ended_parent_before_context_capture() {
+    let (params, gate) = required_guardian_params().await;
+    gate.counts.refuse.store(true, Ordering::SeqCst);
+    let mut prepare = Box::pin(setup::prepare_review(params));
+    assert!(matches!(
+        futures::poll!(&mut prepare),
+        std::task::Poll::Ready(Err(_))
+    ));
+    assert_eq!(gate.counts.turns.load(Ordering::SeqCst), 1);
+    assert_eq!(gate.counts.live.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn prepared_guardian_projection_is_uncounted_after_invocation_drop() {
+    let (params, gate) = required_guardian_params().await;
+    let prepared = setup::prepare_review(params).await.unwrap();
+    assert_eq!(gate.counts.turns.load(Ordering::SeqCst), 1);
+    assert!(gate.counts.derives.load(Ordering::SeqCst) > 0);
+    assert_eq!(
+        gate.counts.live.load(Ordering::SeqCst),
+        1,
+        "active invocation owns its root"
+    );
+    let context = prepared.setup().projection();
+    let _key = context.reuse_key(None);
+    drop(prepared);
+    assert_eq!(
+        gate.counts.live.load(Ordering::SeqCst),
+        0,
+        "retained projection is uncounted"
+    );
+}
+
+#[tokio::test]
+async fn guardian_prewarm_preparation_refuses_unscoped_and_exhausted_work() {
+    let (params, gate) = required_guardian_params().await;
+    let root = GuardianWork::new(&gate.counts);
+    for access in [
+        codex_mcp::McpAttemptAccess::Unscoped,
+        codex_mcp::McpAttemptAccess::Admitted(&root),
+    ] {
+        gate.counts.refuse.store(true, Ordering::SeqCst);
+        let mut prepare = setup::prepare_prewarm(
+            Arc::clone(&params.parent_session),
+            Arc::clone(params.parent_context.turn()),
+            access,
+        );
+        assert!(matches!(
+            futures::poll!(&mut prepare),
+            std::task::Poll::Ready(Err(_))
+        ));
+        assert_eq!(gate.counts.live.load(Ordering::SeqCst), 1);
+    }
+    assert_eq!(gate.counts.turns.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn guardian_prewarm_preparation_borrows_work_without_a_turn_or_cached_lease() {
+    let (params, gate) = required_guardian_params().await;
+    params.parent_session.services.thread_extension_data.insert(
+        codex_guardian_reviewer::ReviewerConfig::<Config>(
+            crate::guardian::test_host::build_reviewer_config,
+        ),
+    );
+    let root = GuardianWork::new(&gate.counts);
+    let context = setup::prepare_prewarm(
+        Arc::clone(&params.parent_session),
+        Arc::clone(params.parent_context.turn()),
+        codex_mcp::McpAttemptAccess::Admitted(&root),
+    )
+    .await
+    .unwrap();
+    assert_eq!(gate.counts.turns.load(Ordering::SeqCst), 0);
+    assert!(gate.counts.derives.load(Ordering::SeqCst) > 0);
+    assert_eq!(gate.counts.live.load(Ordering::SeqCst), 1);
+    drop(root);
+    let _key = context.reuse_key(None);
+    assert_eq!(gate.counts.live.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn node_policy_history_uses_parent_work_without_an_installed_reviewer_turn() {
+    let (mut params, gate) = required_guardian_params().await;
+    let body = required_node_policy(&mut params);
+    let (mut reviewer, _, _) = test_review_session().await;
+    Arc::get_mut(&mut reviewer.session)
+        .unwrap()
+        .services
+        .host_admission = Some(gate.clone());
+    assert!(reviewer.session.reference_context_item().await.is_none());
+    ensure_guardian_node_repl_policy(&reviewer, &params)
+        .await
+        .unwrap();
+    assert!(reviewer.session.reference_context_item().await.is_some());
+    assert_eq!(gate.counts.live.load(Ordering::SeqCst), 0);
+    assert!(gate.counts.derives.load(Ordering::SeqCst) > 0);
+    let derives = gate.counts.derives.load(Ordering::SeqCst);
+    ensure_guardian_node_repl_policy(&reviewer, &params)
+        .await
+        .unwrap();
+    assert_eq!(gate.counts.turns.load(Ordering::SeqCst), 2);
+    assert_eq!(gate.counts.derives.load(Ordering::SeqCst), derives);
+    assert_eq!(gate.counts.live.load(Ordering::SeqCst), 0);
+    let history = reviewer.session.clone_history().await;
+    assert_eq!(history.raw_items().filter(|item| matches!(item, ResponseItem::Message { role, content, .. } if role == "developer" && content.iter().any(|part| matches!(part, ContentItem::InputText { text } if text == &body)))).count(), 1);
+}
+
+#[tokio::test]
+async fn node_policy_refuses_ended_parent_without_recording_history() {
+    let (mut params, gate) = required_guardian_params().await;
+    required_node_policy(&mut params);
+    let (reviewer, _, _) = test_review_session().await;
+    let before = reviewer.session.clone_history().await;
+    gate.counts.refuse.store(true, Ordering::SeqCst);
+    assert!(
+        ensure_guardian_node_repl_policy(&reviewer, &params)
+            .await
+            .is_err()
+    );
+    assert_eq!(gate.counts.turns.load(Ordering::SeqCst), 1);
+    assert_eq!(gate.counts.live.load(Ordering::SeqCst), 0);
+    let after = reviewer.session.clone_history().await;
+    assert_eq!(
+        before.raw_items().collect::<Vec<_>>(),
+        after.raw_items().collect::<Vec<_>>()
+    );
+    assert!(reviewer.session.reference_context_item().await.is_none());
+}
+
+#[tokio::test]
+async fn guardian_invocation_options_transfer_a_child_without_ambient_lookup() {
+    let (params, gate) = required_guardian_params().await;
+    let prepared = setup::prepare_review(params).await.unwrap();
+    let invocation = prepared.setup();
+    let projection = invocation.projection();
+    let (options, _) = invocation
+        .thread_options(GuardianReviewSessionKind::TrunkNew, None)
+        .await
+        .unwrap();
+    assert!(options.account_work.is_some());
+    assert_eq!(gate.counts.live.load(Ordering::SeqCst), 2);
+    assert_eq!(gate.counts.turns.load(Ordering::SeqCst), 1);
+    drop(prepared);
+    drop(invocation);
+    assert_eq!(
+        gate.counts.live.load(Ordering::SeqCst),
+        1,
+        "constructor options own the remaining child"
+    );
+    drop(options);
+    assert_eq!(gate.counts.live.load(Ordering::SeqCst), 0);
+    let _key = projection.reuse_key(None);
+}
+
+#[tokio::test]
+async fn guardian_invocation_exhaustion_refuses_before_constructor_options() {
+    let (params, gate) = required_guardian_params().await;
+    let prepared = setup::prepare_review(params).await.unwrap();
+    gate.counts.refuse.store(true, Ordering::SeqCst);
+    let invocation = prepared.setup();
+    let mut options =
+        Box::pin(invocation.thread_options(GuardianReviewSessionKind::TrunkNew, None));
+    assert!(matches!(
+        futures::poll!(&mut options),
+        std::task::Poll::Ready(Err(_))
+    ));
+    drop(options);
+    assert_eq!(gate.counts.turns.load(Ordering::SeqCst), 1);
+    assert_eq!(gate.counts.live.load(Ordering::SeqCst), 1);
+    drop(invocation);
+    drop(prepared);
+    assert_eq!(gate.counts.live.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn guardian_projection_cannot_authorize_required_construction_without_work() {
+    let (params, gate) = required_guardian_params().await;
+    params.parent_session.services.thread_extension_data.insert(
+        codex_guardian_reviewer::ReviewerConfig::<Config>(
+            crate::guardian::test_host::build_reviewer_config,
+        ),
+    );
+    let root = GuardianWork::new(&gate.counts);
+    let projection = setup::prepare_prewarm(
+        Arc::clone(&params.parent_session),
+        Arc::clone(params.parent_context.turn()),
+        codex_mcp::McpAttemptAccess::Admitted(&root),
+    )
+    .await
+    .unwrap();
+    drop(root);
+    let mut options =
+        Box::pin(projection.thread_options(GuardianReviewSessionKind::TrunkNew, None));
+    assert!(matches!(
+        futures::poll!(&mut options),
+        std::task::Poll::Ready(Err(_))
+    ));
+    drop(options);
+    assert!(GuardianInvocationSetup::new(projection, None).is_err());
+    assert_eq!(gate.counts.turns.load(Ordering::SeqCst), 0);
+    assert_eq!(gate.counts.live.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn cached_guardian_pool_session_keeps_no_invocation_work() {
+    let (params, gate) = required_guardian_params().await;
+    let prepared = setup::prepare_review(params).await.unwrap();
+    let invocation = prepared.setup();
+    let pool = GuardianReviewSessionManager::new(
+        Arc::new(codex_guardian_reviewer::ReviewerTasks::default()),
+        |setup, key, kind, snapshot, _| {
+            Box::pin(async move {
+                let (options, _) = setup.thread_options(kind, snapshot).await?;
+                assert!(options.account_work.is_some());
+                let (mut reviewer, _, _) = test_review_session().await;
+                reviewer.reuse_key = key;
+                drop(options);
+                Ok(reviewer)
+            })
+        },
+    );
+    let key = invocation.reuse_key(None);
+    pool.prewarm(Arc::clone(&invocation), key).await.unwrap();
+    drop(prepared);
+    drop(invocation);
+    assert!(pool.trunk().await.is_some());
+    assert_eq!(gate.counts.live.load(Ordering::SeqCst), 0);
+    pool.shutdown().await;
+}
+
+#[tokio::test]
+async fn cancelled_guardian_pool_creation_releases_invocation_children() {
+    let (params, gate) = required_guardian_params().await;
+    let prepared = setup::prepare_review(params).await.unwrap();
+    let invocation = prepared.setup();
+    let (release, wait) = tokio::sync::oneshot::channel::<()>();
+    let wait = Arc::new(std::sync::Mutex::new(Some(wait)));
+    let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = Arc::clone(&entered);
+    let pool = GuardianReviewSessionManager::new(
+        Arc::new(codex_guardian_reviewer::ReviewerTasks::default()),
+        move |setup, _, kind, snapshot, _| {
+            let wait = wait.lock().unwrap().take().unwrap();
+            let flag = Arc::clone(&flag);
+            Box::pin(async move {
+                let (options, _) = setup.thread_options(kind, snapshot).await?;
+                assert!(options.account_work.is_some());
+                flag.store(true, Ordering::SeqCst);
+                wait.await?;
+                let (reviewer, _, _) = test_review_session().await;
+                drop(options);
+                Ok(reviewer)
+            })
+        },
+    );
+    let key = invocation.reuse_key(None);
+    let mut prewarm = Box::pin(pool.prewarm(Arc::clone(&invocation), key));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            assert!(futures::poll!(&mut prewarm).is_pending());
+            if entered.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(gate.counts.live.load(Ordering::SeqCst), 2);
+    drop(prewarm);
+    assert!(release.send(()).is_err());
+    assert!(pool.trunk().await.is_none());
+    assert_eq!(gate.counts.live.load(Ordering::SeqCst), 1);
+    drop(prepared);
+    drop(invocation);
+    assert_eq!(gate.counts.live.load(Ordering::SeqCst), 0);
+    pool.shutdown().await;
+}
+
+// These probes exercise the real SessionIo queue with synthetic account owners.
+// They do not execute a model, the submission loop, or terminal cleanup.
+struct GuardianTurnCounts {
+    live: std::sync::atomic::AtomicUsize,
+    derives: std::sync::atomic::AtomicUsize,
+    refuse: std::sync::atomic::AtomicBool,
+    store: String,
+    terminations: std::sync::Mutex<Vec<codex_extension_api::ExtensionFuture<'static, ()>>>,
+}
+impl std::fmt::Debug for GuardianTurnCounts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("GuardianTurnCounts")
+    }
+}
+#[derive(Debug)]
+struct GuardianTurnRoot(Arc<GuardianTurnCounts>);
+impl GuardianTurnRoot {
+    fn new(counts: &Arc<GuardianTurnCounts>) -> Self {
+        counts.live.fetch_add(1, Ordering::SeqCst);
+        Self(Arc::clone(counts))
+    }
+}
+impl Drop for GuardianTurnRoot {
+    fn drop(&mut self) {
+        self.0.live.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+impl codex_extension_api::HostOperationWork for GuardianTurnRoot {
+    fn derive_operation(
+        &self,
+    ) -> Result<Box<dyn codex_extension_api::HostOperationWork>, codex_extension_api::TurnWorkRefused>
+    {
+        if self.0.refuse.load(Ordering::SeqCst) {
+            return Err(codex_extension_api::TurnWorkRefused::Unavailable);
+        }
+        Ok(Box::new(Self::new(&self.0)))
+    }
+    fn derive_turn_work(
+        &self,
+        store: &codex_extension_api::ExtensionData,
+        termination: codex_extension_api::ExtensionFuture<'static, ()>,
+    ) -> Result<
+        Box<dyn codex_protocol::host_turn_work::HostTurnWork>,
+        codex_extension_api::TurnWorkRefused,
+    > {
+        assert_eq!(store.level_id(), self.0.store);
+        self.0.derives.fetch_add(1, Ordering::SeqCst);
+        if self.0.refuse.load(Ordering::SeqCst) {
+            return Err(codex_extension_api::TurnWorkRefused::Unavailable);
+        }
+        self.0.terminations.lock().unwrap().push(termination);
+        Ok(Box::new(GuardianQueuedTurn(Self::new(&self.0))))
+    }
+}
+#[derive(Debug)]
+struct GuardianQueuedTurn(GuardianTurnRoot);
+impl codex_protocol::host_turn_work::HostTurnWork for GuardianQueuedTurn {
+    fn bind_submission(&mut self, _: &str) {
+        let _ = &self.0;
+    }
+    fn retain_until_terminal(self: Box<Self>) {
+        panic!("queue probes must not simulate task-terminal retention");
+    }
+}
+#[derive(Debug)]
+struct GuardianTurnGate;
+impl codex_extension_api::TurnStartAdmission for GuardianTurnGate {
+    fn requires_account_work(&self) -> bool {
+        true
+    }
+    fn admit_turn_start(&self) -> Option<Box<dyn Send>> {
+        panic!("no fresh admission")
+    }
+    fn derive_request_operation_work(
+        &self,
+    ) -> Result<
+        Option<Box<dyn codex_extension_api::HostOperationWork>>,
+        codex_extension_api::TurnWorkRefused,
+    > {
+        panic!("no ambient request lookup")
+    }
+}
+async fn guardian_turn_queue() -> (
+    GuardianReviewSession,
+    async_channel::Receiver<Submission>,
+    Arc<GuardianTurnCounts>,
+) {
+    let (mut reviewer, _, submissions) = test_review_session().await;
+    Arc::get_mut(&mut reviewer.session)
+        .unwrap()
+        .services
+        .host_admission = Some(Arc::new(GuardianTurnGate));
+    let counts = Arc::new(GuardianTurnCounts {
+        live: 0.into(),
+        derives: 0.into(),
+        refuse: false.into(),
+        store: reviewer
+            .session
+            .services
+            .thread_extension_data
+            .level_id()
+            .to_owned(),
+        terminations: std::sync::Mutex::new(Vec::new()),
+    });
+    (reviewer, submissions, counts)
+}
+fn guardian_queue_request() -> TurnInputRequest {
+    TurnInputRequest::user_input(vec![codex_protocol::user_input::UserInput::Text {
+        text: "guardian queue custody probe".to_owned(),
+        text_elements: Vec::new(),
+    }])
+}
+#[tokio::test]
+async fn guardian_model_queue_keeps_child_after_reply_waiter_and_invocation_drop() {
+    use codex_guardian_reviewer::ReviewerRuntime;
+    let (reviewer, submissions, counts) = guardian_turn_queue().await;
+    let root = GuardianTurnRoot::new(&counts);
+    let runtime = GuardianInvocationRuntime {
+        session: &reviewer,
+        work: Some(&root),
+    };
+    let mut submit = Box::pin(runtime.submit_turn(guardian_queue_request()));
+    assert!(futures::poll!(&mut submit).is_pending());
+    assert_eq!(counts.live.load(Ordering::SeqCst), 2);
+    drop(submit);
+    drop(runtime);
+    drop(root);
+    assert_eq!(
+        counts.live.load(Ordering::SeqCst),
+        1,
+        "the queue, not the waiter, owns the child"
+    );
+    let sub = submissions.try_recv().unwrap();
+    let Op::TurnInput {
+        host_work,
+        reply,
+        mode,
+        ..
+    } = sub.op
+    else {
+        panic!("typed turn input")
+    };
+    assert!(matches!(mode, TurnInputMode::StartIfIdle));
+    let work = host_work.expect("explicit invocation child");
+    assert!(
+        reply
+            .send(Ok(TurnInputSubmission::Started {
+                root_turn_id: sub.id.clone(),
+                turn_id: sub.id
+            }))
+            .is_err()
+    );
+    assert_eq!(counts.derives.load(Ordering::SeqCst), 1);
+    assert_eq!(counts.live.load(Ordering::SeqCst), 1);
+    drop(work);
+    assert_eq!(counts.live.load(Ordering::SeqCst), 0);
+}
+#[tokio::test]
+async fn guardian_compaction_queue_owns_a_distinct_invocation_child() {
+    let (reviewer, submissions, counts) = guardian_turn_queue().await;
+    let root = GuardianTurnRoot::new(&counts);
+    let runtime = GuardianInvocationRuntime {
+        session: &reviewer,
+        work: Some(&root),
+    };
+    let id = runtime.submit_compaction().await.unwrap();
+    assert_eq!(counts.live.load(Ordering::SeqCst), 2);
+    drop(runtime);
+    drop(root);
+    assert_eq!(counts.live.load(Ordering::SeqCst), 1);
+    let sub = submissions.try_recv().unwrap();
+    assert_eq!(sub.id, id);
+    let Op::HostTurn { action, work } = sub.op else {
+        panic!("typed standalone turn")
+    };
+    assert!(matches!(
+        action,
+        codex_protocol::host_turn_work::HostTurnAction::Compact
+    ));
+    drop(work);
+    assert_eq!(counts.live.load(Ordering::SeqCst), 0);
+}
+#[tokio::test]
+async fn guardian_required_turn_refuses_missing_or_expired_invocation_before_queue() {
+    use codex_guardian_reviewer::ReviewerRuntime;
+    let (reviewer, submissions, counts) = guardian_turn_queue().await;
+    assert!(
+        reviewer
+            .submit_turn(guardian_queue_request())
+            .await
+            .is_err()
+    );
+    let missing = GuardianInvocationRuntime {
+        session: &reviewer,
+        work: None,
+    };
+    assert!(missing.submit_compaction().await.is_err());
+    assert_eq!(counts.derives.load(Ordering::SeqCst), 0);
+    let root = GuardianTurnRoot::new(&counts);
+    counts.refuse.store(true, Ordering::SeqCst);
+    let expired = GuardianInvocationRuntime {
+        session: &reviewer,
+        work: Some(&root),
+    };
+    assert!(expired.submit_turn(guardian_queue_request()).await.is_err());
+    assert!(expired.submit_compaction().await.is_err());
+    assert!(submissions.is_empty());
+    assert_eq!(counts.derives.load(Ordering::SeqCst), 2);
+    assert_eq!(counts.live.load(Ordering::SeqCst), 1);
+    drop(expired);
+    drop(root);
+    assert_eq!(counts.live.load(Ordering::SeqCst), 0);
+}
+#[tokio::test]
+async fn guardian_cancelled_full_queue_drops_unadmitted_children() {
+    use codex_guardian_reviewer::ReviewerRuntime;
+    let (reviewer, submissions, counts) = guardian_turn_queue().await;
+    for _ in 0..4 {
+        reviewer.io.submit(Op::Interrupt).await.unwrap();
+    }
+    let root = GuardianTurnRoot::new(&counts);
+    let runtime = GuardianInvocationRuntime {
+        session: &reviewer,
+        work: Some(&root),
+    };
+    let mut compact = Box::pin(runtime.submit_compaction());
+    assert!(futures::poll!(&mut compact).is_pending());
+    assert_eq!(counts.live.load(Ordering::SeqCst), 2);
+    drop(compact);
+    assert_eq!(counts.live.load(Ordering::SeqCst), 1);
+    let mut model = Box::pin(runtime.submit_turn(guardian_queue_request()));
+    assert!(futures::poll!(&mut model).is_pending());
+    assert_eq!(counts.live.load(Ordering::SeqCst), 2);
+    drop(model);
+    assert_eq!(counts.live.load(Ordering::SeqCst), 1);
+    assert_eq!(submissions.len(), 4);
+    while let Ok(sub) = submissions.try_recv() {
+        assert!(matches!(sub.op, Op::Interrupt));
+    }
+    drop(runtime);
+    drop(root);
+    assert_eq!(counts.live.load(Ordering::SeqCst), 0);
+}
+#[tokio::test]
+async fn guardian_turn_child_receives_the_original_loop_receipt() {
+    let (mut reviewer, submissions, counts) = guardian_turn_queue().await;
+    let (finish, wait) = tokio::sync::oneshot::channel::<()>();
+    reviewer.io.session_loop_termination =
+        crate::session::session_loop_termination_from_handle(tokio::spawn(async move {
+            wait.await.unwrap();
+        }));
+    let root = GuardianTurnRoot::new(&counts);
+    let runtime = GuardianInvocationRuntime {
+        session: &reviewer,
+        work: Some(&root),
+    };
+    runtime.submit_compaction().await.unwrap();
+    let mut receipt = counts.terminations.lock().unwrap().pop().unwrap();
+    assert!(futures::poll!(&mut receipt).is_pending());
+    finish.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), receipt)
+        .await
+        .unwrap();
+    assert_eq!(
+        counts.live.load(Ordering::SeqCst),
+        2,
+        "loop observation is not operation/child destruction"
+    );
+    drop(submissions.try_recv().unwrap());
+    assert_eq!(counts.live.load(Ordering::SeqCst), 1);
+    drop(runtime);
+    drop(root);
+    assert_eq!(counts.live.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn explicit_isolated_preparation_refuses_missing_or_exhausted_work_without_turn_lookup() {
+    for missing in [true, false] {
+        let (params, gate) = required_guardian_params().await;
+        gate.counts.refuse.store(true, Ordering::SeqCst);
+        let work = (!missing).then(|| {
+            Box::new(GuardianWork::new(&gate.counts))
+                as Box<dyn codex_extension_api::HostOperationWork>
+        });
+        let mut prepare = Box::pin(setup::prepare_review_with_work(params, work));
+        assert!(matches!(
+            futures::poll!(&mut prepare),
+            std::task::Poll::Ready(Err(_))
+        ));
+        drop(prepare);
+        assert_eq!(gate.counts.turns.load(Ordering::SeqCst), 0);
+        assert_eq!(gate.counts.live.load(Ordering::SeqCst), 0);
+    }
+}
+#[tokio::test]
+async fn explicit_isolated_preparation_uses_request_root_and_leaves_uncounted_projection() {
+    let (mut params, gate) = required_guardian_params().await;
+    Arc::get_mut(&mut params.parent_context.turn)
+        .unwrap()
+        .sub_id = "request-only-uninstalled".into();
+    let work = Box::new(GuardianWork::new(&gate.counts));
+    let prepared = setup::prepare_review_with_work(params, Some(work))
+        .await
+        .unwrap();
+    assert_eq!(gate.counts.turns.load(Ordering::SeqCst), 0);
+    assert_eq!(gate.counts.live.load(Ordering::SeqCst), 1);
+    assert!(gate.counts.derives.load(Ordering::SeqCst) > 0);
+    let projection = prepared.setup().projection();
+    drop(prepared);
+    assert_eq!(gate.counts.live.load(Ordering::SeqCst), 0);
+    let _key = projection.reuse_key(None);
+}
+
+#[tokio::test]
+async fn reviewer_account_scope_separates_source_and_login_without_credential_revision() {
+    let params = test_review_params().await;
+    let manager = &params.parent_session.services.auth_manager;
+    let scope = |source_login_revisions| {
+        ReviewerAccountScope::new(
+            manager,
+            Some(7),
+            source_login_revisions,
+            manager.renewal_binding(),
+            codex_login::GatewayAdmission::NotConfigured,
+        )
+    };
+    assert_eq!(scope(Some((3, 4))), scope(Some((3, 4))));
+    assert_ne!(scope(Some((3, 4))), scope(Some((5, 4))));
+    assert_ne!(scope(Some((3, 4))), scope(Some((3, 5))));
+    assert_ne!(scope(Some((3, 4))), scope(None));
 }

@@ -327,7 +327,7 @@ async fn observed_local_process_exit_does_not_replace_failed_logical_close() {
         ))
         .await
         .expect("launch child");
-    let process = process_transport.process_handle();
+    let process = process_transport.process_ref();
     let observed = process.clone();
     let registry = RmcpClientRetirement::default();
     let transport = controlled_transport(true);
@@ -352,7 +352,7 @@ async fn observed_local_process_exit_does_not_replace_failed_logical_close() {
         vec![(0, PhysicalRetirementOutcome::LogicalFailed)]
     );
     observed
-        .terminate()
+        .terminate(StdioTermination::Shutdown)
         .await
         .expect("process proof was independently completed");
     drop(process_transport);
@@ -688,4 +688,96 @@ async fn returned_transport_close_failure_remains_sticky_and_owned() {
         1,
         "the final owner releases the transport exactly once"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn retirement_proof_is_cached_only_after_a_complete_closed_census() {
+    let finished = RmcpClientRetirement::default();
+    let startup = finished
+        .start_attempt(|ticket| async move {
+            ticket.finish_no_resource();
+        })
+        .expect("reserve");
+    assert_eq!(startup.await, Some(()));
+    let proof = finished.retirement_proof();
+    assert!(!proof.is_proven());
+    let report = finished
+        .shutdown_until(Instant::now() + Duration::from_secs(1))
+        .await;
+    assert!(report.is_complete());
+    let weak = finished.downgrade();
+    drop(finished);
+    // The proof outlives the registry; the weak handle does not keep it alive.
+    assert!(weak.is_dropped());
+    assert!(proof.is_proven());
+
+    let hung = RmcpClientRetirement::default();
+    let startup = hung
+        .start_attempt(|_| std::future::pending::<()>())
+        .expect("reserve");
+    assert!(startup.now_or_never().is_none());
+    let proof = hung.retirement_proof();
+    let deadline = Instant::now() + Duration::from_millis(50);
+    assert_eq!(
+        hung.shutdown_until(deadline).await.attempts,
+        vec![(0, PhysicalRetirementOutcome::TimedOut)]
+    );
+    assert_eq!(hung.latched_deadline(), Some(deadline));
+    assert!(!proof.is_proven());
+}
+
+#[tokio::test(start_paused = true)]
+async fn expired_latched_deadline_is_retained_and_drives_zero_cleanup() {
+    let registry = RmcpClientRetirement::default();
+    let transport = controlled_transport(false);
+    transport.release.add_permits(1);
+    let closes = Arc::clone(&transport.closes);
+    let startup = registry
+        .start_attempt(move |ticket| async move {
+            let (transport, receipt) = AcknowledgedTransport::new(transport);
+            ticket.attach_transport(receipt, None);
+            drop(transport);
+        })
+        .expect("reserve");
+    assert_eq!(startup.await, Some(()));
+    let expired = Instant::now();
+    assert_eq!(
+        registry.shutdown_until(expired).await.attempts,
+        vec![(0, PhysicalRetirementOutcome::TimedOut)]
+    );
+    tokio::time::advance(Duration::from_millis(10)).await;
+
+    // A later, generous budget must not discard the earlier expired latch.
+    let report = registry
+        .shutdown_within_latched(Instant::now() + Duration::from_secs(1))
+        .await;
+
+    assert_eq!(
+        report.attempts,
+        vec![(0, PhysicalRetirementOutcome::TimedOut)]
+    );
+    assert_eq!(closes.load(Ordering::SeqCst), 0, "no cleanup was polled");
+    assert_eq!(registry.latched_deadline(), Some(expired));
+    assert!(!registry.retirement_proof().is_proven());
+}
+
+#[tokio::test]
+async fn direct_service_wait_requests_cancellation_and_observes_exact_close() {
+    let transport = controlled_transport(false);
+    transport.release.add_permits(1);
+    let closes = Arc::clone(&transport.closes);
+    let (transport, receipt) = AcknowledgedTransport::new(transport);
+    let service = ManagedRunningService::new(serve_directly((), transport, None), receipt);
+    assert_eq!(
+        service
+            .wait_until(Instant::now() + Duration::from_secs(5))
+            .await,
+        Ok(LogicalCloseAck),
+    );
+    assert_eq!(closes.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        service.wait_until(Instant::now()).await,
+        Ok(LogicalCloseAck)
+    );
+    assert_eq!(closes.load(Ordering::SeqCst), 1);
 }

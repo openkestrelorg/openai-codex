@@ -1,15 +1,18 @@
+use super::SessionLoopOutcome;
 use super::Submission;
+use crate::McpRefreshReason;
+use crate::WithTurnExtensionData;
 use crate::realtime_conversation::handle_audio as handle_realtime_conversation_audio;
 use crate::realtime_conversation::handle_close as handle_realtime_conversation_close;
 use crate::realtime_conversation::handle_speech as handle_realtime_conversation_speech;
 use crate::realtime_conversation::handle_start as handle_realtime_conversation_start;
 use crate::realtime_conversation::handle_text as handle_realtime_conversation_text;
 use async_channel::Receiver;
+use codex_features::Feature;
 use tracing::Instrument;
 use tracing::debug_span;
 use tracing::info_span;
 
-use crate::session::SessionLoopOutcome;
 use crate::session::session::Session;
 use crate::session::thread_settings;
 use crate::session::turn_input;
@@ -23,6 +26,9 @@ use crate::tasks::CompactTask;
 use crate::tasks::UserShellCommandMode;
 use crate::tasks::UserShellCommandTask;
 use crate::tasks::execute_user_shell_command;
+use crate::thread_manager::AgentTreeShutdownFailure;
+use crate::thread_manager::thread_store_error_kind;
+use codex_protocol::approvals::ExecApprovalKind;
 use codex_protocol::error::CodexErr;
 use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::ErrorEvent;
@@ -30,7 +36,6 @@ use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::GuardianAssessmentEvent;
 use codex_protocol::protocol::GuardianAssessmentStatus;
-use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::RealtimeConversationListVoicesResponseEvent;
 use codex_protocol::protocol::RealtimeVoicesList;
@@ -79,24 +84,26 @@ pub async fn realtime_conversation_list_voices(sess: &Session, sub_id: String) {
 pub async fn inter_agent_communication(
     sess: &Arc<Session>,
     sub_id: String,
-    communication: InterAgentCommunication,
+    communication: crate::PendingAgentMessage,
     start_options: codex_protocol::turn_input::TurnStartOptions,
     work: Option<Box<dyn codex_protocol::host_turn_work::HostTurnWork>>,
 ) {
     let trigger_turn = communication.trigger_turn;
+    // Queue-only messages cannot hold a turn lease. Accepted trigger mail
+    // keeps the complete native pending record and custody in one reservation.
     let work = if trigger_turn {
         work
     } else {
-        if work.is_some() {
-            tracing::debug!("discarding host turn work attached to queue-only mail");
-        }
         drop(work);
         None
     };
     sess.input_queue
         .enqueue_mailbox_with_work(communication, start_options, work);
     crate::agent_communication::emit_agent_communication_receive(&sub_id);
-    if trigger_turn || sess.has_outstanding_durable_sleep() {
+    if trigger_turn
+        || sess.features.enabled(Feature::WakeOnAgentMessages)
+        || sess.has_outstanding_durable_sleep()
+    {
         sess.maybe_start_turn_for_pending_work_with_sub_id(sub_id)
             .await;
     }
@@ -178,46 +185,65 @@ pub async fn resolve_elicitation(
     }
 }
 
-/// Propagate a user's exec approval decision to the session.
-/// Also optionally applies an execpolicy amendment.
-pub async fn exec_approval(
-    sess: &Arc<Session>,
-    approval_id: String,
-    turn_id: Option<String>,
-    decision: ReviewDecision,
-) {
-    let event_turn_id = turn_id.unwrap_or_else(|| approval_id.clone());
-    if let ReviewDecision::ApprovedExecpolicyAmendment {
-        proposed_execpolicy_amendment,
-    } = &decision
-        && let Err(err) = sess
-            .persist_execpolicy_amendment(proposed_execpolicy_amendment)
+impl Session {
+    /// Claim the prompt before applying a decision that can outlive the requesting execution.
+    pub(crate) async fn resolve_exec_approval(
+        self: &Arc<Self>,
+        approval_id: String,
+        turn_id: Option<String>,
+        decision: ReviewDecision,
+    ) {
+        let Some((pending, active_turn_id)) = self
+            .take_pending_approval(&approval_id, turn_id.as_deref())
             .await
-    {
-        let message = format!("Failed to apply execpolicy amendment: {err}");
-        tracing::warn!("{message}");
-        let warning = EventMsg::Warning(WarningEvent { message });
-        sess.send_event_raw(Event {
-            id: event_turn_id.clone(),
-            msg: warning,
-        })
-        .await;
-    }
-    match decision {
-        ReviewDecision::Abort => {
-            sess.interrupt_task().await;
+        else {
+            return;
+        };
+        let decision = pending.validate(decision);
+        if decision == ReviewDecision::Abort {
+            let turn_id = if pending.kind == ExecApprovalKind::HumanCommand {
+                Some(&pending.turn_id)
+            } else {
+                active_turn_id.as_ref()
+            };
+            if let Some(turn_id) = turn_id {
+                self.abort_turn_if_active(
+                    turn_id,
+                    TurnAbortReason::Interrupted,
+                    /*error*/ None,
+                )
+                .await;
+            }
+        } else if let ReviewDecision::ApprovedExecpolicyAmendment {
+            proposed_execpolicy_amendment,
+        } = &decision
+            && let Err(err) = self
+                .persist_execpolicy_amendment(proposed_execpolicy_amendment)
+                .await
+        {
+            let message = format!("Failed to apply execpolicy amendment: {err}");
+            tracing::warn!("{message}");
+            self.send_event_raw(Event {
+                id: turn_id.unwrap_or(approval_id),
+                msg: EventMsg::Warning(WarningEvent { message }),
+            })
+            .await;
         }
-        other => sess.notify_approval(&approval_id, other).await,
+        let _ = pending.sender.send(decision);
     }
 }
 
-pub async fn patch_approval(sess: &Arc<Session>, id: String, decision: ReviewDecision) {
-    match decision {
-        ReviewDecision::Abort => {
-            sess.interrupt_task().await;
-        }
-        other => sess.notify_approval(&id, other).await,
-    }
+async fn cancel_patch_approval(sess: &Arc<Session>, id: &str, expected_turn_id: Option<&str>) {
+    let Some((pending, _)) = sess.take_pending_approval(id, expected_turn_id).await else {
+        return;
+    };
+    sess.abort_turn_if_active(
+        &pending.turn_id,
+        TurnAbortReason::Interrupted,
+        /*error*/ None,
+    )
+    .await;
+    let _ = pending.sender.send(ReviewDecision::Abort);
 }
 
 pub async fn request_user_input_response(
@@ -243,11 +269,11 @@ pub async fn dynamic_tool_response(sess: &Arc<Session>, id: String, response: Dy
 
 pub fn refresh_mcp_servers(sess: &Session) {
     sess.services.mcp_runtime.reconnect_on_next_refresh();
-    sess.request_mcp_runtime_refresh();
+    sess.request_mcp_runtime_refresh(McpRefreshReason::ExplicitServerReconnect);
 }
 
 pub async fn reload_user_config(sess: &Arc<Session>) {
-    sess.reload_user_config_layer().await;
+    Box::pin(sess.reload_user_config_layer()).await;
 }
 
 pub async fn compact(sess: &Arc<Session>, sub_id: String) -> bool {
@@ -259,7 +285,6 @@ pub async fn compact(sess: &Arc<Session>, sub_id: String) -> bool {
 
     sess.try_spawn_task(turn_context, Vec::new(), CompactTask)
         .await
-        .is_ok()
 }
 
 pub(super) async fn persist_thread_memory_mode_update(
@@ -289,6 +314,7 @@ pub async fn set_thread_memory_mode(sess: &Arc<Session>, sub_id: String, mode: T
                 misalignment: None,
                 message: err.to_string(),
                 codex_error_info: Some(CodexErrorInfo::Other),
+                rejected_audio_file_ids: Vec::new(),
             }),
         };
         sess.send_event_raw(event).await;
@@ -301,31 +327,49 @@ pub(super) async fn shutdown_session_runtime(
 ) -> Option<super::retirement::CleanupExecution> {
     let mut failure = None;
     sess.close_task_admission().await;
-    if let Some(startup_prewarm) = sess.take_session_startup_prewarm().await {
+    if let Some(reporting) = &sess.outcome_reporting {
+        reporting.handoffs.close();
+    }
+    let startup_prewarm = {
+        let mut state = sess.state.lock().await;
+        // Stop admission and take the current warmup together so resume cannot replace it.
+        state.shutting_down = true;
+        state.take_session_startup_prewarm()
+    };
+    if let Some(startup_prewarm) = startup_prewarm {
         startup_prewarm.abort().await;
     }
     if let Err(error) = sess.conversation.shutdown().await {
-        warn!("failed to shutdown realtime conversation: {error}");
+        warn!(%error, "failed to shutdown realtime conversation");
         failure = Some(super::retirement::CleanupExecution::ConversationShutdownFailed);
     }
     sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
-    let shell_snapshot_prewarm = sess.state.lock().await.shell_snapshot_prewarm.take();
-    if let Some(shell_snapshot_prewarm) = shell_snapshot_prewarm {
-        shell_snapshot_prewarm.abort();
-        let _ = shell_snapshot_prewarm.await;
-    }
     if let super::retirement::CleanupMode::Legacy = mode {
         let task_result = sess
             .task_joins
             .shutdown_until(tokio::time::Instant::now() + std::time::Duration::from_secs(30))
             .await;
         if !matches!(task_result, crate::tasks::TaskJoinOutcome::Complete { .. }) {
-            failure.get_or_insert(super::retirement::CleanupExecution::TaskJoinFailed);
-            warn!(
-                ?task_result,
-                "session task joins were not observed during legacy cleanup"
+            sess.services.local_agent_runtime.record_shutdown_failure(
+                AgentTreeShutdownFailure::operation_failed(
+                    "session_shutdown",
+                    "task_joins",
+                    Some(sess.thread_id),
+                    "task_join_failed",
+                ),
             );
+            failure.get_or_insert(super::retirement::CleanupExecution::TaskJoinFailed);
+            warn!(?task_result, "session task joins did not settle cleanly");
         }
+    }
+    if let Some(reporting) = &sess.outcome_reporting {
+        reporting.handoffs.wait().await;
+    }
+    super::async_compaction::shutdown(sess).await;
+    let shell_snapshot_prewarm = sess.state.lock().await.shell_snapshot_prewarm.take();
+    if let Some(shell_snapshot_prewarm) = shell_snapshot_prewarm {
+        shell_snapshot_prewarm.abort();
+        let _ = shell_snapshot_prewarm.await;
     }
     sess.hooks().shutdown().await;
     sess.async_hook_results.close();
@@ -335,27 +379,44 @@ pub(super) async fn shutdown_session_runtime(
         .terminate_all_processes()
         .await;
     if let Err(err) = sess.services.code_mode_service.shutdown().await {
+        sess.services.local_agent_runtime.record_shutdown_failure(
+            AgentTreeShutdownFailure::operation_failed(
+                "session_shutdown",
+                "code_mode",
+                Some(sess.thread_id),
+                "code_mode_error",
+            ),
+        );
         warn!("failed to shutdown code mode session: {err}");
         failure.get_or_insert(super::retirement::CleanupExecution::CodeModeShutdownFailed);
     }
-    let prewarm_outcome = sess.stop_mcp_prewarm_worker().await;
-    if prewarm_outcome != SessionLoopOutcome::Normal {
-        warn!(?prewarm_outcome, "MCP prewarm worker stopped unexpectedly");
+    let prewarm = sess.stop_mcp_prewarm_worker().await;
+    if prewarm != SessionLoopOutcome::Normal {
+        sess.services.local_agent_runtime.record_shutdown_failure(
+            AgentTreeShutdownFailure::operation_failed(
+                "session_shutdown",
+                "mcp_prewarm",
+                Some(sess.thread_id),
+                "prewarm_join_failed",
+            ),
+        );
+        warn!(?prewarm, "MCP prewarm worker stopped unexpectedly");
         failure.get_or_insert(super::retirement::CleanupExecution::McpPrewarmFailed);
     }
     if let super::retirement::CleanupMode::Legacy = mode {
-        let _refresh = sess.mcp_refresh.acquire().await;
-        sess.mcp_refresh.close();
+        {
+            let _refresh = sess.mcp_refresh.acquire().await;
+            sess.mcp_refresh.close();
+        }
+        sess.wait_for_apps_tool_refresh().await;
         let report = sess
             .services
             .mcp_runtime
-            .shutdown_until(tokio::time::Instant::now() + std::time::Duration::from_secs(30))
+            .retirement_owner()
+            .drain_workers_until(tokio::time::Instant::now() + std::time::Duration::from_secs(30))
             .await;
-        if !report.is_complete() {
-            warn!(
-                ?report,
-                "MCP runtime retirement was not acknowledged during legacy cleanup"
-            );
+        if !report.are_recorded_workers_drained() {
+            warn!(?report, "MCP runtime cleanup not proven");
             failure.get_or_insert(super::retirement::CleanupExecution::McpFailed);
         }
     }
@@ -403,7 +464,15 @@ pub(super) async fn cleanup_session(
         } else {
             live_thread.shutdown().await
         };
-        if result.is_err() {
+        if let Err(error) = result {
+            sess.services.local_agent_runtime.record_shutdown_failure(
+                AgentTreeShutdownFailure::operation_failed(
+                    "session_shutdown",
+                    "close_persistence",
+                    Some(sess.thread_id),
+                    thread_store_error_kind(&error),
+                ),
+            );
             let persistence_operation = if failed_initialization {
                 "discard_failed_initialization"
             } else {
@@ -429,7 +498,11 @@ pub(super) async fn cleanup_session(
     } else {
         false
     };
-    failure.unwrap_or(super::retirement::CleanupExecution::Finished { persistence_failed })
+    // The receipt is sticky: a clean result is qualified by the session's
+    // sandbox cleanup census as it stands now, after every launch owner ran.
+    failure
+        .unwrap_or(super::retirement::CleanupExecution::Finished { persistence_failed })
+        .with_sandbox_cleanup_census(sess.services.sandbox_cleanup_census().totals())
 }
 
 pub async fn shutdown(sess: &Arc<Session>, sub_id: String) -> bool {
@@ -446,7 +519,16 @@ pub async fn shutdown(sess: &Arc<Session>, sub_id: String) -> bool {
         | super::retirement::CleanupExecution::TaskJoinFailed
         | super::retirement::CleanupExecution::ConversationShutdownFailed
         | super::retirement::CleanupExecution::CodeModeShutdownFailed
+        | super::retirement::CleanupExecution::SandboxCleanupUnproven { .. }
         | super::retirement::CleanupExecution::AuthorityUnavailable => {
+            sess.services.local_agent_runtime.record_shutdown_failure(
+                AgentTreeShutdownFailure::operation_failed(
+                    "session_shutdown",
+                    "session_runtime_cleanup",
+                    Some(sess.thread_id),
+                    "cleanup_incomplete",
+                ),
+            );
             warn!(
                 ?cleanup,
                 "session cleanup not observed; withholding ShutdownComplete"
@@ -463,6 +545,7 @@ pub async fn shutdown(sess: &Arc<Session>, sub_id: String) -> bool {
                 misalignment: None,
                 message: "Failed to shutdown thread persistence".to_string(),
                 codex_error_info: Some(CodexErrorInfo::Other),
+                rejected_audio_file_ids: Vec::new(),
             }),
         };
         sess.send_event_raw(event).await;
@@ -512,6 +595,7 @@ pub async fn review(
                     misalignment: None,
                     message: err.to_string(),
                     codex_error_info: Some(CodexErrorInfo::Other),
+                    rejected_audio_file_ids: Vec::new(),
                 }),
             };
             sess.send_event(&turn_context, event.msg).await;
@@ -520,72 +604,142 @@ pub async fn review(
     }
 }
 
-#[expect(
-    clippy::expect_used,
-    reason = "the loop exclusively owns mailbox_start and select guards polling on Some"
-)]
+#[cfg(test)]
 pub(super) async fn submission_loop(
+    sess: Arc<Session>,
+    config: Arc<Config>,
+    rx_sub: Receiver<Submission>,
+) {
+    submission_loop_with_dispatch(sess, config, rx_sub, None).await;
+}
+
+pub(super) async fn submission_loop_with_dispatch(
     sess: Arc<Session>,
     config: Arc<Config>,
     rx_sub: Receiver<Submission>,
     submissions: Option<super::submission::SubmissionDispatch>,
 ) {
-    // To break out of this loop, send Op::Shutdown.
-    let _cleanup_owner = sess.cleanup_owner();
+    // Session shutdown and tree shutdown both use the existing teardown handler.
     let mut shutdown_received = false;
-    // As with the former finishing-task caller, birth can interleave with
-    // handlers; install-time task admission remains the shutdown fence.
-    let mut mailbox_start: Option<futures::future::BoxFuture<'_, ()>> = None;
-    // Retain the retry observer across select iterations. Dropping a losing
-    // select arm must not discard the host's pending reopen signal.
+    let mut catalog_updates = sess.services.models_manager.model_catalog_updates();
+    if let Some(updates) = &mut catalog_updates {
+        // A resumed chat must also consume a catalog fetched before it was opened.
+        updates.mark_changed();
+    }
+    let mut mailbox = sess.input_queue.mailbox_updates();
+    if let Some(updates) = &mut mailbox {
+        updates.mark_changed();
+    }
+    let mut mailbox_start: Option<futures::future::BoxFuture<'static, ()>> = None;
+    // Retain this original observer across select iterations and dispatch.
+    // A losing arm must not discard a previously taken host reopen signal.
     let mut mailbox_retry = Box::pin(sess.input_queue.work_retry.wait());
     loop {
         if rx_sub.is_closed() && rx_sub.is_empty() {
             break;
         }
         let sub = tokio::select! {
-            _ = &mut mailbox_retry => {
-                mailbox_retry = Box::pin(sess.input_queue.work_retry.wait());
-                sess.input_queue.completion_wake.notify_one();
+            biased;
+            _ = sess.services.local_agent_runtime.shutdown.cancelled() => {
+                drop(mailbox_start.take());
+                shutdown_received = shutdown(&sess, super::new_submission_id()).await;
+                break;
+            }
+            update = async {
+                match &mut catalog_updates {
+                    Some(updates) => updates.changed().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                if update.is_err() {
+                    catalog_updates = None;
+                } else {
+                    let _work = match submissions.as_ref().map(super::submission::SubmissionDispatch::begin_work) {
+                        Some(Some(work)) => Some(work),
+                        Some(None) => continue,
+                        None => None,
+                    };
+                    super::model_catalog_settings::apply(&sess).await;
+                }
                 continue;
             }
             sub = rx_sub.recv() => match sub {
                 Ok(sub) => sub,
                 Err(_) => break,
             },
-            _ = sess.input_queue.completion_wake.notified(), if mailbox_start.is_none() => {
-                mailbox_start = Some(Box::pin(sess.maybe_start_turn_for_pending_work()));
+            update = async {
+                match &mut mailbox {
+                    Some(updates) => updates.changed().await.map(|()| *updates.borrow_and_update()),
+                    None => std::future::pending().await,
+                }
+            } => {
+                match update {
+                    Ok(true) => {
+                    let _work = match submissions.as_ref().map(super::submission::SubmissionDispatch::begin_work) {
+                        Some(Some(work)) => Some(work),
+                        Some(None) => continue,
+                        None => None,
+                    };
+                        sess.input_queue.notify_mailbox();
+                        if sess.features.enabled(Feature::WakeOnAgentMessages)
+                            || sess.has_outstanding_durable_sleep()
+                        {
+                            sess.input_queue.completion_wake.notify_one();
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(_) => mailbox = None,
+                }
                 continue;
             }
-            _ = async { mailbox_start.as_mut().expect("guarded mailbox start").await }, if mailbox_start.is_some() => {
+            _ = &mut mailbox_retry => {
+                mailbox_retry = Box::pin(sess.input_queue.work_retry.wait());
+                sess.input_queue.completion_wake.notify_one();
+                continue;
+            }
+            _ = sess.input_queue.completion_wake.notified(), if mailbox_start.is_none() => {
+                let work = match submissions.as_ref().map(super::submission::SubmissionDispatch::begin_work) {
+                    Some(Some(work)) => Some(work),
+                    Some(None) => continue,
+                    None => None,
+                };
+                let session = Arc::clone(&sess);
+                mailbox_start = Some(Box::pin(async move {
+                    let _work = work;
+                    session.maybe_start_turn_for_pending_work().await;
+                }));
+                continue;
+            }
+            _ = async { mailbox_start.as_mut().unwrap_or_else(|| panic!("guarded mailbox start")).await }, if mailbox_start.is_some() => {
                 mailbox_start = None;
                 continue;
             }
         };
+        if matches!(&sub.op, Op::Shutdown) {
+            drop(mailbox_start.take());
+        }
         let _dispatch = submissions
             .as_ref()
             .map(super::submission::SubmissionDispatch::begin);
-        if matches!(sub.op, Op::ResolveElicitation { .. }) {
-            debug!(submission_id = %sub.id, operation = sub.op.kind(), "Submission");
-        } else {
-            debug!(?sub, "Submission");
-        }
+        debug!(
+            thread_id = %sess.thread_id(),
+            submission_id = %sub.id,
+            operation = sub.op.kind(),
+            parent_turn_id = ?sub.parent_turn_id,
+            root_turn_id = ?sub.root_turn_id,
+            op = ?sub.op,
+            "Submission"
+        );
         let dispatch_span = submission_dispatch_span(&sub);
         let dispatch = async {
             match sub.op {
                 Op::HostTurn { action, mut work } => {
                     work.bind_submission(&sub.id);
                     let started = match action {
-                        codex_protocol::host_turn_work::HostTurnAction::Compact => {
-                            compact(&sess, sub.id.clone()).await
-                        }
-                        codex_protocol::host_turn_work::HostTurnAction::Review(request) => {
-                            review(&sess, &config, sub.id.clone(), request).await
-                        }
+                        codex_protocol::host_turn_work::HostTurnAction::Compact => compact(&sess, sub.id.clone()).await,
+                        codex_protocol::host_turn_work::HostTurnAction::Review(request) => review(&sess, &config, sub.id.clone(), request).await,
                     };
-                    if started {
-                        work.retain_until_terminal();
-                    }
+                    if started { work.retain_until_terminal(); }
                     false
                 }
                 Op::Interrupt => {
@@ -611,10 +765,47 @@ pub(super) async fn submission_loop(
                                 misalignment: None,
                                 message: err.to_string(),
                                 codex_error_info: Some(CodexErrorInfo::Other),
+                                rejected_audio_file_ids: Vec::new(),
                             }),
                         })
                         .await;
                     }
+                    false
+                }
+                Op::RealtimeConversationAttach {
+                    params,
+                    options,
+                    reply,
+                } => {
+                    let result =
+                        crate::realtime_conversation::handle_attach(&sess, sub.id, params, options)
+                            .await;
+                    let _ = reply.send(result);
+                    false
+                }
+                Op::RealtimeConversationAttachStream {
+                    params,
+                    transport,
+                    reply,
+                } => {
+                    let result = crate::realtime_conversation::handle_attach_stream(
+                        &sess, sub.id, params, transport,
+                    )
+                    .await;
+                    let _ = reply.send(result);
+                    false
+                }
+                Op::RealtimeConversationDetach {
+                    realtime_session_id,
+                    reply,
+                } => {
+                    crate::realtime_conversation::handle_detach(
+                        &sess,
+                        Some(&realtime_session_id),
+                        &sub.id,
+                    )
+                    .await;
+                    let _ = reply.send(Ok(()));
                     false
                 }
                 Op::RealtimeConversationAudio(params) => {
@@ -640,20 +831,14 @@ pub(super) async fn submission_loop(
                 Op::TurnInput {
                     request,
                     mode,
-                    mut host_work,
+                    host_work,
                     reply,
                 } => {
-                    if let Some(work) = &mut host_work {
-                        work.bind_submission(&sub.id);
-                    }
-                    let result = turn_input::handle(&sess, *request, mode, sub.id.clone()).await;
-                    if matches!(
-                        &result,
-                        Ok(codex_protocol::turn_input::TurnInputSubmission::Started { .. })
-                    ) && let Some(work) = host_work.take()
-                    {
-                        work.retain_until_terminal();
-                    }
+                    let request = WithTurnExtensionData {
+                        request: *request,
+                        turn_extension_init: sub.turn_extension_init,
+                    };
+                    let result = turn_input::handle_with_work(&sess, request, mode, sub.id.clone(), host_work).await;
                     let _ = reply.send(result);
                     false
                 }
@@ -663,23 +848,19 @@ pub(super) async fn submission_loop(
                     mut host_work,
                     reply,
                 } => {
-                    if let Some(work) = &mut host_work {
-                        work.bind_submission(&sub.id);
-                    }
+                    if let Some(work) = &mut host_work { work.bind_submission(&sub.id); }
                     let result = turn_input::handle_recovery(
                         &sess,
-                        thread_settings,
+                        WithTurnExtensionData {
+                            request: thread_settings,
+                            turn_extension_init: sub.turn_extension_init,
+                        },
                         start_options,
                         sub.id.clone(),
                     )
                     .await;
-                    if matches!(
-                        &result,
-                        Ok(codex_protocol::turn_input::TurnInputSubmission::Started { .. })
-                    ) && let Some(work) = host_work.take()
-                    {
-                        work.retain_until_terminal();
-                    }
+                    if matches!(&result, Ok(codex_protocol::turn_input::TurnInputSubmission::Started { .. }))
+                        && let Some(work) = host_work.take() { work.retain_until_terminal(); }
                     let _ = reply.send(result);
                     false
                 }
@@ -701,13 +882,37 @@ pub(super) async fn submission_loop(
                     reply,
                 } => {
                     let _settings_guard = thread_settings::acquire_persistence_lock(&sess).await;
-                    match thread_settings::update(&sess, thread_settings).await {
-                        Ok(snapshot) => {
-                            // Reply first: the caller may hold a lock its event consumer needs.
-                            if let Some(reply) = reply {
-                                let _ = reply.send(Ok(()));
+                    let thread_settings = WithTurnExtensionData {
+                        request: thread_settings,
+                        turn_extension_init: sub.turn_extension_init,
+                    };
+                    match thread_settings::update(&sess, thread_settings, reply.is_some()).await {
+                        Ok(commit) => {
+                            match (reply, commit.host_acceptance) {
+                                (Some(mut reply), Some(acceptance)) => {
+                                    // Leave the submission loop free to process interrupts.
+                                    tokio::spawn(async move {
+                                        tokio::select! {
+                                            _ = reply.closed() => {}
+                                            result = acceptance => {
+                                                let result = result.map_err(|error| {
+                                                    CodexErr::from(std::io::Error::other(format!(
+                                                        "service tier committed locally; host acceptance unconfirmed: {error}"
+                                                    )))
+                                                });
+                                                let _ = reply.send(result);
+                                            }
+                                        }
+                                    });
+                                }
+                                (Some(reply), None) => {
+                                    // The caller may hold a lock its event consumer needs.
+                                    let _ = reply.send(Ok(()));
+                                }
+                                (None, _) => {}
                             }
-                            thread_settings::emit_applied(&sess, sub.id.clone(), snapshot).await;
+                            thread_settings::emit_applied(&sess, sub.id.clone(), commit.snapshot)
+                                .await;
                         }
                         Err(error) => {
                             let message = format!("invalid thread settings override: {error}");
@@ -720,12 +925,17 @@ pub(super) async fn submission_loop(
                                         misalignment: None,
                                         message,
                                         codex_error_info: Some(CodexErrorInfo::BadRequest),
+                                        rejected_audio_file_ids: Vec::new(),
                                     }),
                                 })
                                 .await;
                             }
                         }
                     }
+                    false
+                }
+                Op::ReplaceDynamicTools { tools, reply } => {
+                    let _ = reply.send(sess.replace_dynamic_tools(tools).await);
                     false
                 }
                 Op::TurnSettings {
@@ -742,14 +952,10 @@ pub(super) async fn submission_loop(
                     start_options,
                     work,
                 } => {
-                    inter_agent_communication(
-                        &sess,
-                        sub.id.clone(),
-                        communication,
-                        start_options,
-                        work,
-                    )
-                    .await;
+                    let communication =
+                        crate::PendingAgentMessage::new(communication, sub.message_delivery);
+                    inter_agent_communication(&sess, sub.id.clone(), communication, start_options, work)
+                        .await;
                     false
                 }
                 Op::ExecApproval {
@@ -757,11 +963,23 @@ pub(super) async fn submission_loop(
                     turn_id,
                     decision,
                 } => {
-                    exec_approval(&sess, approval_id, turn_id, decision).await;
+                    sess.resolve_exec_approval(approval_id, turn_id, decision)
+                        .await;
+                    false
+                }
+                Op::CancelPatchApproval { id, turn_id } => {
+                    cancel_patch_approval(&sess, &id, Some(&turn_id)).await;
+                    false
+                }
+                Op::PatchApproval {
+                    id,
+                    decision: ReviewDecision::Abort,
+                } => {
+                    cancel_patch_approval(&sess, &id, /*expected_turn_id*/ None).await;
                     false
                 }
                 Op::PatchApproval { id, decision } => {
-                    patch_approval(&sess, id, decision).await;
+                    sess.notify_approval(&id, decision).await;
                     false
                 }
                 Op::UserInputAnswer { id, response } => {
@@ -824,8 +1042,8 @@ pub(super) async fn submission_loop(
         }
         .instrument(dispatch_span);
         tokio::pin!(dispatch);
-        // Keep discovery/start progressing even when a control handler waits
-        // on a lock it holds. Conversely, discovery never blocks dispatch.
+        // Progress the retained preparation alongside control dispatch. It
+        // owns no submission sender; cancellation drops it before cleanup.
         let should_exit = loop {
             tokio::select! {
                 result = &mut dispatch => break result,
@@ -833,7 +1051,7 @@ pub(super) async fn submission_loop(
                     mailbox_retry = Box::pin(sess.input_queue.work_retry.wait());
                     sess.input_queue.completion_wake.notify_one();
                 }
-                _ = async { mailbox_start.as_mut().expect("guarded mailbox start").await }, if mailbox_start.is_some() => {
+                _ = async { mailbox_start.as_mut().unwrap_or_else(|| panic!("guarded mailbox start")).await }, if mailbox_start.is_some() => {
                     mailbox_start = None;
                 }
             }
@@ -844,14 +1062,12 @@ pub(super) async fn submission_loop(
             break;
         }
     }
-    // Release any suspended preparation before cleanup acquires its locks.
     drop(mailbox_start);
-    drop(mailbox_retry);
     // If the submission loop exits because the channel closed without an
     // explicit shutdown op, still run session teardown.
     if !shutdown_received {
         let cleanup = sess.cleanup_owner().observe(Arc::clone(&sess)).await;
-        if cleanup == super::retirement::CleanupExecution::Panicked {
+        if matches!(cleanup, super::retirement::CleanupExecution::Panicked) {
             std::panic::resume_unwind(Box::new("session cleanup panicked"));
         }
         if cleanup
@@ -859,11 +1075,11 @@ pub(super) async fn submission_loop(
                 persistence_failed: false,
             })
         {
-            warn!(
-                ?cleanup,
-                "session cleanup failed after submission channel closed"
-            );
+            warn!(?cleanup, "channel-closed Session cleanup incomplete");
         }
+        sess.services
+            .rollout_thread_trace
+            .record_ended(codex_rollout_trace::RolloutStatus::Aborted);
     }
     debug!("Agent loop exited");
 }
@@ -926,3 +1142,7 @@ pub(super) fn submission_dispatch_span(sub: &Submission) -> tracing::Span {
         ),
     })
 }
+
+#[cfg(test)]
+#[path = "handlers_managed_trace_parent_tests.rs"]
+mod managed_trace_parent_tests;

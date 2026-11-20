@@ -27,6 +27,11 @@ const NEXT_EMAIL: &str = "next-account@example.com";
 const PARENT_TRACE_ID: &str = "4bf92f3577b34da6a3ce929d0e0e4736";
 const PARENT_TRACEPARENT: &str = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
 
+enum TraceExporterSetting {
+    Disabled,
+    Collector,
+}
+
 #[tokio::test]
 async fn account_switch_reloads_telemetry_collectors_and_preserves_trace_context() -> Result<()> {
     let collector = MockServer::start().await;
@@ -37,7 +42,11 @@ async fn account_switch_reloads_telemetry_collectors_and_preserves_trace_context
 
     let codex_home = TempDir::new()?;
     let initial_endpoint = format!("{}/initial", collector.uri());
-    write_otel_config(codex_home.path(), &initial_endpoint)?;
+    write_otel_config(
+        codex_home.path(),
+        &initial_endpoint,
+        TraceExporterSetting::Collector,
+    )?;
     write_chatgpt_auth(
         codex_home.path(),
         ChatGptAuthFixture::new("initial-access-token")
@@ -81,7 +90,11 @@ async fn account_switch_reloads_telemetry_collectors_and_preserves_trace_context
     .context("initial account telemetry must be exported before its permission is revoked")?;
 
     let next_endpoint = format!("{}/next", collector.uri());
-    write_otel_config(codex_home.path(), &next_endpoint)?;
+    write_otel_config(
+        codex_home.path(),
+        &next_endpoint,
+        TraceExporterSetting::Collector,
+    )?;
     let access_token = encode_id_token(
         &ChatGptIdTokenClaims::new()
             .email(NEXT_EMAIL)
@@ -101,7 +114,10 @@ async fn account_switch_reloads_telemetry_collectors_and_preserves_trace_context
     assert_eq!(response, LoginAccountResponse::ChatgptAuthTokens {});
     timeout(
         TEST_TIMEOUT,
-        app_server.wait_for_json_log_event("codex.app_server.otel_reloaded"),
+        app_server.wait_for_json_log_event(
+            "codex.app_server.otel_reloaded",
+            Duration::from_secs(/*secs*/ 10),
+        ),
     )
     .await??;
     timeout(TEST_TIMEOUT, async {
@@ -127,6 +143,18 @@ async fn account_switch_reloads_telemetry_collectors_and_preserves_trace_context
         .received_requests()
         .await
         .context("collector did not record requests")?;
+    for request in requests
+        .iter()
+        .filter(|request| request.url.path().ends_with("/logs"))
+    {
+        assert_eq!(
+            request
+                .headers
+                .get("x-collector-key")
+                .and_then(|value| value.to_str().ok()),
+            Some("test-collector-key")
+        );
+    }
     let exported = |path: &str| {
         requests
             .iter()
@@ -170,139 +198,123 @@ async fn account_switch_reloads_telemetry_collectors_and_preserves_trace_context
 }
 
 #[tokio::test]
-async fn managed_trace_route_preserves_explicit_request_spawn_and_submission_parents() -> Result<()>
-{
-    use codex_app_server_protocol::ClientRequest;
-    use codex_app_server_protocol::ThreadStartResponse;
-    use codex_app_server_protocol::TurnStartParams;
-    use codex_app_server_protocol::TurnStartResponse;
-    use codex_app_server_protocol::UserInput;
-    use codex_protocol::protocol::W3cTraceContext;
-
+async fn account_switch_enables_trace_exporter_after_startup_without_tracing() -> Result<()> {
     let collector = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(ResponseTemplate::new(200))
         .mount(&collector)
         .await;
-    let model = app_test_support::create_mock_responses_server_repeating_assistant("Done").await;
-    let home = TempDir::new()?;
-    write_otel_config(home.path(), &format!("{}/trace-test", collector.uri()))?;
-    let config_path = home.path().join("config.toml");
-    let config = std::fs::read_to_string(&config_path)?;
-    // Detached snapshot work retains the request span while running the login
-    // shell. This fixture tests parent selection, not shell-profile completion.
-    let config = format!("{config}\n[features]\nshell_snapshot = false\n");
-    std::fs::write(
-        config_path,
-        config.replace("http://127.0.0.1:1/v1", &format!("{}/v1", model.uri())),
+
+    let codex_home = TempDir::new()?;
+    let initial_endpoint = format!("{}/initial", collector.uri());
+    write_otel_config(
+        codex_home.path(),
+        &initial_endpoint,
+        TraceExporterSetting::Disabled,
     )?;
-    write_models_cache(home.path()).await?;
-    let mut server = TestAppServer::builder()
-        .with_codex_home(home.path())
+    write_trace_requirements(
+        codex_home.path(),
+        &initial_endpoint,
+        TraceExporterSetting::Disabled,
+    )?;
+    write_chatgpt_auth(
+        codex_home.path(),
+        ChatGptAuthFixture::new("initial-access-token")
+            .account_id(INITIAL_ACCOUNT_ID)
+            .chatgpt_account_id(INITIAL_ACCOUNT_ID)
+            .chatgpt_user_id("initial-user")
+            .plan_type("pro")
+            .email(INITIAL_EMAIL),
+        AuthCredentialsStoreMode::File,
+    )?;
+    write_models_cache(codex_home.path()).await?;
+
+    let mut app_server = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
         .with_env_overrides(&[("TRACEPARENT", Some(PARENT_TRACEPARENT))])
+        .with_json_logging("codex_app_server::otel_reloader=info")
         .build_initialized_with_timeout(TEST_TIMEOUT)
         .await?;
-    let carrier = |id: &str| W3cTraceContext {
-        traceparent: Some(format!("00-{id}-0000000000000022-01")),
-        tracestate: None,
-    };
-    let start_trace = "00000000000000000000000000000011";
-    let turn_trace = "00000000000000000000000000000033";
-    let thread: ThreadStartResponse = server
-        .request_with_trace(
-            |request_id| ClientRequest::ThreadStart {
-                request_id,
-                params: ThreadStartParams::default(),
-            },
-            Some(carrier(start_trace)),
+    app_server
+        .start_thread(ThreadStartParams::default())
+        .await?;
+
+    let next_endpoint = format!("{}/next", collector.uri());
+    write_trace_requirements(
+        codex_home.path(),
+        &next_endpoint,
+        TraceExporterSetting::Collector,
+    )?;
+    let access_token = encode_id_token(
+        &ChatGptIdTokenClaims::new()
+            .email(NEXT_EMAIL)
+            .plan_type("pro")
+            .chatgpt_account_id(NEXT_ACCOUNT_ID)
+            .chatgpt_user_id("next-user"),
+    )?;
+    let request_id = app_server
+        .send_chatgpt_auth_tokens_login_request(
+            access_token,
+            NEXT_ACCOUNT_ID.to_string(),
+            Some("pro".to_string()),
         )
         .await?;
-    let _: TurnStartResponse = server
-        .request_with_trace(
-            |request_id| ClientRequest::TurnStart {
-                request_id,
-                params: TurnStartParams {
-                    thread_id: thread.thread.id,
-                    input: vec![UserInput::Text {
-                        text: "hello".into(),
-                        text_elements: Vec::new(),
-                    }],
-                    ..Default::default()
-                },
-            },
-            Some(carrier(turn_trace)),
-        )
-        .await?;
+    let response: LoginAccountResponse =
+        timeout(TEST_TIMEOUT, app_server.read_response(request_id)).await??;
+    assert_eq!(response, LoginAccountResponse::ChatgptAuthTokens {});
     timeout(
         TEST_TIMEOUT,
-        server.read_stream_until_notification_message("turn/completed"),
+        app_server.wait_for_json_log_event(
+            "codex.app_server.otel_reloaded",
+            Duration::from_secs(/*secs*/ 10),
+        ),
     )
     .await??;
-    let _: ThreadStartResponse = server
-        .request_with_trace(
-            |request_id| ClientRequest::ThreadStart {
-                request_id,
-                params: ThreadStartParams::default(),
-            },
-            Some(W3cTraceContext {
-                traceparent: Some("invalid-carrier".into()),
-                tracestate: None,
-            }),
-        )
+    app_server
+        .start_thread(ThreadStartParams::default())
         .await?;
-    assert!(
-        timeout(TEST_TIMEOUT, server.shutdown_gracefully())
-            .await??
-            .success()
-    );
 
-    let mut spans = Vec::new();
-    for request in collector
+    let status = timeout(TEST_TIMEOUT, app_server.shutdown_gracefully()).await??;
+    assert!(status.success(), "app-server did not shut down cleanly");
+
+    let requests = collector
         .received_requests()
         .await
-        .context("collector requests")?
-    {
-        if request.url.path() != "/trace-test/traces" {
-            continue;
-        }
-        let body: serde_json::Value = serde_json::from_slice(&request.body)?;
-        for resource in body["resourceSpans"].as_array().context("resource spans")? {
-            for scope in resource["scopeSpans"].as_array().context("scope spans")? {
-                spans.extend(scope["spans"].as_array().context("spans")?.iter().cloned());
-            }
-        }
-    }
-    for (name, trace) in [
-        ("thread/start", start_trace),
-        ("thread_spawn", start_trace),
-        ("turn/start", turn_trace),
-        ("op.dispatch.turn_input", turn_trace),
-    ] {
-        assert!(
-            spans
-                .iter()
-                .any(|span| span["name"] == name && span["traceId"] == trace),
-            "missing actual {name} span with explicit parent trace {trace}"
-        );
-    }
-    let request_spans = spans
-        .iter()
-        .filter(|span| span["name"] == "thread/start")
-        .collect::<Vec<_>>();
-    assert_eq!(request_spans.len(), 2);
-    let invalid = request_spans
-        .iter()
-        .find(|span| span["traceId"] != start_trace)
-        .context("invalid-carrier request span")?;
-    assert_ne!(
-        invalid["traceId"], PARENT_TRACE_ID,
-        "invalid explicit input must not fall back to env parent"
+        .context("collector did not record requests")?;
+    let exported = |path: &str| {
+        requests
+            .iter()
+            .filter(|request| request.url.path() == path)
+            .map(|request| String::from_utf8_lossy(&request.body).into_owned())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let initial_traces = exported("/initial/traces");
+    let next_traces = exported("/next/traces");
+
+    assert!(
+        initial_traces.is_empty(),
+        "traces were exported before tracing was configured: {initial_traces}"
     );
-    assert_eq!(invalid["parentSpanId"], "");
+    assert!(
+        next_traces.contains(PARENT_TRACE_ID),
+        "the requirements-managed trace exporter did not start after account switch: {next_traces}"
+    );
+
     Ok(())
 }
 
-fn write_otel_config(codex_home: &Path, collector_endpoint: &str) -> Result<()> {
+fn write_otel_config(
+    codex_home: &Path,
+    collector_endpoint: &str,
+    trace_exporter_setting: TraceExporterSetting,
+) -> Result<()> {
+    let trace_exporter = match trace_exporter_setting {
+        TraceExporterSetting::Disabled => String::new(),
+        TraceExporterSetting::Collector => format!(
+            r#"trace_exporter = {{ otlp-http = {{ endpoint = "{collector_endpoint}/traces", protocol = "json" }} }}"#
+        ),
+    };
     std::fs::write(
         codex_home.join("config.toml"),
         format!(
@@ -315,13 +327,35 @@ base_url = "http://127.0.0.1:1/v1"
 wire_api = "responses"
 
 [analytics]
-enabled = true
+enabled = false
 
 [otel]
 environment = "test"
-exporter = {{ otlp-http = {{ endpoint = "{collector_endpoint}/logs", protocol = "json" }} }}
-trace_exporter = {{ otlp-http = {{ endpoint = "{collector_endpoint}/traces", protocol = "json" }} }}
+exporter = {{ otlp-http = {{ endpoint = "{collector_endpoint}/logs", protocol = "json", headers = {{ x-collector-key = "test-collector-key" }} }} }}
+{trace_exporter}
 metrics_exporter = {{ otlp-http = {{ endpoint = "{collector_endpoint}/metrics", protocol = "json" }} }}
+"#
+        ),
+    )?;
+    Ok(())
+}
+
+fn write_trace_requirements(
+    codex_home: &Path,
+    collector_endpoint: &str,
+    trace_exporter_setting: TraceExporterSetting,
+) -> Result<()> {
+    let trace_exporter = match trace_exporter_setting {
+        TraceExporterSetting::Disabled => "trace_exporter = \"none\"".to_string(),
+        TraceExporterSetting::Collector => format!(
+            r#"trace_exporter = {{ otlp-http = {{ endpoint = "{collector_endpoint}/traces", protocol = "json" }} }}"#
+        ),
+    };
+    std::fs::write(
+        codex_home.join("requirements.toml"),
+        format!(
+            r#"[otel]
+{trace_exporter}
 "#
         ),
     )?;

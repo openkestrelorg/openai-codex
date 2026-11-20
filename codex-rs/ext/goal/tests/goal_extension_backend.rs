@@ -28,12 +28,14 @@ use codex_extension_api::ToolPayload;
 use codex_extension_api::TurnAbortInput;
 use codex_extension_api::TurnCommittedInput;
 use codex_extension_api::TurnErrorInput;
+use codex_extension_api::TurnPreparationOwner;
 use codex_extension_api::TurnStartInput;
 use codex_extension_api::TurnStopInput;
 use codex_goal_extension::GoalExtensionConfig;
 use codex_goal_extension::GoalObjectiveUpdate;
 use codex_goal_extension::GoalRuntimeHandle;
 use codex_goal_extension::GoalService;
+use codex_goal_extension::GoalServiceError;
 use codex_goal_extension::GoalSetRequest;
 use codex_goal_extension::GoalTokenBudgetUpdate;
 use codex_goal_extension::install_with_backend;
@@ -41,7 +43,7 @@ use codex_protocol::ThreadId;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::Settings;
-use codex_protocol::protocol::CodexErrorInfo;
+use codex_protocol::error::CodexErr;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::SessionSource;
@@ -258,167 +260,6 @@ async fn installed_goal_tools_only_replace_complete_goal() -> anyhow::Result<()>
     assert_eq!(json!("replacement goal"), result["goal"]["objective"]);
     assert_eq!(json!("active"), result["goal"]["status"]);
     assert_eq!(json!(0), result["goal"]["tokensUsed"]);
-    Ok(())
-}
-
-#[tokio::test]
-async fn fork_goal_deferral_survives_preparation_until_stop_or_abort() -> anyhow::Result<()> {
-    for abort_reason in [None, Some(TurnAbortReason::Interrupted)] {
-        let runtime = test_runtime().await?;
-        let thread_id = test_thread_id()?;
-        seed_thread_metadata(runtime.as_ref(), thread_id).await?;
-        let goal = runtime
-            .thread_goals()
-            .replace_thread_goal(
-                thread_id,
-                "inherited goal",
-                codex_state::ThreadGoalStatus::Active,
-                /*token_budget*/ None,
-            )
-            .await?;
-        runtime
-            .thread_goals()
-            .replace_thread_goal_snapshot(&goal)
-            .await?;
-        let harness = GoalExtensionHarness::new(runtime.clone(), thread_id).await?;
-
-        // These callbacks run before installation. Abandoning preparation
-        // emits no terminal callback and must leave the durable marker intact.
-        harness
-            .prepare_turn("abandoned", ModeKind::Default, &TokenUsage::default())
-            .await;
-        harness.resume_thread().await;
-        assert!(
-            runtime
-                .thread_goals()
-                .has_thread_goal_continuation_deferral(thread_id)
-                .await?
-        );
-
-        harness
-            .start_turn("installed", &TokenUsage::default())
-            .await;
-        assert!(
-            runtime
-                .thread_goals()
-                .has_thread_goal_continuation_deferral(thread_id)
-                .await?
-        );
-        if let Some(reason) = abort_reason {
-            let turn_store = harness.turn_store("installed");
-            for contributor in harness.registry.turn_lifecycle_contributors() {
-                contributor
-                    .on_turn_abort(TurnAbortInput {
-                        reason: reason.clone(),
-                        session_store: &harness.session_store,
-                        thread_store: &harness.thread_store,
-                        turn_store: &turn_store,
-                    })
-                    .await;
-            }
-        } else {
-            harness.stop_turn("installed").await;
-        }
-        assert!(
-            !runtime
-                .thread_goals()
-                .has_thread_goal_continuation_deferral(thread_id)
-                .await?
-        );
-    }
-    Ok(())
-}
-
-#[tokio::test]
-async fn staged_goal_preparation_respects_persisted_set_before_runtime_effects_and_clear()
--> anyhow::Result<()> {
-    for status in [
-        ThreadGoalStatus::Active,
-        ThreadGoalStatus::Paused,
-        ThreadGoalStatus::BudgetLimited,
-    ] {
-        let runtime = test_runtime().await?;
-        let thread_id = test_thread_id()?;
-        seed_thread_metadata(runtime.as_ref(), thread_id).await?;
-        runtime
-            .thread_goals()
-            .replace_thread_goal(
-                thread_id,
-                "cached goal",
-                codex_state::ThreadGoalStatus::Active,
-                /*token_budget*/ None,
-            )
-            .await?;
-        let harness = GoalExtensionHarness::new(Arc::clone(&runtime), thread_id).await?;
-        let staged = harness
-            .prepare_turn("accepted", ModeKind::Default, &TokenUsage::default())
-            .await;
-        let outcome = harness
-            .goal_service
-            .set_thread_goal(
-                runtime.as_ref(),
-                GoalSetRequest {
-                    thread_id,
-                    objective: GoalObjectiveUpdate::Keep,
-                    status: Some(status),
-                    token_budget: GoalTokenBudgetUpdate::Keep,
-                    max_goal_token_budget: None,
-                },
-            )
-            .await?;
-        // Deliberately commit before the separate runtime-effects phase.
-        harness.commit_turn(&staged);
-        harness
-            .record_token_usage("accepted", &input_token_usage(23))
-            .await;
-        harness
-            .runtime_handle()
-            .prepare_external_goal_mutation()
-            .await
-            .map_err(anyhow::Error::msg)?;
-        let goal = runtime
-            .thread_goals()
-            .get_thread_goal(thread_id)
-            .await?
-            .expect("goal exists");
-        assert_eq!(
-            if matches!(
-                status,
-                ThreadGoalStatus::Active | ThreadGoalStatus::BudgetLimited
-            ) {
-                23
-            } else {
-                0
-            },
-            goal.tokens_used
-        );
-        outcome.apply_runtime_effects(&harness.goal_service).await;
-        let staged = harness
-            .prepare_turn("cleared", ModeKind::Default, &TokenUsage::default())
-            .await;
-        assert!(
-            harness
-                .goal_service
-                .clear_thread_goal(runtime.as_ref(), thread_id)
-                .await?
-        );
-        harness.commit_turn(&staged);
-        harness
-            .record_token_usage("cleared", &input_token_usage(30))
-            .await;
-        harness
-            .runtime_handle()
-            .prepare_external_goal_mutation()
-            .await
-            .map_err(anyhow::Error::msg)?;
-        assert!(
-            runtime
-                .thread_goals()
-                .get_thread_goal(thread_id)
-                .await?
-                .is_none()
-        );
-    }
     Ok(())
 }
 
@@ -952,7 +793,7 @@ async fn turn_error_usage_limit_accounts_progress_and_clears_accounting() -> any
         )
         .await;
     harness
-        .notify_turn_error("turn-1", CodexErrorInfo::UsageLimitExceeded)
+        .notify_turn_error("turn-1", CodexErr::UsageNotIncluded)
         .await;
 
     let goal = runtime
@@ -1023,7 +864,7 @@ async fn turn_error_blocks_goal() -> anyhow::Result<()> {
         .await?;
 
     harness
-        .notify_turn_error("turn-1", CodexErrorInfo::Other)
+        .notify_turn_error("turn-1", CodexErr::Fatal("test error".to_string()))
         .await;
 
     let goal = runtime
@@ -1508,6 +1349,7 @@ async fn goal_service_external_set_active_preserves_concurrent_usage() -> anyhow
                 token_budget: GoalTokenBudgetUpdate::Keep,
                 max_goal_token_budget: None,
             },
+            std::future::ready(Ok(())),
         )
         .await?;
     harness
@@ -1524,7 +1366,9 @@ async fn goal_service_external_set_active_preserves_concurrent_usage() -> anyhow
     child
         .record_token_usage_with_last("child-turn", &child_usage, &child_usage)
         .await;
-    outcome.apply_runtime_effects(&harness.goal_service).await;
+    outcome
+        .apply_runtime_effects(&harness.goal_service, Ok(None))
+        .await;
 
     harness
         .record_token_usage(
@@ -1582,7 +1426,7 @@ async fn thread_stop_unregisters_goal_runtime_from_service() -> anyhow::Result<(
     assert!(
         harness
             .goal_service
-            .clear_thread_goal(runtime.as_ref(), thread_id)
+            .clear_thread_goal(runtime.as_ref(), thread_id, std::future::ready(Ok(())))
             .await?
     );
     assert_eq!(Vec::<CapturedGoalEvent>::new(), harness.sink.goal_events());
@@ -1591,6 +1435,21 @@ async fn thread_stop_unregisters_goal_runtime_from_service() -> anyhow::Result<(
 
 #[tokio::test]
 async fn thread_resume_rehydrates_active_goal_idle_accounting() -> anyhow::Result<()> {
+    check_resume_accounting(Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped)).await
+}
+
+#[tokio::test]
+async fn thread_resume_refused_account_work_preserves_local_goal_accounting() -> anyhow::Result<()>
+{
+    check_resume_accounting(Err(codex_protocol::mcp_work::McpAttemptRefused)).await
+}
+
+async fn check_resume_accounting(
+    access: Result<
+        codex_protocol::mcp_work::McpAttemptAccess<'_>,
+        codex_protocol::mcp_work::McpAttemptRefused,
+    >,
+) -> anyhow::Result<()> {
     let runtime = test_runtime().await?;
     let thread_id = test_thread_id()?;
     seed_thread_metadata(runtime.as_ref(), thread_id).await?;
@@ -1605,7 +1464,7 @@ async fn thread_resume_rehydrates_active_goal_idle_accounting() -> anyhow::Resul
         .await?;
     let harness = GoalExtensionHarness::new(runtime.clone(), thread_id).await?;
 
-    harness.resume_thread().await;
+    harness.resume_thread_with_access(access).await;
     let child = harness.spawn_child(ThreadId::new()).await?;
     child.start_turn("child-turn", &TokenUsage::default()).await;
     let usage = input_token_usage(/*input_tokens*/ 23);
@@ -1649,17 +1508,28 @@ async fn goal_service_sets_gets_and_clears_thread_goal() -> anyhow::Result<()> {
     seed_thread_metadata(runtime.as_ref(), thread_id).await?;
     let api = GoalService::new();
 
-    let set = api
+    let request = GoalSetRequest {
+        thread_id,
+        objective: GoalObjectiveUpdate::Set(" ship goal API ownership "),
+        status: None,
+        token_budget: GoalTokenBudgetUpdate::Set(Some(123)),
+        max_goal_token_budget: None,
+    };
+    let failure = GoalServiceError::Internal("instruction recording failed".to_owned());
+    let result = api
         .set_thread_goal(
             runtime.as_ref(),
-            GoalSetRequest {
-                thread_id,
-                objective: GoalObjectiveUpdate::Set(" ship goal API ownership "),
-                status: None,
-                token_budget: GoalTokenBudgetUpdate::Set(Some(123)),
-                max_goal_token_budget: None,
-            },
+            request,
+            std::future::ready(Err(failure.clone())),
         )
+        .await;
+    assert_eq!(result.unwrap_err(), failure);
+    assert_eq!(
+        api.get_thread_goal(runtime.as_ref(), thread_id).await?,
+        None
+    );
+    let set = api
+        .set_thread_goal(runtime.as_ref(), request, std::future::ready(Ok(())))
         .await?;
     let get = api
         .get_thread_goal(runtime.as_ref(), thread_id)
@@ -1676,12 +1546,32 @@ async fn goal_service_sets_gets_and_clears_thread_goal() -> anyhow::Result<()> {
     assert_eq!(Some(123), get.token_budget);
     assert_eq!(Some("ship goal API ownership"), metadata.preview.as_deref());
 
-    assert!(api.clear_thread_goal(runtime.as_ref(), thread_id).await?);
+    assert_eq!(
+        api.clear_thread_goal(
+            runtime.as_ref(),
+            thread_id,
+            std::future::ready(Err(failure.clone()))
+        )
+        .await,
+        Err(failure),
+    );
+    assert_eq!(
+        api.get_thread_goal(runtime.as_ref(), thread_id).await?,
+        Some(get)
+    );
+
+    assert!(
+        api.clear_thread_goal(runtime.as_ref(), thread_id, std::future::ready(Ok(())))
+            .await?
+    );
     assert_eq!(
         None,
         api.get_thread_goal(runtime.as_ref(), thread_id).await?
     );
-    assert!(!api.clear_thread_goal(runtime.as_ref(), thread_id).await?);
+    assert!(
+        !api.clear_thread_goal(runtime.as_ref(), thread_id, std::future::ready(Ok(())))
+            .await?
+    );
     Ok(())
 }
 
@@ -1703,6 +1593,7 @@ async fn goal_service_enforces_maximum_token_budget_on_creation_and_updates() ->
                 token_budget: GoalTokenBudgetUpdate::Keep,
                 max_goal_token_budget: Some(100),
             },
+            std::future::ready(Ok(())),
         )
         .await?;
     assert_eq!(goal.goal.token_budget, Some(100));
@@ -1717,6 +1608,7 @@ async fn goal_service_enforces_maximum_token_budget_on_creation_and_updates() ->
                 token_budget: GoalTokenBudgetUpdate::Set(Some(101)),
                 max_goal_token_budget: Some(100),
             },
+            std::future::ready(Ok(())),
         )
         .await
         .expect_err("goal budget above the configured maximum should fail");
@@ -1743,6 +1635,7 @@ async fn goal_service_enforces_maximum_token_budget_on_creation_and_updates() ->
                 token_budget: GoalTokenBudgetUpdate::Set(Some(99)),
                 max_goal_token_budget: Some(100),
             },
+            std::future::ready(Ok(())),
         )
         .await?;
     assert_eq!(goal.goal.token_budget, Some(99));
@@ -1757,6 +1650,7 @@ async fn goal_service_enforces_maximum_token_budget_on_creation_and_updates() ->
                 token_budget: GoalTokenBudgetUpdate::Set(None),
                 max_goal_token_budget: Some(100),
             },
+            std::future::ready(Ok(())),
         )
         .await?;
     assert_eq!(goal.goal.token_budget, Some(100));
@@ -1802,6 +1696,7 @@ async fn installed_tools_with_start(
     for contributor in registry.thread_lifecycle_contributors() {
         contributor
             .on_thread_start(ThreadStartInput {
+                mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
                 config: &(),
                 session_source: &session_source,
                 persistent_thread_state_available,
@@ -1823,6 +1718,11 @@ async fn installed_tools_with_start(
 
 fn tool_names(tools: &[Arc<dyn for<'call> ToolExecutor<ToolCall<'call>>>]) -> Vec<String> {
     tools.iter().map(|tool| tool.tool_name().name).collect()
+}
+
+struct PreparedTurn {
+    store: Arc<ExtensionData>,
+    owner: Mutex<Option<TurnPreparationOwner>>,
 }
 
 struct GoalExtensionHarness {
@@ -1861,6 +1761,7 @@ impl GoalExtensionHarness {
         for contributor in registry.thread_lifecycle_contributors() {
             contributor
                 .on_thread_start(ThreadStartInput {
+                    mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
                     config: &(),
                     session_source: &session_source,
                     persistent_thread_state_available: true,
@@ -1905,6 +1806,7 @@ impl GoalExtensionHarness {
         for contributor in self.registry.thread_lifecycle_contributors() {
             contributor
                 .on_thread_start(ThreadStartInput {
+                    mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
                     config: &(),
                     session_source: &session_source,
                     persistent_thread_state_available: true,
@@ -1940,8 +1842,8 @@ impl GoalExtensionHarness {
     }
 
     async fn start_turn_with_mode(&self, turn_id: &str, mode: ModeKind, usage: &TokenUsage) {
-        let turn_store = self.prepare_turn(turn_id, mode, usage).await;
-        self.commit_turn(&turn_store);
+        let prepared = self.prepare_turn(turn_id, mode, usage).await;
+        self.commit_turn(&prepared);
     }
 
     async fn prepare_turn(
@@ -1949,8 +1851,10 @@ impl GoalExtensionHarness {
         turn_id: &str,
         mode: ModeKind,
         usage: &TokenUsage,
-    ) -> Arc<ExtensionData> {
+    ) -> PreparedTurn {
+        let owner = TurnPreparationOwner::new(turn_id);
         let turn_store = Arc::new(ExtensionData::new(turn_id));
+        turn_store.insert(owner.access());
         self.turn_stores
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -1970,18 +1874,28 @@ impl GoalExtensionHarness {
                 })
                 .await;
         }
-        turn_store
+        PreparedTurn {
+            store: turn_store,
+            owner: Mutex::new(Some(owner)),
+        }
     }
 
-    fn commit_turn(&self, turn_store: &ExtensionData) {
+    fn commit_turn(&self, prepared: &PreparedTurn) {
         for contributor in self.registry.turn_lifecycle_contributors() {
             contributor.on_turn_committed(TurnCommittedInput {
-                turn_id: turn_store.level_id(),
+                turn_id: prepared.store.level_id(),
                 session_store: &self.session_store,
                 thread_store: &self.thread_store,
-                turn_store,
+                turn_store: &prepared.store,
             });
         }
+        drop(
+            prepared
+                .owner
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take(),
+        );
     }
 
     fn turn_store(&self, turn_id: &str) -> Arc<ExtensionData> {
@@ -2020,6 +1934,7 @@ impl GoalExtensionHarness {
         let turn_store = self.turn_store(turn_id);
         let token_usage = TokenUsageInfo {
             total_token_usage: usage.clone(),
+            last_usage_includes_reasoning: None,
             last_token_usage: last_usage.clone(),
             model_context_window: None,
         };
@@ -2036,9 +1951,21 @@ impl GoalExtensionHarness {
     }
 
     async fn resume_thread(&self) {
+        self.resume_thread_with_access(Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped))
+            .await;
+    }
+
+    async fn resume_thread_with_access(
+        &self,
+        access: Result<
+            codex_protocol::mcp_work::McpAttemptAccess<'_>,
+            codex_protocol::mcp_work::McpAttemptRefused,
+        >,
+    ) {
         for contributor in self.registry.thread_lifecycle_contributors() {
             contributor
                 .on_thread_resume(ThreadResumeInput {
+                    mcp_access: access,
                     session_store: &self.session_store,
                     thread_store: &self.thread_store,
                 })
@@ -2092,13 +2019,14 @@ impl GoalExtensionHarness {
         }
     }
 
-    async fn notify_turn_error(&self, turn_id: &str, error: CodexErrorInfo) {
+    async fn notify_turn_error(&self, turn_id: &str, error: CodexErr) {
         let turn_store = self.turn_store(turn_id);
         for contributor in self.registry.turn_lifecycle_contributors() {
             contributor
                 .on_turn_error(TurnErrorInput {
                     turn_id,
-                    error: error.clone(),
+                    error: error.to_codex_protocol_error(),
+                    error_details: error.details(),
                     session_store: &self.session_store,
                     thread_store: &self.thread_store,
                     turn_store: &turn_store,
@@ -2126,6 +2054,7 @@ fn tool_by_name<'a>(
 
 fn tool_call(tool_name: &str, call_id: &str, arguments: serde_json::Value) -> ToolCall<'static> {
     ToolCall {
+        mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
         turn_id: "turn-1".to_string(),
         call_id: call_id.to_string(),
         tool_name: codex_extension_api::ToolName::plain(tool_name),
@@ -2135,7 +2064,8 @@ fn tool_call(tool_name: &str, call_id: &str, arguments: serde_json::Value) -> To
         source: ToolCallSource::Direct,
         conversation_history: codex_extension_api::ConversationHistory::default(),
         turn_item_emitter: Arc::new(NoopTurnItemEmitter),
-        mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
+        attachment_store: codex_core::passthrough_image_store(),
+        ephemeral: false,
         environments: Vec::new(),
         payload: ToolPayload::Function {
             arguments: arguments.to_string(),
@@ -2266,4 +2196,538 @@ fn protocol_status(status: codex_state::ThreadGoalStatus) -> ThreadGoalStatus {
         codex_state::ThreadGoalStatus::BudgetLimited => ThreadGoalStatus::BudgetLimited,
         codex_state::ThreadGoalStatus::Complete => ThreadGoalStatus::Complete,
     }
+}
+
+#[tokio::test]
+async fn fork_goal_deferral_survives_preparation_until_stop_or_abort() -> anyhow::Result<()> {
+    for abort_reason in [None, Some(TurnAbortReason::Interrupted)] {
+        let runtime = test_runtime().await?;
+        let thread_id = test_thread_id()?;
+        seed_thread_metadata(runtime.as_ref(), thread_id).await?;
+        let goal = runtime
+            .thread_goals()
+            .replace_thread_goal(
+                thread_id,
+                "inherited goal",
+                codex_state::ThreadGoalStatus::Active,
+                /*token_budget*/ None,
+            )
+            .await?;
+        runtime
+            .thread_goals()
+            .replace_thread_goal_snapshot(&goal)
+            .await?;
+        let harness = GoalExtensionHarness::new(runtime.clone(), thread_id).await?;
+
+        // These callbacks run before installation. Abandoning preparation
+        // emits no terminal callback and must leave the durable marker intact.
+        harness
+            .prepare_turn("abandoned", ModeKind::Default, &TokenUsage::default())
+            .await;
+        harness.resume_thread().await;
+        assert!(
+            runtime
+                .thread_goals()
+                .has_thread_goal_continuation_deferral(thread_id)
+                .await?
+        );
+
+        harness
+            .start_turn("installed", &TokenUsage::default())
+            .await;
+        assert!(
+            runtime
+                .thread_goals()
+                .has_thread_goal_continuation_deferral(thread_id)
+                .await?
+        );
+        if let Some(reason) = abort_reason {
+            let turn_store = harness.turn_store("installed");
+            for contributor in harness.registry.turn_lifecycle_contributors() {
+                contributor
+                    .on_turn_abort(TurnAbortInput {
+                        reason: reason.clone(),
+                        session_store: &harness.session_store,
+                        thread_store: &harness.thread_store,
+                        turn_store: &turn_store,
+                    })
+                    .await;
+            }
+        } else {
+            harness.stop_turn("installed").await;
+        }
+        assert!(
+            !runtime
+                .thread_goals()
+                .has_thread_goal_continuation_deferral(thread_id)
+                .await?
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn staged_goal_preparation_respects_persisted_set_before_runtime_effects_and_clear()
+-> anyhow::Result<()> {
+    for status in [
+        ThreadGoalStatus::Active,
+        ThreadGoalStatus::Paused,
+        ThreadGoalStatus::BudgetLimited,
+    ] {
+        let runtime = test_runtime().await?;
+        let thread_id = test_thread_id()?;
+        seed_thread_metadata(runtime.as_ref(), thread_id).await?;
+        runtime
+            .thread_goals()
+            .replace_thread_goal(
+                thread_id,
+                "cached goal",
+                codex_state::ThreadGoalStatus::Active,
+                /*token_budget*/ None,
+            )
+            .await?;
+        let harness = GoalExtensionHarness::new(Arc::clone(&runtime), thread_id).await?;
+        let staged = harness
+            .prepare_turn("accepted", ModeKind::Default, &TokenUsage::default())
+            .await;
+        let outcome = harness
+            .goal_service
+            .set_thread_goal(
+                runtime.as_ref(),
+                GoalSetRequest {
+                    thread_id,
+                    objective: GoalObjectiveUpdate::Keep,
+                    status: Some(status),
+                    token_budget: GoalTokenBudgetUpdate::Keep,
+                    max_goal_token_budget: None,
+                },
+                std::future::ready(Ok(())),
+            )
+            .await?;
+        // Deliberately commit before the separate runtime-effects phase.
+        harness.commit_turn(&staged);
+        harness
+            .record_token_usage("accepted", &input_token_usage(23))
+            .await;
+        harness
+            .runtime_handle()
+            .prepare_external_goal_mutation()
+            .await
+            .map_err(anyhow::Error::msg)?;
+        let goal = runtime
+            .thread_goals()
+            .get_thread_goal(thread_id)
+            .await?
+            .expect("goal exists");
+        assert_eq!(
+            if matches!(
+                status,
+                ThreadGoalStatus::Active | ThreadGoalStatus::BudgetLimited
+            ) {
+                23
+            } else {
+                0
+            },
+            goal.tokens_used
+        );
+        outcome
+            .apply_runtime_effects(&harness.goal_service, Ok(None))
+            .await;
+        let staged = harness
+            .prepare_turn("cleared", ModeKind::Default, &TokenUsage::default())
+            .await;
+        assert!(
+            harness
+                .goal_service
+                .clear_thread_goal(runtime.as_ref(), thread_id, std::future::ready(Ok(())))
+                .await?
+        );
+        harness.commit_turn(&staged);
+        harness
+            .record_token_usage("cleared", &input_token_usage(30))
+            .await;
+        harness
+            .runtime_handle()
+            .prepare_external_goal_mutation()
+            .await
+            .map_err(anyhow::Error::msg)?;
+        assert!(
+            runtime
+                .thread_goals()
+                .get_thread_goal(thread_id)
+                .await?
+                .is_none()
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn actual_goal_preparation_permit_releases_on_drop_and_commit_with_retained_store()
+-> anyhow::Result<()> {
+    let runtime = test_runtime().await?;
+    let thread_id = test_thread_id()?;
+    seed_thread_metadata(runtime.as_ref(), thread_id).await?;
+    let harness = GoalExtensionHarness::new(runtime, thread_id).await?;
+    let abandoned = harness
+        .prepare_turn("abandoned", ModeKind::Default, &TokenUsage::default())
+        .await;
+    let retained = Arc::clone(&abandoned.store);
+    let baseline = TokenUsage::default();
+    let mut next = Box::pin(harness.prepare_turn("accepted", ModeKind::Default, &baseline));
+    tokio::select! {
+        _ = &mut next => panic!("a competing actual Goal preparation overtook the retained permit"),
+        _ = tokio::time::sleep(Duration::from_millis(30)) => {}
+    }
+    drop(abandoned);
+    let accepted = tokio::time::timeout(Duration::from_secs(5), next).await?;
+    assert_eq!("abandoned", retained.level_id());
+    harness.commit_turn(&accepted);
+    // A retained committed preparation also cannot retain the permit.
+    let following = tokio::time::timeout(
+        Duration::from_secs(5),
+        harness.prepare_turn("following", ModeKind::Default, &baseline),
+    )
+    .await?;
+    drop(following);
+    Ok(())
+}
+
+#[tokio::test]
+async fn retained_goal_snapshot_cannot_commit_through_a_new_preparation_with_the_same_id()
+-> anyhow::Result<()> {
+    let runtime = test_runtime().await?;
+    let thread_id = test_thread_id()?;
+    seed_thread_metadata(runtime.as_ref(), thread_id).await?;
+    runtime
+        .thread_goals()
+        .replace_thread_goal(
+            thread_id,
+            "goal",
+            codex_state::ThreadGoalStatus::Active,
+            None,
+        )
+        .await?;
+    let harness = GoalExtensionHarness::new(Arc::clone(&runtime), thread_id).await?;
+    let abandoned = harness
+        .prepare_turn("reused", ModeKind::Default, &TokenUsage::default())
+        .await;
+    let retained = Arc::clone(&abandoned.store);
+    drop(abandoned);
+    let different = TurnPreparationOwner::new("reused");
+    retained.insert(different.access());
+    for contributor in harness.registry.turn_lifecycle_contributors() {
+        contributor.on_turn_committed(TurnCommittedInput {
+            turn_id: "reused",
+            session_store: &harness.session_store,
+            thread_store: &harness.thread_store,
+            turn_store: &retained,
+        });
+    }
+    harness
+        .record_token_usage("reused", &input_token_usage(41))
+        .await;
+    harness
+        .runtime_handle()
+        .prepare_external_goal_mutation()
+        .await
+        .map_err(anyhow::Error::msg)?;
+    assert_eq!(
+        0,
+        runtime
+            .thread_goals()
+            .get_thread_goal(thread_id)
+            .await?
+            .expect("goal")
+            .tokens_used
+    );
+    drop(different);
+    let accepted = harness
+        .prepare_turn("reused", ModeKind::Default, &TokenUsage::default())
+        .await;
+    harness.commit_turn(&accepted);
+    harness
+        .record_token_usage("reused", &input_token_usage(9))
+        .await;
+    harness
+        .runtime_handle()
+        .prepare_external_goal_mutation()
+        .await
+        .map_err(anyhow::Error::msg)?;
+    assert_eq!(
+        9,
+        runtime
+            .thread_goals()
+            .get_thread_goal(thread_id)
+            .await?
+            .expect("goal")
+            .tokens_used
+    );
+    Ok(())
+}
+
+#[derive(Debug)]
+struct GoalIdleWork {
+    live: Arc<std::sync::atomic::AtomicUsize>,
+    derives: Arc<std::sync::atomic::AtomicUsize>,
+    refuse: bool,
+}
+impl Drop for GoalIdleWork {
+    fn drop(&mut self) {
+        self.live.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+impl codex_extension_api::HostOperationWork for GoalIdleWork {
+    fn derive_operation(
+        &self,
+    ) -> Result<Box<dyn codex_extension_api::HostOperationWork>, codex_extension_api::TurnWorkRefused>
+    {
+        self.derives
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.refuse {
+            return Err(codex_extension_api::TurnWorkRefused::Unavailable);
+        }
+        self.live.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(Box::new(Self {
+            live: self.live.clone(),
+            derives: self.derives.clone(),
+            refuse: false,
+        }))
+    }
+    fn derive_turn_work(
+        &self,
+        _: &ExtensionData,
+        _: codex_extension_api::ExtensionFuture<'static, ()>,
+    ) -> Result<
+        Box<dyn codex_protocol::host_turn_work::HostTurnWork>,
+        codex_extension_api::TurnWorkRefused,
+    > {
+        panic!("this backend fixture has no loaded manager")
+    }
+}
+impl GoalExtensionHarness {
+    async fn idle_with_work(
+        &self,
+        account_work: Result<
+            Option<&dyn codex_extension_api::HostOperationWork>,
+            codex_protocol::mcp_work::McpAttemptRefused,
+        >,
+    ) {
+        for contributor in self.registry.thread_lifecycle_contributors() {
+            contributor
+                .on_thread_idle(codex_extension_api::ThreadIdleInput {
+                    account_work,
+                    cause: codex_extension_api::ThreadIdleCause::Completed,
+                    session_store: &self.session_store,
+                    thread_store: &self.thread_store,
+                })
+                .await;
+        }
+    }
+}
+#[tokio::test]
+async fn refused_or_exhausted_idle_goal_work_does_not_wait_for_preparation_or_mutate_goal()
+-> anyhow::Result<()> {
+    let runtime = test_runtime().await?;
+    let thread_id = test_thread_id()?;
+    seed_thread_metadata(runtime.as_ref(), thread_id).await?;
+    let goal = runtime
+        .thread_goals()
+        .replace_thread_goal(
+            thread_id,
+            "retain active goal",
+            codex_state::ThreadGoalStatus::Active,
+            None,
+        )
+        .await?;
+    let harness = GoalExtensionHarness::new(runtime.clone(), thread_id).await?;
+    let prepared = harness
+        .prepare_turn(
+            "held-preparation",
+            ModeKind::Default,
+            &TokenUsage::default(),
+        )
+        .await;
+    let work = GoalIdleWork {
+        live: Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+        derives: Default::default(),
+        refuse: true,
+    };
+    for access in [
+        Err(codex_protocol::mcp_work::McpAttemptRefused),
+        Ok(Some(&work as &dyn codex_extension_api::HostOperationWork)),
+    ] {
+        let mut idle = Box::pin(harness.idle_with_work(access));
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(
+                std::future::Future::poll(idle.as_mut(), cx).is_ready()
+            ))
+            .await,
+            "refused account work must not enter Goal continuation's held preparation permit"
+        );
+    }
+    assert_eq!(work.derives.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(work.live.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let current = runtime
+        .thread_goals()
+        .get_thread_goal(thread_id)
+        .await?
+        .unwrap();
+    assert_eq!(current.goal_id, goal.goal_id);
+    assert_eq!(current.status, codex_state::ThreadGoalStatus::Active);
+    assert_eq!(current.tokens_used, goal.tokens_used);
+    assert!(harness.sink.goal_events().is_empty());
+    drop(prepared);
+    Ok(())
+}
+#[tokio::test]
+async fn idle_goal_work_is_derived_before_preparation_wait_and_released_on_cancellation()
+-> anyhow::Result<()> {
+    let runtime = test_runtime().await?;
+    let thread_id = test_thread_id()?;
+    seed_thread_metadata(runtime.as_ref(), thread_id).await?;
+    runtime
+        .thread_goals()
+        .replace_thread_goal(
+            thread_id,
+            "held goal continuation",
+            codex_state::ThreadGoalStatus::Active,
+            None,
+        )
+        .await?;
+    let harness = GoalExtensionHarness::new(runtime, thread_id).await?;
+    let prepared = harness
+        .prepare_turn(
+            "held-preparation",
+            ModeKind::Default,
+            &TokenUsage::default(),
+        )
+        .await;
+    let work = GoalIdleWork {
+        live: Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+        derives: Default::default(),
+        refuse: false,
+    };
+    let live = work.live.clone();
+    let mut idle = Box::pin(harness.idle_with_work(Ok(Some(&work))));
+    assert!(
+        std::future::poll_fn(|cx| std::task::Poll::Ready(
+            std::future::Future::poll(idle.as_mut(), cx).is_pending()
+        ))
+        .await
+    );
+    assert_eq!(work.derives.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(live.load(std::sync::atomic::Ordering::SeqCst), 2);
+    drop(idle);
+    assert_eq!(live.load(std::sync::atomic::Ordering::SeqCst), 1);
+    drop(prepared);
+    harness.idle_with_work(Ok(Some(&work))).await;
+    assert_eq!(work.derives.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(live.load(std::sync::atomic::Ordering::SeqCst), 1);
+    drop(work);
+    assert_eq!(live.load(std::sync::atomic::Ordering::SeqCst), 0);
+    Ok(())
+}
+
+async fn external_effect_fixture() -> anyhow::Result<(
+    Arc<codex_state::StateRuntime>,
+    GoalExtensionHarness,
+    codex_goal_extension::GoalSetOutcome,
+)> {
+    let runtime = test_runtime().await?;
+    let thread_id = test_thread_id()?;
+    seed_thread_metadata(runtime.as_ref(), thread_id).await?;
+    let harness = GoalExtensionHarness::new(runtime.clone(), thread_id).await?;
+    let outcome = harness
+        .goal_service
+        .set_thread_goal(
+            runtime.as_ref(),
+            GoalSetRequest {
+                thread_id,
+                objective: GoalObjectiveUpdate::Set("retained external request"),
+                status: Some(ThreadGoalStatus::Active),
+                token_budget: GoalTokenBudgetUpdate::Keep,
+                max_goal_token_budget: None,
+            },
+            std::future::ready(Ok(())),
+        )
+        .await?;
+    Ok((runtime, harness, outcome))
+}
+#[tokio::test]
+async fn external_goal_effects_refused_or_exhausted_do_not_wait_or_reopen_admission()
+-> anyhow::Result<()> {
+    let (runtime, harness, outcome) = external_effect_fixture().await?;
+    let prepared = harness
+        .prepare_turn(
+            "held-external-effects",
+            ModeKind::Default,
+            &TokenUsage::default(),
+        )
+        .await;
+    let work = GoalIdleWork {
+        live: Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+        derives: Default::default(),
+        refuse: true,
+    };
+    for access in [
+        Err(codex_protocol::mcp_work::McpAttemptRefused),
+        Ok(Some(&work as &dyn codex_extension_api::HostOperationWork)),
+    ] {
+        let mut effects = Box::pin(outcome.apply_runtime_effects(&harness.goal_service, access));
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(
+                std::future::Future::poll(effects.as_mut(), cx).is_ready()
+            ))
+            .await,
+            "refused external effects must not wait for Goal continuation preparation"
+        );
+    }
+    assert_eq!(work.derives.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(work.live.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let current = runtime
+        .thread_goals()
+        .get_thread_goal(outcome.goal.thread_id)
+        .await?
+        .unwrap();
+    assert_eq!(current.objective, "retained external request");
+    assert_eq!(current.status, codex_state::ThreadGoalStatus::Active);
+    drop(prepared);
+    Ok(())
+}
+#[tokio::test]
+async fn external_goal_effects_derive_before_wait_without_storing_work_in_outcome()
+-> anyhow::Result<()> {
+    let (_runtime, harness, outcome) = external_effect_fixture().await?;
+    let retained = outcome.clone();
+    let prepared = harness
+        .prepare_turn(
+            "held-external-effects",
+            ModeKind::Default,
+            &TokenUsage::default(),
+        )
+        .await;
+    let work = GoalIdleWork {
+        live: Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+        derives: Default::default(),
+        refuse: false,
+    };
+    let live = work.live.clone();
+    let mut effects =
+        Box::pin(outcome.apply_runtime_effects(&harness.goal_service, Ok(Some(&work))));
+    assert!(
+        std::future::poll_fn(|cx| std::task::Poll::Ready(
+            std::future::Future::poll(effects.as_mut(), cx).is_pending()
+        ))
+        .await
+    );
+    assert_eq!(work.derives.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(live.load(std::sync::atomic::Ordering::SeqCst), 2);
+    drop(effects);
+    assert_eq!(live.load(std::sync::atomic::Ordering::SeqCst), 1);
+    drop(prepared);
+    drop(work);
+    assert_eq!(live.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(retained.goal.objective, outcome.goal.objective);
+    Ok(())
 }

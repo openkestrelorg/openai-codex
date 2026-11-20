@@ -444,7 +444,7 @@ async fn turn_commit_replacement_waits_after_another_abort_takes_the_task() {
     held_rx.await.expect("publication lock held");
     let starting = Arc::clone(&session);
     let first_start = tokio::spawn(async move {
-        starting
+        let started = starting
             .try_spawn_task(
                 Arc::new(context),
                 Vec::new(),
@@ -453,8 +453,8 @@ async fn turn_commit_replacement_waits_after_another_abort_takes_the_task() {
                     listen_to_cancellation_token: true,
                 },
             )
-            .await
-            .expect("first accepted");
+            .await;
+        assert!(started, "first accepted");
     });
     tokio::time::timeout(Duration::from_secs(5), contributor.entered.acquire())
         .await
@@ -478,7 +478,7 @@ async fn turn_commit_replacement_waits_after_another_abort_takes_the_task() {
         starting_tx
             .send(())
             .expect("observe replacement scheduling");
-        starting
+        let started = starting
             .try_spawn_task(
                 next,
                 Vec::new(),
@@ -487,8 +487,8 @@ async fn turn_commit_replacement_waits_after_another_abort_takes_the_task() {
                     listen_to_cancellation_token: true,
                 },
             )
-            .await
-            .expect("winner accepted");
+            .await;
+        assert!(started, "winner accepted");
     });
     starting_rx.await.expect("replacement scheduled");
     // A direct replacement's own abort sees no active task. It must still
@@ -522,4 +522,174 @@ async fn turn_commit_replacement_waits_after_another_abort_takes_the_task() {
             .map(|task| task.turn_context.sub_id.clone())
     );
     session.abort_all_tasks(TurnAbortReason::Interrupted).await;
+}
+
+struct PermitPreparation {
+    permit: Arc<tokio::sync::Semaphore>,
+    entered: CancellationToken,
+    release: CancellationToken,
+    commits: AtomicUsize,
+}
+impl TurnLifecycleContributor for PermitPreparation {
+    fn on_turn_start<'a>(
+        &'a self,
+        input: codex_extension_api::TurnStartInput<'a>,
+    ) -> codex_extension_api::ExtensionFuture<'a, ()> {
+        Box::pin(async move {
+            let permit = Arc::clone(&self.permit)
+                .acquire_owned()
+                .await
+                .expect("permit open");
+            assert!(
+                input
+                    .turn_store
+                    .get::<codex_extension_api::TurnPreparationAccess>()
+                    .expect("host preparation resources")
+                    .retain(input.turn_id, permit)
+                    .is_ok()
+            );
+            self.entered.cancel();
+            self.release.cancelled().await;
+        })
+    }
+    fn on_turn_committed(&self, _: TurnCommittedInput<'_>) {
+        assert_eq!(
+            0,
+            self.permit.available_permits(),
+            "publication owns preparation permit"
+        );
+        self.commits.fetch_add(1, Ordering::SeqCst);
+    }
+}
+struct PermitRunTask {
+    contributor: Arc<PermitPreparation>,
+    ran: CancellationToken,
+}
+impl SessionTask for PermitRunTask {
+    fn kind(&self) -> TaskKind {
+        TaskKind::Regular
+    }
+    fn span_name(&self) -> &'static str {
+        "session_task.preparation_permit"
+    }
+    async fn run(
+        self: Arc<Self>,
+        _: Arc<Session>,
+        _: Arc<TurnContext>,
+        _: Vec<TurnInput>,
+        cancel: CancellationToken,
+    ) -> SessionTaskResult {
+        assert_eq!(1, self.contributor.commits.load(Ordering::SeqCst));
+        assert_eq!(
+            1,
+            self.contributor.permit.available_permits(),
+            "release before worker readiness"
+        );
+        self.ran.cancel();
+        cancel.cancelled().await;
+        Ok(None)
+    }
+}
+
+#[tokio::test]
+async fn retained_context_cannot_keep_preparation_permit_after_cancel_and_retry() {
+    let (mut session, context) = make_session_and_context().await;
+    let contributor = Arc::new(PermitPreparation {
+        permit: Arc::new(tokio::sync::Semaphore::new(1)),
+        entered: CancellationToken::new(),
+        release: CancellationToken::new(),
+        commits: AtomicUsize::new(0),
+    });
+    let mut builder = codex_extension_api::ExtensionRegistryBuilder::<crate::config::Config>::new();
+    builder.turn_lifecycle_contributor(contributor.clone());
+    session.services.extensions = Arc::new(builder.build());
+    let session = Arc::new(session);
+    let context = Arc::new(context);
+    let before = session.state.lock().await.last_started_turn_id.clone();
+    let mut start = Box::pin(session.start_task(
+        Arc::clone(&context),
+        Vec::new(),
+        NeverEndingTask {
+            kind: TaskKind::Regular,
+            listen_to_cancellation_token: true,
+        },
+    ));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::select! { _ = contributor.entered.cancelled() => {}, _ = &mut start => panic!("returned before held preparation") }
+    }).await.expect("preparation entered");
+    assert_eq!(0, contributor.permit.available_permits());
+    drop(start);
+    assert_eq!(before, session.state.lock().await.last_started_turn_id);
+    assert_eq!(0, contributor.commits.load(Ordering::SeqCst));
+    let permit = Arc::clone(&contributor.permit)
+        .try_acquire_owned()
+        .expect("cancel releases actual owned semaphore");
+    let retained_access = context
+        .extension_data
+        .get::<codex_extension_api::TurnPreparationAccess>()
+        .expect("retained context access");
+    let refused = retained_access.retain(&context.sub_id, permit);
+    assert!(
+        refused.is_err(),
+        "ended preparation never accepts resources"
+    );
+    drop(refused);
+    assert_eq!(1, contributor.permit.available_permits());
+    contributor.release.cancel();
+    let ran = CancellationToken::new();
+    assert!(
+        session
+            .start_task(
+                context,
+                Vec::new(),
+                PermitRunTask {
+                    contributor: Arc::clone(&contributor),
+                    ran: ran.clone()
+                }
+            )
+            .await
+    );
+    tokio::time::timeout(Duration::from_secs(5), ran.cancelled())
+        .await
+        .expect("committed task runs after permit release");
+    session.abort_all_tasks(TurnAbortReason::Replaced).await;
+}
+
+#[tokio::test]
+async fn final_admission_refusal_releases_preparation_permit_with_context_retained() {
+    let (mut session, context) = make_session_and_context().await;
+    let contributor = Arc::new(PermitPreparation {
+        permit: Arc::new(tokio::sync::Semaphore::new(1)),
+        entered: CancellationToken::new(),
+        release: CancellationToken::new(),
+        commits: AtomicUsize::new(0),
+    });
+    let mut builder = codex_extension_api::ExtensionRegistryBuilder::<crate::config::Config>::new();
+    builder.turn_lifecycle_contributor(contributor.clone());
+    session.services.extensions = Arc::new(builder.build());
+    let session = Arc::new(session);
+    let context = Arc::new(context);
+    let mut start = Box::pin(session.start_task(
+        Arc::clone(&context),
+        Vec::new(),
+        NeverEndingTask {
+            kind: TaskKind::Regular,
+            listen_to_cancellation_token: true,
+        },
+    ));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::select! { _ = contributor.entered.cancelled() => {}, _ = &mut start => panic!("returned before held preparation") }
+    }).await.expect("preparation entered");
+    session.close_task_admission().await;
+    contributor.release.cancel();
+    assert!(!start.await);
+    assert_eq!(0, contributor.commits.load(Ordering::SeqCst));
+    assert_eq!(1, contributor.permit.available_permits());
+    assert!(
+        context
+            .extension_data
+            .get::<codex_extension_api::TurnPreparationAccess>()
+            .is_some()
+    );
+    assert!(session.active_turn.lock().await.is_none());
 }

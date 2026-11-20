@@ -310,7 +310,7 @@ async fn concurrent_state_opens_never_publish_partial_schema_and_retry() -> anyh
                 pool.close().await;
             }
             Err(err) => assert!(
-                err.downcast_ref::<crate::runtime::RuntimeDbInitError>()
+                err.downcast_ref::<crate::runtime::recovery::RuntimeDbInitError>()
                     .is_some(),
                 "{err:#}"
             ),

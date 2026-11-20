@@ -43,6 +43,12 @@ impl ProcessorThreadShutdown {
                     report.is_complete()
                         || (report.ordinary == codex_core::ThreadShutdownOutcome::Complete
                             && report.session_loop == codex_core::ThreadLoopOutcome::Normal
+                            // Reconciliation re-proves MCP/owner cleanup only;
+                            // it never proves unproven sandbox cleanup clean.
+                            && !matches!(
+                                report.cleanup,
+                                codex_core::ThreadCleanupOutcome::SandboxCleanupUnproven { .. }
+                            )
                             && self.reconciled_prior.contains(&(*id, *generation)))
                 })
             })

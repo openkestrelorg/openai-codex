@@ -1,3 +1,7 @@
+// Release builds exceed rustc's default query depth when laying out the async
+// MessageProcessor::handle_initialized_client_request future.
+#![recursion_limit = "256"]
+
 //! Shared in-process app-server client facade for CLI surfaces.
 //!
 //! This crate wraps [`codex_app_server::in_process`] behind a single async API
@@ -8,7 +12,7 @@
 //! - Typed and raw request/notification dispatch.
 //! - Server request resolution and rejection.
 //! - Ordered, lossless event consumption that cannot block request processing.
-//! - Bounded graceful shutdown with retained incomplete custody.
+//! - Bounded shutdown observation with retained original-task custody.
 //!
 //! The facade interposes a worker task between the caller and the underlying
 //! [`InProcessClientHandle`](codex_app_server::in_process::InProcessClientHandle),
@@ -16,8 +20,19 @@
 //! runtime remain bounded; the local consumer event queue is unbounded so
 //! unread notifications cannot prevent request responses from being delivered.
 
+mod cloud;
+pub mod cloud_backend;
+pub use codex_cloud_client::ProjectEnvironment;
 mod path;
 mod remote;
+mod remote_websocket;
+pub use cloud::CloudClient;
+pub use cloud::CloudCommand;
+pub use cloud::CloudOperation;
+pub use cloud::CloudRequestHandle;
+pub use cloud::CloudUserMessageReceipt;
+mod server_request;
+pub use server_request::AppServerReplyHandle;
 
 use std::error::Error;
 use std::fmt;
@@ -34,12 +49,8 @@ pub use codex_app_server::in_process::InProcessHost;
 pub use codex_app_server::in_process::InProcessServerEvent;
 use codex_app_server::in_process::InProcessStartArgs;
 use codex_app_server::in_process::LogDbLayer;
-pub use codex_app_server::in_process::ProcessorCleanupExecution;
-pub use codex_app_server::in_process::ProcessorCleanupProgress;
-pub use codex_app_server::in_process::RuntimeShutdownReport;
 pub use codex_app_server::in_process::StateDbHandle;
-pub use codex_app_server::in_process::TaskObservation;
-pub use codex_app_server::in_process::TaskTermination;
+pub use codex_app_server::verified_local_daemon_socket;
 use codex_app_server_protocol::ClientInfo;
 use codex_app_server_protocol::ClientNotification;
 use codex_app_server_protocol::ClientRequest;
@@ -65,12 +76,16 @@ use codex_utils_absolute_path::AbsolutePathBuf;
 use serde::de::DeserializeOwned;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
+use tokio::sync::watch;
 use tokio::time::Instant;
+#[cfg(test)]
+use tokio::time::timeout;
 use tokio::time::timeout_at;
 use toml::Value as TomlValue;
 use tracing::warn;
 
 pub use crate::path::AppServerPath;
+pub use crate::remote::FinalClose;
 pub use crate::remote::RemoteAppServerClient;
 pub use crate::remote::RemoteAppServerConnectArgs;
 pub use crate::remote::RemoteAppServerEndpoint;
@@ -103,10 +118,16 @@ pub type RequestResult = std::result::Result<JsonRpcResult, JSONRPCErrorError>;
 
 #[derive(Debug, Clone)]
 pub enum AppServerEvent {
-    Lagged { skipped: usize },
+    Lagged {
+        skipped: usize,
+    },
     ServerNotification(Box<ServerNotification>),
     ServerRequest(Box<ServerRequest>),
-    Disconnected { message: String },
+    /// A native Cloud reply stream ended. The underlying thread can still be running.
+    ThreadStreamDisconnected(Box<codex_app_server_protocol::ErrorNotification>),
+    Disconnected {
+        message: String,
+    },
 }
 
 impl From<InProcessServerEvent> for AppServerEvent {
@@ -201,6 +222,10 @@ where
 
 #[derive(Clone)]
 pub struct InProcessClientStartArgs {
+    /// Request the interactive role; the server still verifies trusted provenance.
+    pub interactive_client: bool,
+    /// This client collects fresh human decisions for managed command checkpoints.
+    pub required_human_approval: bool,
     /// Resolved argv0 dispatch paths used by command execution internals.
     pub arg0_paths: Arg0DispatchPaths,
     /// Shared config used to initialize app-server runtime.
@@ -237,8 +262,6 @@ pub struct InProcessClientStartArgs {
     pub experimental_api: bool,
     /// Whether MCP servers may send `openai/form` elicitation requests.
     pub mcp_server_openai_form_elicitation: bool,
-    /// Whether this client requests server-established interactive attachment.
-    pub interactive_client: bool,
     /// Notification methods this client opts out of receiving.
     pub opt_out_notification_methods: Vec<String>,
     /// Queue capacity for command and embedded-runtime channels (clamped to at least 1).
@@ -249,10 +272,11 @@ impl InProcessClientStartArgs {
     /// Builds initialize params from caller-provided metadata.
     pub fn initialize_params(&self) -> InitializeParams {
         let capabilities = InitializeCapabilities {
+            interactive_client: self.interactive_client,
+            required_human_approval: self.required_human_approval,
             explicit_gateway_oauth: false,
             experimental_api: self.experimental_api,
             request_attestation: false,
-            interactive_client: self.interactive_client,
             extensions: None,
             opt_out_notification_methods: if self.opt_out_notification_methods.is_empty() {
                 None
@@ -340,9 +364,7 @@ pub struct InProcessAppServerClient {
     command_tx: mpsc::Sender<ClientCommand>,
     event_rx: mpsc::UnboundedReceiver<InProcessServerEvent>,
     worker_handle: tokio::task::JoinHandle<()>,
-    // Keep the caller-provided host alive for the entire facade lifetime. The
-    // worker also captures this host so a bounded shutdown observer may drop
-    // its JoinHandle without discarding the runtime custody.
+    // Retain original runtime custody even after a bounded observer returns.
     _host: Arc<InProcessHost>,
 }
 
@@ -353,13 +375,36 @@ pub struct InProcessAppServerRequestHandle {
 
 #[derive(Clone)]
 pub enum AppServerRequestHandle {
+    Cloud(CloudRequestHandle),
     InProcess(InProcessAppServerRequestHandle),
     Remote(crate::remote::RemoteAppServerRequestHandle),
 }
 
 pub enum AppServerClient {
+    Cloud(CloudClient),
     InProcess(InProcessAppServerClient),
     Remote(RemoteAppServerClient),
+}
+
+/// Answers a command the worker will not run because its owner is gone.
+fn fail_closed_command(command: ClientCommand) {
+    let error = || {
+        IoError::new(
+            ErrorKind::BrokenPipe,
+            "in-process app-server client was dropped",
+        )
+    };
+    match command {
+        ClientCommand::Request { response_tx, .. } => {
+            let _ = response_tx.send(Err(error()));
+        }
+        ClientCommand::Notify { response_tx, .. }
+        | ClientCommand::ResolveServerRequest { response_tx, .. }
+        | ClientCommand::RejectServerRequest { response_tx, .. }
+        | ClientCommand::Shutdown { response_tx, .. } => {
+            let _ = response_tx.send(Err(error()));
+        }
+    }
 }
 
 impl InProcessAppServerClient {
@@ -384,9 +429,8 @@ impl InProcessAppServerClient {
         args: InProcessClientStartArgs,
     ) -> IoResult<Self> {
         let channel_capacity = args.channel_capacity.max(1);
-        let mut handle =
-            codex_app_server::in_process::start_in_host(&host, args.into_runtime_start_args())
-                .await?;
+        let runtime_args = args.into_runtime_start_args();
+        let mut handle = codex_app_server::in_process::start_in_host(&host, runtime_args).await?;
         let request_sender = handle.sender();
         let (command_tx, mut command_rx) = mpsc::channel::<ClientCommand>(channel_capacity);
         // e9996ec62a preserved transcript events by awaiting a bounded queue, but that can
@@ -394,6 +438,10 @@ impl InProcessAppServerClient {
         // Match the remote-client fix in 79ea57715636: only this local consumer queue is
         // unbounded; commands and the embedded runtime stay bounded and events remain ordered.
         let (event_tx, event_rx) = mpsc::unbounded_channel::<InProcessServerEvent>();
+        // Set only when the event consumer is dropped without an explicit
+        // shutdown. Detached request tasks then fail with BrokenPipe instead
+        // of keeping a dropped owner's work alive.
+        let (owner_dropped_tx, owner_dropped_rx) = watch::channel(false);
 
         let worker_host = Arc::clone(&host);
         let worker_handle = tokio::spawn(async move {
@@ -401,13 +449,48 @@ impl InProcessAppServerClient {
             // incomplete and drops its JoinHandle. The worker owns the same
             // low-level client/host pair and remains the durable observer.
             let _host = worker_host;
-            let mut event_stream_enabled = true;
             loop {
                 tokio::select! {
+                    // Consumer-closed first: once the owner is gone no further
+                    // command is admitted, however fast retained handles send.
+                    biased;
+                    () = event_tx.closed() => {
+                        // Cloned request handles do not own the runtime lifetime.
+                        // Stop admitting commands first, so retained handles that
+                        // keep sending cannot delay this exit; the drain is then
+                        // bounded by what is already buffered. Explicit shutdown
+                        // queues its Shutdown before releasing the consumer, so if
+                        // one exists it is buffered here.
+                        command_rx.close();
+                        let mut explicit_shutdown = None;
+                        while let Ok(command) = command_rx.try_recv() {
+                            match command {
+                                ClientCommand::Shutdown { response_tx, deadline } => {
+                                    explicit_shutdown = Some((response_tx, deadline));
+                                }
+                                command => fail_closed_command(command),
+                            }
+                        }
+                        match explicit_shutdown {
+                            Some((response_tx, deadline)) => {
+                                let shutdown_result = handle.shutdown_until(deadline).await;
+                                let _ = response_tx.send(shutdown_result);
+                            }
+                            None => {
+                                let _ = owner_dropped_tx.send_replace(true);
+                                // Same bounded runtime shutdown as the closed
+                                // command-channel path. Its cleanup closes the
+                                // embedded connection, which revokes grants.
+                                let _ = handle.shutdown().await;
+                            }
+                        }
+                        break;
+                    }
                     command = command_rx.recv() => {
                         match command {
                             Some(ClientCommand::Request { request, response_tx }) => {
                                 let request_sender = request_sender.clone();
+                                let mut owner_dropped = owner_dropped_rx.clone();
                                 // Request waits happen on a detached task so
                                 // this loop can keep draining runtime events
                                 // while the request is blocked on client input.
@@ -421,7 +504,21 @@ impl InProcessAppServerClient {
                                         | ClientRequest::UserVerificationVerify { .. });
                                     let mut response_tx = response_tx;
                                     tokio::select! {
+                                        // An owner drop beats a response that became
+                                        // ready in the same poll: that response would
+                                        // otherwise be the runtime's shutdown error.
+                                        biased;
                                         _ = response_tx.closed(), if cancellable => {}
+                                        // `false` means the worker exited without an
+                                        // owner drop; that disables only this branch.
+                                        true = async move {
+                                            owner_dropped.wait_for(|dropped| *dropped).await.is_ok()
+                                        } => {
+                                            let _ = response_tx.send(Err(IoError::new(
+                                                ErrorKind::BrokenPipe,
+                                                "in-process app-server client was dropped",
+                                            )));
+                                        }
                                         result = request_sender.request(*request) => {
                                             let _ = response_tx.send(result);
                                         }
@@ -466,7 +563,7 @@ impl InProcessAppServerClient {
                             }
                         }
                     }
-                    event = handle.next_event(), if event_stream_enabled => {
+                    event = handle.next_event() => {
                         let Some(event) = event else {
                             break;
                         };
@@ -490,9 +587,9 @@ impl InProcessAppServerClient {
                             continue;
                         }
 
-                        if event_tx.send(event).is_err() {
-                            event_stream_enabled = false;
-                        }
+                        // A failed send means the consumer is gone; the biased
+                        // `event_tx.closed()` branch exits on the next iteration.
+                        let _ = event_tx.send(event);
                     }
                 }
             }
@@ -585,26 +682,9 @@ impl InProcessAppServerClient {
         request_id: RequestId,
         result: JsonRpcResult,
     ) -> IoResult<()> {
-        let (response_tx, response_rx) = oneshot::channel();
-        self.command_tx
-            .send(ClientCommand::ResolveServerRequest {
-                request_id,
-                result,
-                response_tx,
-            })
+        self.request_handle()
+            .resolve_server_request(request_id, result)
             .await
-            .map_err(|_| {
-                IoError::new(
-                    ErrorKind::BrokenPipe,
-                    "in-process app-server worker channel is closed",
-                )
-            })?;
-        response_rx.await.map_err(|_| {
-            IoError::new(
-                ErrorKind::BrokenPipe,
-                "in-process app-server resolve channel is closed",
-            )
-        })?
     }
 
     /// Rejects a pending server request with JSON-RPC error payload.
@@ -613,26 +693,9 @@ impl InProcessAppServerClient {
         request_id: RequestId,
         error: JSONRPCErrorError,
     ) -> IoResult<()> {
-        let (response_tx, response_rx) = oneshot::channel();
-        self.command_tx
-            .send(ClientCommand::RejectServerRequest {
-                request_id,
-                error,
-                response_tx,
-            })
+        self.request_handle()
+            .reject_server_request(request_id, error)
             .await
-            .map_err(|_| {
-                IoError::new(
-                    ErrorKind::BrokenPipe,
-                    "in-process app-server worker channel is closed",
-                )
-            })?;
-        response_rx.await.map_err(|_| {
-            IoError::new(
-                ErrorKind::BrokenPipe,
-                "in-process app-server reject channel is closed",
-            )
-        })?
     }
 
     /// Returns the next in-process event, or `None` when worker exits.
@@ -648,6 +711,11 @@ impl InProcessAppServerClient {
     /// error. The worker is deliberately not aborted: its host-owned runtime
     /// and cleanup receipts remain observable after this caller returns.
     pub async fn shutdown(self) -> IoResult<()> {
+        self.shutdown_until(Instant::now() + IN_PROCESS_SHUTDOWN_TIMEOUT)
+            .await
+    }
+
+    async fn shutdown_until(self, deadline: Instant) -> IoResult<()> {
         let Self {
             command_tx,
             event_rx,
@@ -655,9 +723,9 @@ impl InProcessAppServerClient {
             _host,
         } = self;
         let mut worker_handle = worker_handle;
-        // Stop forwarding caller-facing events before asking the worker to shut down.
-        drop(event_rx);
-        let deadline = Instant::now() + IN_PROCESS_SHUTDOWN_TIMEOUT;
+        // Keep the event consumer alive until the worker has been observed or
+        // the deadline elapsed. Dropping it first would let the worker's
+        // owner-drop exit win before this caller-deadlined Shutdown is queued.
         let mut command_error = None;
         let (response_tx, response_rx) = oneshot::channel();
         match timeout_at(
@@ -699,18 +767,75 @@ impl InProcessAppServerClient {
             }
         }
 
-        match timeout_at(deadline, &mut worker_handle).await {
+        let result = match timeout_at(deadline, &mut worker_handle).await {
             Ok(Ok(())) => command_error.map_or(Ok(()), Err),
             Ok(Err(_)) => Err(IoError::other("in-process app-server worker panicked")),
             Err(_) => Err(IoError::new(
                 ErrorKind::TimedOut,
                 "in-process app-server worker shutdown timed out",
             )),
-        }
+        };
+        drop(event_rx);
+        result
     }
 }
 
 impl InProcessAppServerRequestHandle {
+    pub(crate) async fn resolve_server_request(
+        &self,
+        request_id: RequestId,
+        result: JsonRpcResult,
+    ) -> IoResult<()> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.command_tx
+            .send(ClientCommand::ResolveServerRequest {
+                request_id,
+                result,
+                response_tx,
+            })
+            .await
+            .map_err(|_| {
+                IoError::new(
+                    ErrorKind::BrokenPipe,
+                    "in-process app-server worker channel is closed",
+                )
+            })?;
+        response_rx.await.map_err(|_| {
+            IoError::new(
+                ErrorKind::BrokenPipe,
+                "in-process app-server resolve channel is closed",
+            )
+        })?
+    }
+
+    /// Rejects a pending server request with JSON-RPC error payload.
+    pub(crate) async fn reject_server_request(
+        &self,
+        request_id: RequestId,
+        error: JSONRPCErrorError,
+    ) -> IoResult<()> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.command_tx
+            .send(ClientCommand::RejectServerRequest {
+                request_id,
+                error,
+                response_tx,
+            })
+            .await
+            .map_err(|_| {
+                IoError::new(
+                    ErrorKind::BrokenPipe,
+                    "in-process app-server worker channel is closed",
+                )
+            })?;
+        response_rx.await.map_err(|_| {
+            IoError::new(
+                ErrorKind::BrokenPipe,
+                "in-process app-server reject channel is closed",
+            )
+        })?
+    }
+
     pub async fn request(&self, request: ClientRequest) -> IoResult<RequestResult> {
         let (response_tx, response_rx) = oneshot::channel();
         self.command_tx
@@ -744,10 +869,56 @@ impl InProcessAppServerRequestHandle {
 }
 
 impl AppServerRequestHandle {
+    /// Starts a native cloud thread with host project metadata without adding wire fields.
+    pub async fn start_cloud_project_thread(
+        &self,
+        request_id: RequestId,
+        params: codex_app_server_protocol::ThreadStartParams,
+        project: codex_cloud_client::ProjectEnvironment,
+    ) -> Result<codex_app_server_protocol::ThreadStartResponse, TypedRequestError> {
+        let response = match self {
+            Self::Cloud(handle) => {
+                handle
+                    .start_project_thread(request_id, params, project)
+                    .await
+            }
+            Self::InProcess(_) | Self::Remote(_) => Err(IoError::new(
+                std::io::ErrorKind::Unsupported,
+                "Project checkout requires the native cloud transport.",
+            )),
+        };
+        decode_typed_response("thread/start", response)
+    }
+
+    pub(crate) async fn resolve_server_request(
+        &self,
+        request_id: RequestId,
+        result: JsonRpcResult,
+    ) -> IoResult<()> {
+        match self {
+            Self::InProcess(handle) => handle.resolve_server_request(request_id, result).await,
+            Self::Remote(handle) => handle.resolve_server_request(request_id, result).await,
+            Self::Cloud(handle) => handle.resolve_server_request(request_id, result).await,
+        }
+    }
+
+    pub(crate) async fn reject_server_request(
+        &self,
+        request_id: RequestId,
+        error: JSONRPCErrorError,
+    ) -> IoResult<()> {
+        match self {
+            Self::InProcess(handle) => handle.reject_server_request(request_id, error).await,
+            Self::Remote(handle) => handle.reject_server_request(request_id, error).await,
+            Self::Cloud(handle) => handle.reject_server_request(request_id, error).await,
+        }
+    }
+
     pub async fn request(&self, request: ClientRequest) -> IoResult<RequestResult> {
         match self {
             Self::InProcess(handle) => handle.request(request).await,
             Self::Remote(handle) => handle.request(request).await,
+            Self::Cloud(handle) => handle.request(request).await,
         }
     }
 
@@ -768,6 +939,7 @@ impl AppServerClient {
         match self {
             Self::InProcess(_) => Some(std::env::consts::FAMILY),
             Self::Remote(client) => client.platform_family(),
+            Self::Cloud(_) => None,
         }
     }
 
@@ -776,6 +948,7 @@ impl AppServerClient {
         match self {
             Self::InProcess(_) => Some(std::env::consts::OS),
             Self::Remote(client) => client.platform_os(),
+            Self::Cloud(_) => None,
         }
     }
 
@@ -785,6 +958,7 @@ impl AppServerClient {
                 local_codex_home.display().to_string(),
             )),
             Self::Remote(client) => client.codex_home().map(AppServerPath::from_app_server),
+            Self::Cloud(_) => None,
         }
     }
 
@@ -792,6 +966,7 @@ impl AppServerClient {
         match self {
             Self::InProcess(client) => client.request(request).await,
             Self::Remote(client) => client.request(request).await,
+            Self::Cloud(client) => client.request(request).await,
         }
     }
 
@@ -808,6 +983,7 @@ impl AppServerClient {
         match self {
             Self::InProcess(client) => client.notify(notification).await,
             Self::Remote(client) => client.notify(notification).await,
+            Self::Cloud(client) => client.notify(notification).await,
         }
     }
 
@@ -819,6 +995,7 @@ impl AppServerClient {
         match self {
             Self::InProcess(client) => client.resolve_server_request(request_id, result).await,
             Self::Remote(client) => client.resolve_server_request(request_id, result).await,
+            Self::Cloud(client) => client.resolve_server_request(request_id, result).await,
         }
     }
 
@@ -830,6 +1007,7 @@ impl AppServerClient {
         match self {
             Self::InProcess(client) => client.reject_server_request(request_id, error).await,
             Self::Remote(client) => client.reject_server_request(request_id, error).await,
+            Self::Cloud(client) => client.reject_server_request(request_id, error).await,
         }
     }
 
@@ -837,6 +1015,26 @@ impl AppServerClient {
         match self {
             Self::InProcess(client) => client.next_event().await.map(Into::into),
             Self::Remote(client) => client.next_event().await,
+            Self::Cloud(client) => client.next_event().await,
+        }
+    }
+
+    pub fn begin_final_exit(&self, deadline: Instant) {
+        if let Self::Remote(client) = self {
+            client.begin_final_exit(deadline);
+        }
+    }
+
+    pub async fn shutdown_by(self, deadline: Instant) -> FinalClose {
+        let result = match self {
+            Self::Remote(client) => return client.shutdown_by(deadline).await,
+            Self::InProcess(client) => client.shutdown_until(deadline).await,
+            Self::Cloud(client) => client.shutdown_until(deadline).await,
+        };
+        match result {
+            Ok(()) => FinalClose::Closed,
+            Err(error) if error.kind() == ErrorKind::TimedOut => FinalClose::TimedOut(error),
+            Err(error) => FinalClose::CloseFailed(error),
         }
     }
 
@@ -844,6 +1042,7 @@ impl AppServerClient {
         match self {
             Self::InProcess(client) => client.shutdown().await,
             Self::Remote(client) => client.shutdown().await,
+            Self::Cloud(client) => client.shutdown().await,
         }
     }
 
@@ -851,12 +1050,15 @@ impl AppServerClient {
         match self {
             Self::InProcess(client) => AppServerRequestHandle::InProcess(client.request_handle()),
             Self::Remote(client) => AppServerRequestHandle::Remote(client.request_handle()),
+            Self::Cloud(client) => AppServerRequestHandle::Cloud(client.request_handle()),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[path = "reply_tests.rs"]
+    mod replies;
     use super::*;
     use codex_app_server_protocol::AccountUpdatedNotification;
     use codex_app_server_protocol::ConfigRequirementsReadResponse;
@@ -956,6 +1158,8 @@ mod tests {
         let client = InProcessAppServerClient::start_in_host(
             Arc::clone(&host),
             InProcessClientStartArgs {
+                interactive_client: false,
+                required_human_approval: false,
                 arg0_paths: Arg0DispatchPaths::default(),
                 config,
                 cli_overrides: Vec::new(),
@@ -974,7 +1178,6 @@ mod tests {
                 client_version: "0.0.0-test".to_string(),
                 experimental_api: true,
                 mcp_server_openai_form_elicitation: false,
-                interactive_client: false,
                 opt_out_notification_methods: Vec::new(),
                 channel_capacity,
             },
@@ -1145,19 +1348,23 @@ mod tests {
     }
 
     fn item_completed_notification(text: &str) -> ServerNotification {
-        ServerNotification::ItemCompleted(codex_app_server_protocol::ItemCompletedNotification {
-            thread_id: "thread".to_string(),
-            turn_id: "turn".to_string(),
-            completed_at_ms: 0,
-            item: codex_app_server_protocol::ThreadItem::AgentMessage {
-                id: "item".to_string(),
-                text: text.to_string(),
-                phase: None,
-                memory_citation: None,
-                delivery: None,
-                questions: None,
-            },
-        })
+        ServerNotification::ItemCompleted(
+            codex_app_server_protocol::ItemCompletedNotification::new(
+                "thread".to_string(),
+                "turn".to_string(),
+                codex_app_server_protocol::ThreadItemPayload::AgentMessage {
+                    moderation: None,
+                    id: "item".to_string(),
+                    text: text.to_string(),
+                    phase: None,
+                    memory_citation: None,
+                    delivery: None,
+                    questions: None,
+                },
+                /*started_at_ms*/ None,
+                /*completed_at_ms*/ 0,
+            ),
+        )
     }
 
     fn turn_completed_notification() -> ServerNotification {
@@ -1165,6 +1372,7 @@ mod tests {
             thread_id: "thread".to_string(),
             turn: codex_app_server_protocol::Turn {
                 id: "turn".to_string(),
+                root_turn_id: None,
                 items_view: codex_app_server_protocol::TurnItemsView::Full,
                 items: Vec::new(),
                 status: codex_app_server_protocol::TurnStatus::Completed,
@@ -1176,8 +1384,22 @@ mod tests {
         })
     }
 
+    #[test]
+    fn remote_interactive_request_is_explicit_and_independent_of_human_approval() {
+        for interactive in [false, true] {
+            let mut args = test_remote_connect_args("ws://127.0.0.1:1".into());
+            args.interactive_client = interactive;
+            args.required_human_approval = false;
+            let capabilities = args.initialize_params().capabilities.unwrap();
+            assert_eq!(capabilities.interactive_client, interactive);
+            assert!(!capabilities.required_human_approval);
+        }
+    }
+
     fn test_remote_connect_args(websocket_url: String) -> RemoteAppServerConnectArgs {
         RemoteAppServerConnectArgs {
+            interactive_client: false,
+            required_human_approval: false,
             endpoint: RemoteAppServerEndpoint::WebSocket {
                 websocket_url,
                 auth_token: None,
@@ -1186,7 +1408,6 @@ mod tests {
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
             mcp_server_openai_form_elicitation: false,
-            interactive_client: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         }
@@ -1245,8 +1466,8 @@ mod tests {
     async fn typed_request_roundtrip_works() {
         let TestClient {
             _codex_home,
-            client,
             _host,
+            client,
         } = start_test_client(SessionSource::Exec).await;
         let client = AppServerClient::InProcess(client);
         assert_eq!(
@@ -1478,6 +1699,7 @@ mod tests {
                     id: request.id,
                     result: serde_json::to_value(GetAccountResponse {
                         auth_observation: None,
+                        user_id: None,
                         workspace_routing: None,
                         account: None,
                         requires_openai_auth: false,
@@ -1536,6 +1758,7 @@ mod tests {
                     id: request.id,
                     result: serde_json::to_value(GetAccountResponse {
                         auth_observation: None,
+                        user_id: None,
                         workspace_routing: None,
                         account: None,
                         requires_openai_auth: false,
@@ -1547,12 +1770,13 @@ mod tests {
             websocket.close(None).await.expect("close should succeed");
         });
         let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+            interactive_client: false,
+            required_human_approval: false,
             endpoint: RemoteAppServerEndpoint::UnixSocket { socket_path },
             client_name: "codex-app-server-client-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
             mcp_server_openai_form_elicitation: false,
-            interactive_client: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         })
@@ -1617,6 +1841,7 @@ mod tests {
             response,
             GetAccountResponse {
                 auth_observation: None,
+                user_id: None,
                 workspace_routing: None,
                 account: None,
                 requires_openai_auth: false,
@@ -1638,6 +1863,8 @@ mod tests {
         )
         .await;
         let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+            interactive_client: false,
+            required_human_approval: false,
             endpoint: RemoteAppServerEndpoint::WebSocket {
                 websocket_url,
                 auth_token: Some(auth_token),
@@ -1646,7 +1873,6 @@ mod tests {
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
             mcp_server_openai_form_elicitation: false,
-            interactive_client: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         })
@@ -1659,6 +1885,8 @@ mod tests {
     #[tokio::test]
     async fn remote_connect_rejects_non_loopback_ws_when_auth_configured() {
         let result = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+            interactive_client: false,
+            required_human_approval: false,
             endpoint: RemoteAppServerEndpoint::WebSocket {
                 websocket_url: "ws://example.com:4500".to_string(),
                 auth_token: Some("remote-bearer-token".to_string()),
@@ -1667,7 +1895,6 @@ mod tests {
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
             mcp_server_openai_form_elicitation: false,
-            interactive_client: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         })
@@ -1724,6 +1951,7 @@ mod tests {
                     id: request.id,
                     result: serde_json::to_value(GetAccountResponse {
                         auth_observation: None,
+                        user_id: None,
                         workspace_routing: None,
                         account: None,
                         requires_openai_auth: false,
@@ -1781,6 +2009,7 @@ mod tests {
             first_response,
             GetAccountResponse {
                 auth_observation: None,
+                user_id: None,
                 workspace_routing: None,
                 account: None,
                 requires_openai_auth: false,
@@ -1792,24 +2021,25 @@ mod tests {
 
     #[tokio::test]
     async fn remote_notifications_arrive_over_websocket() {
+        let (close_tx, close_rx) = tokio::sync::oneshot::channel();
         let websocket_url = start_test_remote_server(|mut websocket| async move {
             expect_remote_initialize(&mut websocket).await;
-            write_websocket_message(
-                &mut websocket,
-                JSONRPCMessage::Notification(
-                    serde_json::from_value(
-                        serde_json::to_value(ServerNotification::AccountUpdated(
-                            AccountUpdatedNotification {
-                                auth_mode: None,
-                                plan_type: None,
-                            },
-                        ))
-                        .expect("notification should serialize"),
-                    )
-                    .expect("notification should convert to JSON-RPC"),
-                ),
-            )
-            .await;
+            let notification = JSONRPCMessage::Notification(
+                serde_json::from_value(
+                    serde_json::to_value(ServerNotification::AccountUpdated(
+                        AccountUpdatedNotification {
+                            auth_mode: None,
+                            plan_type: None,
+                        },
+                    ))
+                    .expect("notification should serialize"),
+                )
+                .expect("notification should convert to JSON-RPC"),
+            );
+            // Only the first notification is consumed; the other can arrive during shutdown.
+            write_websocket_message(&mut websocket, notification.clone()).await;
+            write_websocket_message(&mut websocket, notification).await;
+            let _ = close_tx.send(websocket.next().await);
         })
         .await;
         let mut client = RemoteAppServerClient::connect(test_remote_connect_args(websocket_url))
@@ -1824,6 +2054,14 @@ mod tests {
         ));
 
         client.shutdown().await.expect("shutdown should complete");
+        assert_eq!(
+            close_rx
+                .await
+                .expect("server should observe shutdown")
+                .expect("server should receive a frame")
+                .expect("websocket should close cleanly"),
+            Message::Close(None),
+        );
     }
 
     #[tokio::test]
@@ -1854,6 +2092,7 @@ mod tests {
         })
         .await;
         let mut client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+            interactive_client: false,
             channel_capacity: 1,
             ..test_remote_connect_args(websocket_url)
         })
@@ -1898,8 +2137,8 @@ mod tests {
                     }
                     ServerNotification::ItemCompleted(notification)
                         if matches!(
-                            &notification.item,
-                            codex_app_server_protocol::ThreadItem::AgentMessage { text, .. }
+                            &notification.item.payload,
+                            codex_app_server_protocol::ThreadItemPayload::AgentMessage { text, .. }
                                 if text == "hello"
                         ) =>
                     {
@@ -2145,17 +2384,84 @@ mod tests {
         assert_eq!(std::error::Error::source(&deserialize).is_some(), true);
     }
 
+    async fn assert_embedded_shutdown_deadline(final_exit: bool) {
+        let (command_tx, mut command_rx) = mpsc::channel(1);
+        let (_event_tx, event_rx) = mpsc::unbounded_channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let (finished_tx, finished_rx) = oneshot::channel();
+        let start = Instant::now();
+        let deadline = start
+            + if final_exit {
+                Duration::from_millis(100)
+            } else {
+                IN_PROCESS_SHUTDOWN_TIMEOUT
+            };
+        let worker_handle = tokio::spawn(async move {
+            let ClientCommand::Shutdown {
+                response_tx,
+                deadline: received,
+            } = command_rx.recv().await.expect("shutdown admitted")
+            else {
+                panic!("only shutdown is expected");
+            };
+            assert_eq!(
+                received, deadline,
+                "the worker receives the original deadline"
+            );
+            release_rx
+                .await
+                .expect("the fixture releases the original worker");
+            assert!(response_tx.is_closed(), "timeout closed only the observer");
+            finished_tx
+                .send(())
+                .expect("the original worker was not aborted");
+        });
+        let client = AppServerClient::InProcess(InProcessAppServerClient {
+            command_tx,
+            event_rx,
+            worker_handle,
+            _host: Arc::new(InProcessHost::default()),
+        });
+        if final_exit {
+            assert!(matches!(
+                client.shutdown_by(deadline).await,
+                FinalClose::TimedOut(_)
+            ));
+        } else {
+            let error = client
+                .shutdown()
+                .await
+                .expect_err("stalled embedded close times out");
+            assert_eq!(error.kind(), ErrorKind::TimedOut);
+        }
+        assert_eq!(
+            Instant::now(),
+            deadline,
+            "no new 45-second budget is started"
+        );
+        release_tx
+            .send(())
+            .expect("the original worker remains alive");
+        finished_rx
+            .await
+            .expect("the released worker exits without abort");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn embedded_final_close_passes_the_shared_deadline_and_does_not_abort() {
+        assert_embedded_shutdown_deadline(/*final_exit*/ true).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn embedded_ordinary_close_keeps_its_original_budget() {
+        assert_embedded_shutdown_deadline(/*final_exit*/ false).await;
+    }
+
     #[tokio::test]
     async fn next_event_surfaces_lagged_markers() {
-        let (command_tx, mut command_rx) = mpsc::channel(1);
+        let (command_tx, _) = mpsc::channel(1);
         let (event_tx, event_rx) = mpsc::unbounded_channel();
-        let worker_handle = tokio::spawn(async move {
-            let response_tx = match command_rx.recv().await {
-                Some(ClientCommand::Shutdown { response_tx, .. }) => response_tx,
-                _ => panic!("expected shutdown command"),
-            };
-            let _ = response_tx.send(Ok(()));
-        });
+        let worker_handle = tokio::spawn(async {});
         event_tx
             .send(InProcessServerEvent::Lagged { skipped: 3 })
             .expect("lagged marker should enqueue");
@@ -2196,59 +2502,79 @@ mod tests {
             .await,
         );
 
-        let runtime_args = InProcessClientStartArgs {
-            arg0_paths: Arg0DispatchPaths::default(),
-            config: config.clone(),
-            cli_overrides: Vec::new(),
-            loader_overrides: LoaderOverrides::default(),
-            strict_config: false,
-            cloud_config_bundle: CloudConfigBundleLoader::default(),
-            embedded_network_policy: Default::default(),
-            feedback: CodexFeedback::new(),
-            log_db: None,
-            state_db: None,
-            environment_manager: environment_manager.clone(),
-            config_warnings: Vec::new(),
-            session_source: SessionSource::Exec,
-            enable_codex_api_key_env: false,
-            client_name: "codex-app-server-client-test".to_string(),
-            client_version: "0.0.0-test".to_string(),
-            experimental_api: true,
-            mcp_server_openai_form_elicitation: true,
-            interactive_client: false,
-            opt_out_notification_methods: Vec::new(),
-            channel_capacity: DEFAULT_IN_PROCESS_CHANNEL_CAPACITY,
-        }
-        .into_runtime_start_args();
+        for interactive in [false, true] {
+            let runtime_args = InProcessClientStartArgs {
+                interactive_client: interactive,
+                required_human_approval: false,
+                arg0_paths: Arg0DispatchPaths::default(),
+                config: config.clone(),
+                cli_overrides: Vec::new(),
+                loader_overrides: LoaderOverrides::default(),
+                strict_config: false,
+                cloud_config_bundle: CloudConfigBundleLoader::default(),
+                embedded_network_policy: Default::default(),
+                feedback: CodexFeedback::new(),
+                log_db: None,
+                state_db: None,
+                environment_manager: environment_manager.clone(),
+                config_warnings: Vec::new(),
+                session_source: SessionSource::Exec,
+                enable_codex_api_key_env: false,
+                client_name: "codex-app-server-client-test".to_string(),
+                client_version: "0.0.0-test".to_string(),
+                experimental_api: true,
+                mcp_server_openai_form_elicitation: true,
+                opt_out_notification_methods: Vec::new(),
+                channel_capacity: DEFAULT_IN_PROCESS_CHANNEL_CAPACITY,
+            }
+            .into_runtime_start_args();
 
-        assert_eq!(runtime_args.config, config);
-        assert!(
-            runtime_args
-                .initialize
-                .capabilities
-                .expect("initialize capabilities")
-                .mcp_server_openai_form_elicitation
-        );
-        assert!(Arc::ptr_eq(
-            &runtime_args.environment_manager,
-            &environment_manager
-        ));
-        assert!(
-            runtime_args
-                .environment_manager
-                .default_environment()
-                .expect("default environment")
-                .is_remote()
-        );
+            assert_eq!(runtime_args.config, config);
+            assert_eq!(
+                runtime_args
+                    .initialize
+                    .capabilities
+                    .as_ref()
+                    .unwrap()
+                    .interactive_client,
+                interactive
+            );
+            assert!(
+                !runtime_args
+                    .initialize
+                    .capabilities
+                    .as_ref()
+                    .unwrap()
+                    .required_human_approval
+            );
+            assert!(
+                runtime_args
+                    .initialize
+                    .capabilities
+                    .expect("initialize capabilities")
+                    .mcp_server_openai_form_elicitation
+            );
+            assert!(Arc::ptr_eq(
+                &runtime_args.environment_manager,
+                &environment_manager
+            ));
+            assert!(
+                runtime_args
+                    .environment_manager
+                    .default_environment()
+                    .expect("default environment")
+                    .is_remote()
+            );
+        }
     }
 
     #[tokio::test]
     async fn shutdown_completes_promptly_without_retained_managers() {
         let client = start_test_client(SessionSource::Cli).await;
 
-        timeout(Duration::from_secs(5), client.shutdown())
+        timeout(Duration::from_secs(1), client.shutdown())
             .await
-            .expect("shutdown should complete before the bounded fallback timeout")
+            .expect("shutdown should not wait for the 5s fallback timeout")
             .expect("shutdown should complete");
     }
 
@@ -2279,5 +2605,477 @@ mod tests {
 
         client.shutdown().await.expect("shutdown should complete");
         assert!(completed.load(Ordering::Acquire));
+    }
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_timeout_retains_original_worker() {
+        let (command_tx, mut command_rx) = mpsc::channel(1);
+        let (_event_tx, event_rx) = mpsc::unbounded_channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let (done_tx, done_rx) = oneshot::channel();
+        let worker_handle = tokio::spawn(async move {
+            let Some(ClientCommand::Shutdown { response_tx, .. }) = command_rx.recv().await else {
+                panic!("expected shutdown");
+            };
+            let _ = release_rx.await;
+            let _ = response_tx.send(Ok(()));
+            let _ = done_tx.send(());
+        });
+        let client = InProcessAppServerClient {
+            command_tx,
+            event_rx,
+            worker_handle,
+            _host: Arc::new(InProcessHost::default()),
+        };
+        let error = client
+            .shutdown()
+            .await
+            .expect_err("unjoined worker is incomplete");
+        assert_eq!(error.kind(), ErrorKind::TimedOut);
+        release_tx
+            .send(())
+            .expect("original worker was not aborted");
+        done_rx
+            .await
+            .expect("original worker can still complete after observer timeout");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_error_still_observes_original_worker() {
+        let (command_tx, mut command_rx) = mpsc::channel(1);
+        let (_event_tx, event_rx) = mpsc::unbounded_channel();
+        let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_completed = Arc::clone(&completed);
+        let worker_handle = tokio::spawn(async move {
+            let Some(ClientCommand::Shutdown { response_tx, .. }) = command_rx.recv().await else {
+                panic!("expected shutdown");
+            };
+            let _ = response_tx.send(Err(IoError::other("original cleanup incomplete")));
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            worker_completed.store(true, std::sync::atomic::Ordering::Release);
+        });
+        let client = InProcessAppServerClient {
+            command_tx,
+            event_rx,
+            worker_handle,
+            _host: Arc::new(InProcessHost::default()),
+        };
+        let error = client
+            .shutdown()
+            .await
+            .expect_err("cleanup error must propagate");
+        assert_eq!(error.to_string(), "original cleanup incomplete");
+        assert!(completed.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn shutdown_worker_panic_is_not_clean() {
+        let (command_tx, mut command_rx) = mpsc::channel(1);
+        let (_event_tx, event_rx) = mpsc::unbounded_channel();
+        let worker_handle = tokio::spawn(async move {
+            let _command = command_rx.recv().await;
+            panic!("original worker failed");
+        });
+        let client = InProcessAppServerClient {
+            command_tx,
+            event_rx,
+            worker_handle,
+            _host: Arc::new(InProcessHost::default()),
+        };
+        let error = client
+            .shutdown()
+            .await
+            .expect_err("panic cannot be successful shutdown");
+        assert_eq!(error.kind(), ErrorKind::Other);
+        assert!(error.to_string().contains("worker panicked"));
+    }
+    #[tokio::test]
+    async fn dropping_remote_client_closes_connection_with_request_handles_retained() {
+        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel();
+        let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
+        let websocket_url = start_test_remote_server(|mut websocket| async move {
+            expect_remote_initialize(&mut websocket).await;
+            let JSONRPCMessage::Request(request) = read_websocket_message(&mut websocket).await
+            else {
+                panic!("expected account/read request");
+            };
+            assert_eq!(request.method, "account/read");
+            seen_tx.send(()).expect("request observer remains alive");
+            assert!(matches!(
+                websocket.next().await,
+                Some(Ok(Message::Close(_)))
+            ));
+            closed_tx.send(()).expect("close observer remains alive");
+        })
+        .await;
+        let client = RemoteAppServerClient::connect(test_remote_connect_args(websocket_url))
+            .await
+            .expect("remote client should connect");
+        let handle = client.request_handle();
+        let pending_handle = handle.clone();
+        let request = |id| ClientRequest::GetAccount {
+            request_id: RequestId::Integer(id),
+            params: codex_app_server_protocol::GetAccountParams {
+                cache_only: false,
+                refresh_token: false,
+            },
+        };
+        let pending = tokio::spawn(async move { pending_handle.request(request(1)).await });
+        timeout(SHUTDOWN_TIMEOUT, seen_rx)
+            .await
+            .expect("request reaches server")
+            .expect("server observes request");
+        drop(client);
+        timeout(SHUTDOWN_TIMEOUT, closed_rx)
+            .await
+            .expect("dropping the event consumer closes the websocket")
+            .expect("server observes close");
+        let pending_error = timeout(SHUTDOWN_TIMEOUT, pending)
+            .await
+            .expect("pending request finishes")
+            .expect("request task joins")
+            .expect_err("pending request fails when client closes");
+        assert_eq!(pending_error.kind(), ErrorKind::BrokenPipe);
+        let error = timeout(SHUTDOWN_TIMEOUT, handle.request(request(2)))
+            .await
+            .expect("retained handle never hangs after client drop")
+            .expect_err("retained handle no longer owns a connection");
+        assert_eq!(error.kind(), ErrorKind::BrokenPipe);
+    }
+
+    fn config_requirements_request(id: i64) -> ClientRequest {
+        ClientRequest::ConfigRequirementsRead {
+            request_id: RequestId::Integer(id),
+            params: None,
+        }
+    }
+
+    // Owner drop: the event consumer is released and no Shutdown is ever
+    // queued, while a cloned handle and an in-flight request are retained.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn owner_drop_fails_in_flight_request_with_retained_handle() {
+        use codex_app_server_protocol::CommandExecParams;
+        use codex_app_server_protocol::SandboxPolicy;
+
+        let TestClient {
+            _codex_home,
+            _host,
+            client,
+        } = start_test_client(SessionSource::Cli).await;
+        let handle = client.request_handle();
+        let pending_handle = handle.clone();
+        let process_id = "owner-drop-in-flight".to_string();
+        let request = ClientRequest::OneOffCommandExec {
+            request_id: RequestId::Integer(1),
+            params: CommandExecParams {
+                command: vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "printf ready; sleep 30".to_string(),
+                ],
+                process_id: Some(process_id.clone()),
+                tty: false,
+                stream_stdin: false,
+                stream_stdout_stderr: true,
+                output_bytes_cap: None,
+                disable_output_cap: false,
+                disable_timeout: false,
+                timeout_ms: None,
+                cwd: None,
+                env: None,
+                size: None,
+                sandbox_policy: Some(SandboxPolicy::DangerFullAccess),
+                permission_profile: None,
+            },
+        };
+        let pending = tokio::spawn(async move { pending_handle.request(request).await });
+        let InProcessAppServerClient {
+            command_tx,
+            mut event_rx,
+            worker_handle,
+            _host: client_host,
+        } = client;
+
+        // Output from the started process proves the runtime received the
+        // request; its response is deferred until the process exits.
+        timeout(SHUTDOWN_TIMEOUT, async {
+            loop {
+                match event_rx.recv().await {
+                    Some(InProcessServerEvent::ServerNotification(notification))
+                        if matches!(
+                            notification.as_ref(),
+                            ServerNotification::CommandExecOutputDelta(delta)
+                                if delta.process_id == process_id
+                        ) =>
+                    {
+                        break;
+                    }
+                    Some(_) => {}
+                    None => panic!("event stream closed before the request was in flight"),
+                }
+            }
+        })
+        .await
+        .expect("command/exec reaches the runtime and starts streaming");
+        assert!(!pending.is_finished(), "request must still be in flight");
+
+        // Drop the owner field by field, in declaration order, keeping only the
+        // worker JoinHandle so its exit can be observed. Dropping a JoinHandle
+        // never affects the task, so this matches dropping the whole client.
+        drop(command_tx);
+        drop(event_rx);
+        drop(client_host);
+
+        timeout(IN_PROCESS_SHUTDOWN_TIMEOUT, worker_handle)
+            .await
+            .expect("worker exits after its event consumer is dropped")
+            .expect("worker does not panic");
+        let pending_error = timeout(SHUTDOWN_TIMEOUT, pending)
+            .await
+            .expect("in-flight request finishes")
+            .expect("request task joins")
+            .expect_err("in-flight request fails when the owner is dropped");
+        assert_eq!(pending_error.kind(), ErrorKind::BrokenPipe);
+        let error = timeout(
+            SHUTDOWN_TIMEOUT,
+            handle.request(config_requirements_request(2)),
+        )
+        .await
+        .expect("retained handle never hangs after owner drop")
+        .expect_err("retained handle no longer owns a runtime");
+        assert_eq!(error.kind(), ErrorKind::BrokenPipe);
+    }
+
+    // Explicit order: Shutdown is queued before the consumer-closed signal is
+    // observable. The closed-first worker drains it from the closed channel,
+    // so the caller's deadline and ack are used, never the owner-drop path.
+    #[tokio::test]
+    async fn shutdown_queued_before_consumer_close_takes_explicit_path() {
+        let TestClient {
+            _codex_home,
+            _host,
+            client,
+        } = start_test_client(SessionSource::Cli).await;
+        let handle = client.request_handle();
+        let InProcessAppServerClient {
+            command_tx,
+            event_rx,
+            worker_handle,
+            _host: _client_host,
+        } = client;
+        let deadline = Instant::now() + IN_PROCESS_SHUTDOWN_TIMEOUT;
+        let (response_tx, response_rx) = oneshot::channel();
+        command_tx
+            .try_send(ClientCommand::Shutdown {
+                response_tx,
+                deadline,
+            })
+            .unwrap_or_else(|_| panic!("shutdown should be queued"));
+        drop(event_rx);
+
+        timeout_at(deadline, response_rx)
+            .await
+            .expect("explicit shutdown is acknowledged before its deadline")
+            .expect("explicit shutdown is not short-circuited by consumer close")
+            .expect("explicit shutdown should complete");
+        timeout_at(deadline, worker_handle)
+            .await
+            .expect("worker exits after acknowledging shutdown")
+            .expect("worker does not panic");
+        let error = timeout(
+            SHUTDOWN_TIMEOUT,
+            handle.request(config_requirements_request(1)),
+        )
+        .await
+        .expect("retained handle never hangs after shutdown")
+        .expect_err("retained handle no longer owns a runtime");
+        assert_eq!(error.kind(), ErrorKind::BrokenPipe);
+    }
+
+    // Owner-drop order: the consumer closes with no Shutdown queued while a
+    // command sender is still held. The worker must exit on its own and close
+    // the command channel, so a late Shutdown is refused rather than acked.
+    #[tokio::test]
+    async fn consumer_close_without_shutdown_takes_owner_drop_path() {
+        let TestClient {
+            _codex_home,
+            _host,
+            client,
+        } = start_test_client(SessionSource::Cli).await;
+        let InProcessAppServerClient {
+            command_tx,
+            event_rx,
+            worker_handle,
+            _host: _client_host,
+        } = client;
+        drop(event_rx);
+
+        timeout(IN_PROCESS_SHUTDOWN_TIMEOUT, worker_handle)
+            .await
+            .expect("worker exits although a command sender is retained")
+            .expect("worker does not panic");
+        let (response_tx, _response_rx) = oneshot::channel();
+        assert!(matches!(
+            command_tx.try_send(ClientCommand::Shutdown {
+                response_tx,
+                deadline: Instant::now() + SHUTDOWN_TIMEOUT,
+            }),
+            Err(mpsc::error::TrySendError::Closed(_))
+        ));
+    }
+
+    fn queue_request(
+        command_tx: &mpsc::Sender<ClientCommand>,
+        id: i64,
+    ) -> oneshot::Receiver<IoResult<RequestResult>> {
+        let (response_tx, response_rx) = oneshot::channel();
+        command_tx
+            .try_send(ClientCommand::Request {
+                request: Box::new(config_requirements_request(id)),
+                response_tx,
+            })
+            .unwrap_or_else(|_| panic!("request should be buffered"));
+        response_rx
+    }
+
+    // Retained handles keep sending after the owner drops. The closed-first
+    // worker stops admitting commands at once, so the flood cannot delay its
+    // exit, and every spammed request fails closed.
+    #[tokio::test]
+    async fn owner_drop_exits_while_retained_handles_spam_commands() {
+        const SPAMMERS: i64 = 4;
+        let TestClient {
+            _codex_home,
+            _host,
+            client,
+        } = start_test_client(SessionSource::Cli).await;
+        let handle = client.request_handle();
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let spammers = (0..SPAMMERS)
+            .map(|spammer| {
+                let handle = handle.clone();
+                let mut started_tx = Some(started_tx.clone());
+                tokio::spawn(async move {
+                    let mut sequence = 0;
+                    loop {
+                        sequence += 1;
+                        let request = config_requirements_request(spammer * 1_000_000 + sequence);
+                        match handle.request(request).await {
+                            Ok(_) => {
+                                if let Some(started_tx) = started_tx.take() {
+                                    let _ = started_tx.send(());
+                                }
+                            }
+                            Err(error) => return error,
+                        }
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        drop(started_tx);
+        for _ in 0..SPAMMERS {
+            timeout(SHUTDOWN_TIMEOUT, started_rx.recv())
+                .await
+                .expect("every spammer is admitted before the owner drops")
+                .expect("spammer reports admission");
+        }
+
+        let InProcessAppServerClient {
+            command_tx,
+            event_rx,
+            worker_handle,
+            _host: client_host,
+        } = client;
+        drop(command_tx);
+        drop(event_rx);
+        drop(client_host);
+
+        timeout(IN_PROCESS_SHUTDOWN_TIMEOUT, worker_handle)
+            .await
+            .expect("worker exits although retained handles keep sending")
+            .expect("worker does not panic");
+        for spammer in spammers {
+            let error = timeout(SHUTDOWN_TIMEOUT, spammer)
+                .await
+                .expect("spammer stops once the owner is gone")
+                .expect("spammer joins");
+            assert_eq!(error.kind(), ErrorKind::BrokenPipe);
+        }
+    }
+
+    // A Shutdown buffered among spammed commands when the consumer closes
+    // still takes the explicit path with its caller deadline and ack; every
+    // other buffered command is answered with BrokenPipe, never run.
+    #[tokio::test]
+    async fn shutdown_buffered_with_spam_takes_explicit_path() {
+        let TestClient {
+            _codex_home,
+            _host,
+            client,
+        } = start_test_client(SessionSource::Cli).await;
+        let InProcessAppServerClient {
+            command_tx,
+            event_rx,
+            worker_handle,
+            _host: _client_host,
+        } = client;
+        // `try_send` cannot yield, so on this current-thread runtime the whole
+        // buffer and the consumer close are in place before the worker polls.
+        let mut spam = vec![queue_request(&command_tx, 1), queue_request(&command_tx, 2)];
+        let deadline = Instant::now() + IN_PROCESS_SHUTDOWN_TIMEOUT;
+        let (response_tx, response_rx) = oneshot::channel();
+        command_tx
+            .try_send(ClientCommand::Shutdown {
+                response_tx,
+                deadline,
+            })
+            .unwrap_or_else(|_| panic!("shutdown should be buffered"));
+        spam.push(queue_request(&command_tx, 3));
+        spam.push(queue_request(&command_tx, 4));
+        drop(event_rx);
+
+        timeout_at(deadline, response_rx)
+            .await
+            .expect("explicit shutdown is acknowledged before its deadline")
+            .expect("explicit shutdown is not short-circuited by consumer close")
+            .expect("explicit shutdown should complete");
+        timeout_at(deadline, worker_handle)
+            .await
+            .expect("worker exits after acknowledging shutdown")
+            .expect("worker does not panic");
+        for response_rx in spam {
+            let error = response_rx
+                .await
+                .expect("buffered request is answered")
+                .expect_err("buffered request fails closed");
+            assert_eq!(error.kind(), ErrorKind::BrokenPipe);
+        }
+        let (response_tx, _response_rx) = oneshot::channel();
+        assert!(matches!(
+            command_tx.try_send(ClientCommand::Request {
+                request: Box::new(config_requirements_request(5)),
+                response_tx,
+            }),
+            Err(mpsc::error::TrySendError::Closed(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn explicit_shutdown_with_retained_handle_still_acknowledges() {
+        let client = start_test_client(SessionSource::Cli).await;
+        let handle = client.request_handle();
+
+        timeout(IN_PROCESS_SHUTDOWN_TIMEOUT, client.shutdown())
+            .await
+            .expect("explicit shutdown stays within its deadline")
+            .expect("explicit shutdown should complete");
+        let error = timeout(
+            SHUTDOWN_TIMEOUT,
+            handle.request(config_requirements_request(1)),
+        )
+        .await
+        .expect("retained handle never hangs after shutdown")
+        .expect_err("retained handle no longer owns a runtime");
+        assert_eq!(error.kind(), ErrorKind::BrokenPipe);
     }
 }

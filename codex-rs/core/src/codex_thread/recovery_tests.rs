@@ -199,3 +199,94 @@ async fn recovery_complete_cleanup_accepts_historical_task_panic_but_incomplete_
     );
     assert!(!thread.retirement_reconciled());
 }
+
+fn unproven_sandbox_cleanup(thread: &super::CodexThread) {
+    // A sandboxed read that may have launched a helper but left no receipt.
+    thread
+        .session
+        .services
+        .sandbox_cleanup_census()
+        .record(/*may_have_launched*/ true, /*receipt*/ None);
+}
+
+#[tokio::test]
+async fn unproven_sandbox_cleanup_is_never_a_clean_retirement_or_release() {
+    let thread = exact_thread_fixture(ThreadLoopFixture::Ordinary).await;
+    unproven_sandbox_cleanup(&thread);
+    let report = thread
+        .begin_retirement(Instant::now() + Duration::from_secs(20))
+        .unwrap()
+        .wait()
+        .await;
+    assert_eq!(
+        report.cleanup,
+        ThreadCleanupOutcome::SandboxCleanupUnproven { timed_out: false }
+    );
+    assert!(!report.is_complete());
+    assert_eq!(
+        thread.sandbox_cleanup_outcome(),
+        Some(ThreadCleanupOutcome::SandboxCleanupUnproven { timed_out: false })
+    );
+    // No positively fenced handoff: the old authority stays retained.
+    assert!(!thread.retirement_is_quiescent());
+    assert!(!thread.late_release_is_quiescent());
+    assert!(thread.observed_terminal_cleanup().is_none());
+    assert_eq!(
+        thread
+            .reconcile_retirement_until(Instant::now() + Duration::from_secs(5))
+            .await,
+        ThreadRecoveryOutcome::Ineligible
+    );
+    assert!(!thread.retirement_reconciled());
+}
+
+#[tokio::test]
+async fn sandbox_cleanup_census_cannot_be_overridden_by_mcp_reconciliation() {
+    let thread = exact_thread_fixture(ThreadLoopFixture::Ordinary).await;
+    let _ = thread
+        .begin_retirement(Instant::now() + Duration::from_secs(20))
+        .unwrap()
+        .wait()
+        .await;
+    assert_eq!(
+        thread
+            .reconcile_retirement_until(Instant::now() + Duration::from_secs(5))
+            .await,
+        ThreadRecoveryOutcome::Reconciled
+    );
+    assert!(thread.observed_terminal_cleanup().is_some());
+    assert!(thread.retirement_reconciled());
+    // Unproven sandbox cleanup observed afterwards withdraws the claim.
+    unproven_sandbox_cleanup(&thread);
+    assert!(!thread.retirement_reconciled());
+    assert!(!thread.retirement_is_quiescent());
+    assert!(thread.observed_terminal_cleanup().is_none());
+}
+
+#[tokio::test]
+async fn proven_or_no_launch_sandbox_cleanup_keeps_clean_retirement() {
+    let thread = exact_thread_fixture(ThreadLoopFixture::Ordinary).await;
+    let census = thread.session.services.sandbox_cleanup_census();
+    // Positively no launch, and a proven complete launch: both clean.
+    census.record(/*may_have_launched*/ false, /*receipt*/ None);
+    census.record(
+        true,
+        Some(codex_protocol::exec_output::SandboxCleanupSummary {
+            state: codex_protocol::exec_output::SandboxCleanupState::Complete,
+            reaped: 1,
+            preserved_unproven: 0,
+            host_owned: 0,
+            handed_off: 0,
+            timed_out: 0,
+            joined: true,
+        }),
+    );
+    let report = thread
+        .begin_retirement(Instant::now() + Duration::from_secs(20))
+        .unwrap()
+        .wait()
+        .await;
+    assert!(report.is_complete());
+    assert_eq!(thread.sandbox_cleanup_outcome(), None);
+    assert!(thread.retirement_is_quiescent());
+}

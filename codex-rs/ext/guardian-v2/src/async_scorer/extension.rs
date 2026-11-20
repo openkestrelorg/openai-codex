@@ -16,6 +16,7 @@ use codex_extension_api::SkillInvocationContributor;
 use codex_extension_api::SkillInvocationInput;
 use codex_extension_api::ThreadLifecycleContributor;
 use codex_extension_api::ThreadStartInput;
+use codex_extension_api::ThreadStopInput;
 use codex_extension_api::ToolFinishInput;
 use codex_extension_api::ToolLifecycleContributor;
 use codex_extension_api::ToolLifecycleFuture;
@@ -27,6 +28,7 @@ use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::protocol::has_full_access;
 
 use super::config::GuardianV2Config;
+use super::conversation::ConversationBackend;
 use super::sampler::LunaSampler;
 use super::score::GuardianV2ScoreProgress;
 use super::trusted_skills::TrustedSkillRoots;
@@ -48,6 +50,25 @@ impl ThreadLifecycleContributor<Config> for GuardianV2Extension {
                 return;
             }
 
+            // Capture before configuration/provider waits, then move the owner
+            // into any actual prewarm job rather than storing it in the sampler.
+            let work = match &input.mcp_access {
+                Ok(codex_protocol::mcp_work::McpAttemptAccess::Admitted(work)) => {
+                    match work.derive_attempt() {
+                        Ok(work) => Some(work),
+                        Err(_) => {
+                            tracing::warn!("Guardian classifier startup work refused");
+                            return;
+                        }
+                    }
+                }
+                Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped) => None,
+                Err(_) => {
+                    tracing::warn!("Guardian classifier startup has no account authority");
+                    return;
+                }
+            };
+
             let model = input.thread_store.get::<ModelInfo>();
             let thread_id = input.thread_store.level_id().to_string();
             let guardian_config = match GuardianV2Config::resolve(input.config) {
@@ -61,21 +82,13 @@ impl ThreadLifecycleContributor<Config> for GuardianV2Extension {
                     return;
                 }
             };
-            let mut policy = guardian_config.policy_for_model(model.as_deref());
-            if let Some(model) = model.as_ref() {
-                input
-                    .config
-                    .config_layer_stack
-                    .requirements()
-                    .constrain_guardian_policy(&mut policy, &model.slug);
-            }
+            let policy = guardian_config.policy_for_model(
+                model.as_deref(),
+                input.config.config_layer_stack.requirements(),
+            );
             let scoring_enabled = policy.scoring_enabled();
-            let sampler_config = super::startup::sampler_config(
-                &input,
-                Arc::clone(&self.auth_manager),
-                self.thread_manager.upgrade(),
-            )
-            .await;
+            let sampler_config =
+                super::startup::sampler_config(&input, self.thread_manager.upgrade()).await;
 
             if scoring_enabled && guardian_config.transcript.include_images {
                 input
@@ -83,10 +96,29 @@ impl ThreadLifecycleContributor<Config> for GuardianV2Extension {
                     .get_or_init(NodeReplReviewEvidence::default)
                     .enable_image_capture();
             }
-            input.thread_store.remove::<LunaSampler>();
+            input.thread_store.remove::<ConversationBackend>();
+            if let Some(previous) = input.thread_store.get::<LunaSampler>() {
+                previous.shutdown().await;
+                input.thread_store.remove::<LunaSampler>();
+            }
             let sampler = input
                 .thread_store
                 .get_or_init(|| LunaSampler::new(sampler_config));
+            input
+                .thread_store
+                .insert(ConversationBackend::new(Arc::clone(&sampler)));
+            input
+                .thread_store
+                .remove::<super::decisions::DecisionsSampler>();
+            if input
+                .config
+                .features
+                .enabled(Feature::GuardianV2DecisionsComparison)
+                && let Some(decisions_sampler) =
+                    super::startup::decisions_sampler(&input, &self.auth_manager)
+            {
+                input.thread_store.insert(decisions_sampler);
+            }
             input.thread_store.insert(guardian_config);
             input.thread_store.insert(GuardianV2ScoreProgress::new(
                 input.extension_metrics.clone(),
@@ -115,9 +147,17 @@ impl ThreadLifecycleContributor<Config> for GuardianV2Extension {
                         .map(|environment| &environment.config),
                 )
             {
-                tokio::spawn(async move {
-                    sampler.prewarm().await;
-                });
+                sampler.spawn_prewarm(work);
+            }
+        })
+    }
+    fn on_thread_stop<'a>(&'a self, input: ThreadStopInput<'a>) -> ExtensionFuture<'a, ()> {
+        Box::pin(async move {
+            input.thread_store.remove::<ConversationBackend>();
+            // Keep the closed sampler/receipt discoverable for repeated or
+            // cancelled stop waiters until the owning thread store is dropped.
+            if let Some(sampler) = input.thread_store.get::<LunaSampler>() {
+                sampler.shutdown().await;
             }
         })
     }

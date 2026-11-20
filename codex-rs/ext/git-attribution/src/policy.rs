@@ -4,8 +4,10 @@ use std::time::Instant;
 
 use codex_backend_client::Client as BackendClient;
 use codex_extension_api::ExtensionData;
+use codex_features::RuntimeAuthMode;
 use codex_http_client::HttpClientFactory;
 use codex_login::AuthManager;
+use codex_runtime_agent_instance::RuntimeAuthManager;
 use tokio::time::timeout;
 
 #[derive(Clone, Debug)]
@@ -53,6 +55,7 @@ pub(super) async fn resolve_attribution_policy(
     auth_manager: &Arc<AuthManager>,
     base_url: &str,
     http_client_factory: &HttpClientFactory,
+    runtime_auth: Option<&(Arc<RuntimeAuthManager>, RuntimeAuthMode)>,
 ) -> Result<Option<GitAttributionPolicy>, tokio::time::error::Elapsed> {
     timeout(POLICY_RESOLUTION_TIMEOUT, async {
         let mut recovery_generation = auth_generation(auth_manager);
@@ -63,15 +66,28 @@ pub(super) async fn resolve_attribution_policy(
                 auth_recovery = auth_manager.unauthorized_recovery();
                 recovery_generation = auth_generation_at_start;
             }
-            let auth = auth_manager.auth().await;
+            let auth = auth_manager.auth_with_http_client_factory().await;
             if auth_generation(auth_manager) != auth_generation_at_start {
                 continue;
             }
             let enabled = match auth {
-                Some(auth) if auth.uses_codex_backend() => {
-                    auth_recovery.record_failed_auth(Some(&auth));
-                    let client =
-                        BackendClient::from_auth(base_url, &auth, http_client_factory.clone());
+                Some((auth, captured_factory)) if auth.uses_codex_backend() => {
+                    let policy = http_client_factory
+                        .network_policy()
+                        .clone()
+                        .with_account_binding(captured_factory.network_policy())?;
+                    let client = BackendClient::from_auth_with_runtime(
+                        base_url,
+                        &auth,
+                        http_client_factory.clone().with_network_policy(policy),
+                        runtime_auth,
+                        /*headers*/ &Default::default(),
+                    )
+                    .await;
+                    if auth_generation(auth_manager) != auth_generation_at_start {
+                        continue;
+                    }
+                    let (client, evidence) = client.ok()?.observe_request_auth();
                     let settings = client.get_user_settings().await;
                     if auth_generation(auth_manager) != auth_generation_at_start {
                         continue;
@@ -79,6 +95,7 @@ pub(super) async fn resolve_attribution_policy(
                     match settings {
                         Ok(settings) => Some(settings.commit_attribution_enabled),
                         Err(err) if err.is_unauthorized() && auth_recovery.has_next() => {
+                            auth_recovery.record_failed_credential(evidence.fingerprint());
                             if auth_recovery.next().await.is_ok() {
                                 recovery_generation = auth_generation(auth_manager);
                                 continue;

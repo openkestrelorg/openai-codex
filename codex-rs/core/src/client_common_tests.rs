@@ -21,6 +21,8 @@ fn prompt_with_image_outputs(detail: Option<ImageDetail>) -> Prompt {
     Prompt {
         input: vec![
             ResponseItem::Message {
+                status: None,
+                encrypted_content: None,
                 id: None,
                 role: "user".to_string(),
                 content: vec![
@@ -112,7 +114,6 @@ fn serializes_text_verbosity_when_set() {
     let input: Vec<ResponseItem> = vec![];
     let req = ResponsesApiRequest {
         model: "gpt-5.4".to_string(),
-        instructions: "i".to_string(),
         input,
         tools: Some(empty_tools().into()),
         tool_choice: "auto".to_string(),
@@ -123,6 +124,7 @@ fn serializes_text_verbosity_when_set() {
         stream_options: None,
         include: vec![],
         prompt_cache_key: None,
+        prompt_cache_options: None,
         service_tier: None,
         text: Some(TextControls {
             verbosity: Some(OpenAiVerbosity::Low),
@@ -160,7 +162,6 @@ fn serializes_text_schema_with_strict_format() {
 
     let req = ResponsesApiRequest {
         model: "gpt-5.4".to_string(),
-        instructions: "i".to_string(),
         input,
         tools: Some(empty_tools().into()),
         tool_choice: "auto".to_string(),
@@ -171,6 +172,7 @@ fn serializes_text_schema_with_strict_format() {
         stream_options: None,
         include: vec![],
         prompt_cache_key: None,
+        prompt_cache_options: None,
         service_tier: None,
         text: Some(text_controls),
         client_metadata: None,
@@ -222,7 +224,6 @@ fn omits_text_when_not_set() {
     let input: Vec<ResponseItem> = vec![];
     let req = ResponsesApiRequest {
         model: "gpt-5.4".to_string(),
-        instructions: "i".to_string(),
         input,
         tools: Some(empty_tools().into()),
         tool_choice: "auto".to_string(),
@@ -233,6 +234,7 @@ fn omits_text_when_not_set() {
         stream_options: None,
         include: vec![],
         prompt_cache_key: None,
+        prompt_cache_options: None,
         service_tier: None,
         text: None,
         client_metadata: None,
@@ -247,7 +249,6 @@ fn omits_text_when_not_set() {
 fn serializes_flex_service_tier_when_set() {
     let req = ResponsesApiRequest {
         model: "gpt-5.4".to_string(),
-        instructions: "i".to_string(),
         input: vec![],
         tools: Some(empty_tools().into()),
         tool_choice: "auto".to_string(),
@@ -258,6 +259,7 @@ fn serializes_flex_service_tier_when_set() {
         stream_options: None,
         include: vec![],
         prompt_cache_key: None,
+        prompt_cache_options: None,
         service_tier: Some(ServiceTier::Flex.to_string()),
         text: None,
         client_metadata: None,
@@ -269,4 +271,101 @@ fn serializes_flex_service_tier_when_set() {
         v.get("service_tier").and_then(|tier| tier.as_str()),
         Some("flex")
     );
+}
+
+fn finish_test_stream(pump: Option<ProviderTaskCompletion>) -> ResponseStream {
+    let (_send, rx_event) = mpsc::channel(1);
+    ResponseStream {
+        routing_affinity: None,
+        rx_event,
+        interrupt: None,
+        consumer_dropped: CancellationToken::new(),
+        pump,
+    }
+}
+
+#[tokio::test]
+async fn unmanaged_finish_does_not_change_drop_or_cancellation_semantics() {
+    let mut stream = finish_test_stream(None);
+    let cancellation = stream.consumer_dropped.clone();
+    stream.finish().await.unwrap();
+    assert!(!cancellation.is_cancelled());
+    drop(stream);
+    assert!(cancellation.is_cancelled());
+}
+
+#[tokio::test]
+async fn cancelled_finish_observer_retains_the_same_original_pump() {
+    let (send, receive) = oneshot::channel();
+    let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let child_finished = finished.clone();
+    let original = tokio::spawn(async move {
+        receive.await.unwrap();
+        child_finished.store(true, std::sync::atomic::Ordering::SeqCst);
+    });
+    let observation = Box::pin(async move {
+        original
+            .await
+            .map_err(|_| codex_model_provider::AuthTaskFailure::Unavailable)
+    });
+    let mut stream = finish_test_stream(Some(ProviderTaskCompletion::Pending(observation)));
+    let mut first = Box::pin(stream.finish());
+    assert!(futures::poll!(first.as_mut()).is_pending());
+    drop(first);
+    assert!(stream.consumer_dropped.is_cancelled());
+    assert!(!finished.load(std::sync::atomic::Ordering::SeqCst));
+    send.send(()).unwrap();
+    stream.finish().await.unwrap();
+    assert!(finished.load(std::sync::atomic::Ordering::SeqCst));
+    stream.finish().await.unwrap();
+}
+
+#[tokio::test]
+async fn managed_finish_replays_original_panic_as_failure() {
+    let original = tokio::spawn(async {
+        panic!("synthetic stream pump panic");
+    });
+    let observation = Box::pin(async move {
+        original.await.map_err(|error| {
+            assert!(error.is_panic());
+            codex_model_provider::AuthTaskFailure::Panicked
+        })
+    });
+    let mut stream = finish_test_stream(Some(ProviderTaskCompletion::Pending(observation)));
+    for _ in 0..2 {
+        assert_eq!(
+            stream.finish().await.unwrap_err().to_string(),
+            codex_model_provider::AuthTaskFailure::Panicked
+                .error()
+                .to_string()
+        );
+    }
+}
+
+#[tokio::test]
+async fn managed_finish_releases_a_sender_blocked_after_the_terminal_event() {
+    let (send, rx_event) = mpsc::channel(1);
+    send.send(Ok(ResponseEvent::OutputTextDelta("queued".into())))
+        .await
+        .unwrap();
+    let original = tokio::spawn(async move {
+        assert!(
+            send.send(Ok(ResponseEvent::OutputTextDelta("blocked".into())))
+                .await
+                .is_err()
+        );
+    });
+    let observation = Box::pin(async move {
+        original
+            .await
+            .map_err(|_| codex_model_provider::AuthTaskFailure::Unavailable)
+    });
+    let mut stream = ResponseStream {
+        routing_affinity: None,
+        rx_event,
+        interrupt: None,
+        consumer_dropped: CancellationToken::new(),
+        pump: Some(ProviderTaskCompletion::Pending(observation)),
+    };
+    stream.finish().await.unwrap();
 }

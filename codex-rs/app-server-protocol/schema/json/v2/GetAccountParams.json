@@ -2,7 +2,7 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "properties": {
     "cacheOnly": {
-      "description": "Observe cached auth only, without issuer, provider or routing discovery.",
+      "description": "Observe only the existing auth cache, without refresh or configuration discovery.",
       "type": "boolean"
     },
     "refreshToken": {

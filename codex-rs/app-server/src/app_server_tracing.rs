@@ -167,3 +167,7 @@ fn initialize_client_info_from_typed_request(request: &ClientRequest) -> Option<
         _ => None,
     }
 }
+
+#[cfg(test)]
+#[path = "app_server_tracing_tests.rs"]
+mod tests;

@@ -96,7 +96,7 @@ async fn handle_resume_agent(
                 config,
                 receiver_thread_id,
                 source,
-                &crate::ParentTurnAuthority::capture(&session, &turn.sub_id),
+                Some(&crate::ParentTurnAuthority::capture(&session, &turn.sub_id)),
             )
             .await
             .map_err(|err| collab_agent_error(receiver_thread_id, err))

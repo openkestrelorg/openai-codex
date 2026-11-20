@@ -54,19 +54,18 @@ struct State {
 
 impl State {
     fn compact(&mut self) {
-        self.tasks
-            .retain(|receipt| match receipt.clone().now_or_never() {
-                Some(ProcessorTaskJoin::Joined) => false,
-                Some(ProcessorTaskJoin::Cancelled) => {
-                    self.cancelled = true;
-                    false
-                }
-                Some(ProcessorTaskJoin::Panicked) => {
-                    self.panicked = true;
-                    false
-                }
-                None => true,
-            });
+        self.tasks.retain(|receipt| match receipt.peek() {
+            Some(ProcessorTaskJoin::Joined) => false,
+            Some(ProcessorTaskJoin::Cancelled) => {
+                self.cancelled = true;
+                false
+            }
+            Some(ProcessorTaskJoin::Panicked) => {
+                self.panicked = true;
+                false
+            }
+            None => true,
+        });
     }
 }
 
@@ -96,9 +95,52 @@ impl ProcessorTaskTicket {
             .ok_or(ProcessorTaskAdmissionError::Unavailable)?;
         ProcessorTasks { state }.spawn(future)
     }
+
+    /// A joined wrapper must not erase a failed subordinate auth observation.
+    pub(crate) fn mark_unverified(&self) -> Result<(), ProcessorTaskAdmissionError> {
+        let state = self
+            .state
+            .upgrade()
+            .ok_or(ProcessorTaskAdmissionError::Unavailable)?;
+        state
+            .lock()
+            .map_err(|_| ProcessorTaskAdmissionError::Unavailable)?
+            .unverified = true;
+        Ok(())
+    }
+
+    pub(crate) fn spawn_blocking(
+        &self,
+        task: impl FnOnce() + Send + 'static,
+    ) -> Result<Receipt, ProcessorTaskAdmissionError> {
+        let state = self
+            .state
+            .upgrade()
+            .ok_or(ProcessorTaskAdmissionError::Unavailable)?;
+        ProcessorTasks { state }.spawn_blocking(task)
+    }
 }
 
 impl ProcessorTasks {
+    /// Poll only snapshots outside the registry lock. Completing a JoinHandle
+    /// can destroy an arbitrary panic payload which re-enters this registry.
+    fn compact_finished(&self) -> Result<(), ProcessorTaskAdmissionError> {
+        let snapshot = self
+            .state
+            .lock()
+            .map_err(|_| ProcessorTaskAdmissionError::Unavailable)?
+            .tasks
+            .clone();
+        for receipt in snapshot {
+            let _ = receipt.now_or_never();
+        }
+        self.state
+            .lock()
+            .map_err(|_| ProcessorTaskAdmissionError::Unavailable)?
+            .compact();
+        Ok(())
+    }
+
     pub(crate) fn ticket(&self) -> ProcessorTaskTicket {
         ProcessorTaskTicket {
             state: Arc::downgrade(&self.state),
@@ -120,6 +162,37 @@ impl ProcessorTasks {
         self.spawn_inner(future, false)
     }
 
+    /// Retain the actual blocking JoinHandle. Cancelling an observer cannot
+    /// release work captured by a body that is still physically running.
+    pub(crate) fn spawn_blocking(
+        &self,
+        task: impl FnOnce() + Send + 'static,
+    ) -> Result<Receipt, ProcessorTaskAdmissionError> {
+        let runtime = tokio::runtime::Handle::try_current()
+            .map_err(|_| ProcessorTaskAdmissionError::Unavailable)?;
+        self.compact_finished()?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| ProcessorTaskAdmissionError::Unavailable)?;
+        if state.closed {
+            return Err(ProcessorTaskAdmissionError::Closed);
+        }
+        state.compact();
+        let original = runtime.spawn_blocking(task);
+        let receipt = async move {
+            match original.await {
+                Ok(()) => ProcessorTaskJoin::Joined,
+                Err(error) if error.is_cancelled() => ProcessorTaskJoin::Cancelled,
+                Err(_) => ProcessorTaskJoin::Panicked,
+            }
+        }
+        .boxed()
+        .shared();
+        state.tasks.push(receipt.clone());
+        Ok(receipt)
+    }
+
     pub(crate) fn spawn_unverified(
         &self,
         future: impl Future<Output = ()> + Send + 'static,
@@ -132,6 +205,7 @@ impl ProcessorTasks {
         future: impl Future<Output = ()> + Send + 'static,
         unverified: bool,
     ) -> Result<Receipt, ProcessorTaskAdmissionError> {
+        self.compact_finished()?;
         let mut state = self
             .state
             .lock()
@@ -155,19 +229,23 @@ impl ProcessorTasks {
         Ok(receipt)
     }
 
-    pub(crate) async fn shutdown_until(&self, deadline: Instant) -> ProcessorTaskDrain {
-        let (deadline, tasks) = {
-            let Ok(mut state) = self.state.lock() else {
+    /// Observe a finite auth batch without permanently closing this reusable owner.
+    /// Caller owns its fixed phase deadline. No timeout aborts or discards original joins.
+    pub(crate) async fn observe_until(&self, deadline: Instant) -> ProcessorTaskDrain {
+        let tasks = {
+            let Ok(state) = self.state.lock() else {
                 return ProcessorTaskDrain {
                     unavailable: true,
                     ..Default::default()
                 };
             };
-            state.closed = true;
-            let deadline = *state.deadline.get_or_insert(deadline);
-            state.compact();
-            (deadline, state.tasks.clone())
+            state.tasks.clone()
         };
+        // One nonblocking poll outside the census lock also preserves observation
+        // of already-completed originals when the caller's deadline has elapsed.
+        for receipt in tasks.iter().cloned() {
+            let _ = receipt.now_or_never();
+        }
         if !tasks.is_empty() && Instant::now() < deadline {
             tokio::select! {
                 biased;
@@ -181,7 +259,63 @@ impl ProcessorTasks {
                 ..Default::default()
             };
         };
-        // Only polls pure JoinHandle observers, never the spawned task body.
+        let mut cancelled = false;
+        let mut panicked = false;
+        state.tasks.retain(|receipt| match receipt.peek() {
+            Some(ProcessorTaskJoin::Joined) => false,
+            Some(ProcessorTaskJoin::Cancelled) => {
+                cancelled = true;
+                false
+            }
+            Some(ProcessorTaskJoin::Panicked) => {
+                panicked = true;
+                false
+            }
+            None => true,
+        });
+        state.cancelled |= cancelled;
+        state.panicked |= panicked;
+        ProcessorTaskDrain {
+            terminal: state.tasks.is_empty(),
+            cancelled: state.cancelled,
+            panicked: state.panicked,
+            unavailable: false,
+            unverified: state.unverified,
+        }
+    }
+
+    pub(crate) async fn shutdown_until(&self, deadline: Instant) -> ProcessorTaskDrain {
+        let (deadline, tasks) = {
+            let Ok(mut state) = self.state.lock() else {
+                return ProcessorTaskDrain {
+                    unavailable: true,
+                    ..Default::default()
+                };
+            };
+            state.closed = true;
+            let deadline = *state.deadline.get_or_insert(deadline);
+            state.compact();
+            (deadline, state.tasks.clone())
+        };
+        // One nonblocking poll outside the census lock also preserves observation
+        // of already-completed originals when the caller's deadline has elapsed.
+        for receipt in tasks.iter().cloned() {
+            let _ = receipt.now_or_never();
+        }
+        if !tasks.is_empty() && Instant::now() < deadline {
+            tokio::select! {
+                biased;
+                _ = tokio::time::sleep_until(deadline) => {},
+                _ = futures::future::join_all(tasks) => {},
+            }
+        }
+        let Ok(mut state) = self.state.lock() else {
+            return ProcessorTaskDrain {
+                unavailable: true,
+                ..Default::default()
+            };
+        };
+        // Inspect already-polled fixed outcomes only; do not poll under this lock.
         state.compact();
         ProcessorTaskDrain {
             terminal: state.tasks.is_empty(),
@@ -190,6 +324,16 @@ impl ProcessorTasks {
             unavailable: false,
             unverified: state.unverified,
         }
+    }
+
+    /// A test snapshot polls existing originals once, without waiting, closing,
+    /// spawning replacement work, or discarding a pending/failure receipt.
+    #[cfg(test)]
+    pub(crate) fn pending_len_for_test(&self) -> usize {
+        self.compact_finished().unwrap();
+        let mut state = self.state.lock().unwrap();
+        state.compact();
+        state.tasks.len()
     }
 
     #[cfg(test)]

@@ -1,10 +1,16 @@
 //! Exercises classifier fallback, cooldown, and cancellation against local servers.
 
+use super::super::ConversationSample;
 use super::super::LunaSampler;
+use super::super::tests::ProxyPrewarmLimit;
+use super::super::tests::proxy_websocket_servers_with_http;
 use super::super::tests::sample_request;
 use super::super::tests::sampler_config;
 use super::*;
+use crate::async_scorer::request::PreparedRequest;
 use anyhow::Result;
+use codex_guardian_context::TranscriptCursor;
+use codex_history::ResponseItemEnvelope;
 use codex_login::AuthManager;
 use codex_login::WorkspaceRouting;
 use codex_login::WorkspaceRoutingRequest;
@@ -83,6 +89,99 @@ impl Drop for Gateway {
 }
 
 #[tokio::test]
+async fn stalled_handshake_does_not_delay_other_warm_sockets() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let stalled = responses::start_websocket_server_with_headers(vec![
+        responses::WebSocketConnectionConfig {
+            requests: Vec::new(),
+            response_headers: Vec::new(),
+            accept_delay: Some(Duration::from_secs(/*secs*/ 10)),
+            close_after_requests: false,
+        },
+    ])
+    .await;
+    let healthy = responses::start_websocket_server(vec![vec![vec![
+        responses::ev_output_text_delta("low"),
+        responses::ev_completed("score"),
+    ]]])
+    .await;
+    let url = proxy_websocket_servers_with_http(
+        &[&stalled, &healthy],
+        ProxyPrewarmLimit::AllConnections,
+        /*http_url*/ None,
+    )
+    .await?;
+    let sampler = LunaSampler::new(sampler_config(url));
+    let opener = sampler.connections.replenish().unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while sampler
+            .connections
+            .idle_connections
+            .lock()
+            .unwrap()
+            .is_empty()
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    assert!(!opener.is_finished());
+    assert_eq!(
+        sampler.sample(sample_request("healthy-socket")).await?,
+        "low"
+    );
+    assert_eq!(healthy.single_connection().len(), 1);
+    opener.abort();
+    let _ = opener.await;
+    drop(stalled);
+    healthy.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn replenishes_before_last_idle_socket_is_leased() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let mut servers = Vec::new();
+    for _ in 0..INITIAL_WEBSOCKET_CONNECTIONS + 1 {
+        servers.push(
+            responses::start_websocket_server_with_headers(vec![
+                responses::WebSocketConnectionConfig {
+                    requests: Vec::new(),
+                    response_headers: Vec::new(),
+                    accept_delay: None,
+                    close_after_requests: false,
+                },
+            ])
+            .await,
+        );
+    }
+    let url = proxy_websocket_servers_with_http(
+        &servers.iter().collect::<Vec<_>>(),
+        ProxyPrewarmLimit::AllConnections,
+        /*http_url*/ None,
+    )
+    .await?;
+    let sampler = LunaSampler::new(sampler_config(url));
+    sampler.prewarm().await;
+    let held = sampler.connections.lease().await?;
+    assert!(matches!(held.connection, Connection::Websocket(_)));
+    // A healthy socket remains available, but the next burst needs the reserve restored.
+    sampler.wait_for_prewarm(Duration::from_secs(2)).await?;
+    let mut burst = Vec::new();
+    for _ in 0..INITIAL_WEBSOCKET_CONNECTIONS {
+        let lease = sampler.connections.lease().await?;
+        assert!(matches!(lease.connection, Connection::Websocket(_)));
+        burst.push(lease);
+    }
+    drop(burst);
+    drop(held);
+    for server in servers {
+        server.shutdown().await;
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn cold_pool_uses_http_during_open_timeout_then_recovers_after_cooldown() -> Result<()> {
     skip_if_no_network!(Ok(()));
     for uses_codex_backend in [false, true] {
@@ -131,7 +230,10 @@ async fn cold_pool_uses_http_during_open_timeout_then_recovers_after_cooldown() 
             sampler.sample(sample_request("parent-turn-2")).await?,
             "low"
         );
-        assert_eq!(gateway.opens.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            gateway.opens.load(Ordering::SeqCst),
+            INITIAL_WEBSOCKET_CONNECTIONS
+        );
         assert!(!opener.is_finished());
         assert!(sampler.connections.replenish().is_none());
 
@@ -144,7 +246,10 @@ async fn cold_pool_uses_http_during_open_timeout_then_recovers_after_cooldown() 
             sampler.sample(sample_request("during-cooldown")).await?,
             "low"
         );
-        assert_eq!(gateway.opens.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            gateway.opens.load(Ordering::SeqCst),
+            INITIAL_WEBSOCKET_CONNECTIONS
+        );
 
         let requests = http_mock.requests();
         let first = &requests[0];
@@ -179,14 +284,14 @@ async fn cold_pool_uses_http_during_open_timeout_then_recovers_after_cooldown() 
         tokio::time::resume();
         sampler.connections.replenish().unwrap().await?;
         assert_eq!(
+            gateway.opens.load(Ordering::SeqCst),
+            2 * INITIAL_WEBSOCKET_CONNECTIONS
+        );
+        assert_eq!(
             sampler.sample(sample_request("after-cooldown")).await?,
             "low"
         );
         assert_eq!(http_mock.requests().len(), 3);
-        assert_eq!(
-            gateway.opens.load(Ordering::SeqCst),
-            1 + INITIAL_WEBSOCKET_CONNECTIONS
-        );
     }
     Ok(())
 }
@@ -209,7 +314,14 @@ async fn cooldown_preserves_healthy_sockets_and_both_transports_share_capacity()
     let sampler = LunaSampler::new(sampler_config(format!("{}/v1", gateway.url)));
     let opener = sampler.connections.replenish().unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
-        while gateway.opens.load(Ordering::SeqCst) < 2 {
+        while gateway.opens.load(Ordering::SeqCst) < 2
+            || sampler
+                .connections
+                .idle_connections
+                .lock()
+                .unwrap()
+                .is_empty()
+        {
             tokio::task::yield_now().await;
         }
     })
@@ -296,7 +408,7 @@ async fn stalled_http_headers_exhaust_the_sampling_retry_budget() -> Result<()> 
 }
 
 #[tokio::test]
-async fn supersession_closes_http_before_headers_and_while_draining_the_body() -> Result<()> {
+async fn cancellation_closes_http_before_headers_and_while_draining_the_body() -> Result<()> {
     skip_if_no_network!(Ok(()));
     // The second case publishes a score, then leaves the response body open forever.
     for response in [
@@ -338,37 +450,53 @@ async fn supersession_closes_http_before_headers_and_while_draining_the_body() -
             }
             Ok::<_, std::io::Error>(())
         });
-        let mut samples = tokio::task::JoinSet::new();
+        let mut request = sample_request("first");
+        let evidence = std::mem::take(&mut request.input)
+            .into_iter()
+            .map(ResponseItemEnvelope::new)
+            .collect();
+        let (input, input_tokens) =
+            LunaSampler::prepare_input(&request, /*history*/ None, evidence);
+        let sample = ConversationSample {
+            input: PreparedRequest {
+                input,
+                input_tokens,
+                existing_context_tokens: 0,
+                cursor: TranscriptCursor {
+                    parent_history_version: 0,
+                    transcript_entry_count: 1,
+                },
+                truncations: Vec::new(),
+                section_costs: Vec::new(),
+            },
+            sampling: request,
+        };
+        let (ready, score) = tokio::sync::oneshot::channel();
         let first = Arc::clone(&sampler);
-        samples.spawn(async move { first.sample(sample_request("first")).await });
+        let pending = tokio::spawn(async move { first.sample_retained(sample, ready).await });
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(5), requests.recv()).await?,
             Some(1)
         );
         if has_score {
             assert_eq!(
-                tokio::time::timeout(Duration::from_secs(5), samples.join_next())
-                    .await?
-                    .unwrap()??,
+                tokio::time::timeout(Duration::from_secs(5), score)
+                    .await???
+                    .accept(),
                 "low",
             );
             assert!(disconnects.try_recv().is_err());
         }
-        for _ in 0..MAX_CONCURRENT_REQUESTS {
-            let sampler = Arc::clone(&sampler);
-            samples.spawn(async move { sampler.sample(sample_request("newer")).await });
-        }
-        if !has_score {
-            assert!(matches!(
-                tokio::time::timeout(Duration::from_secs(5), samples.join_next())
-                    .await?
-                    .unwrap()?,
-                Err(LunaSamplerError::Superseded)
-            ));
-        }
+        // Conversation expiry cancels the retained future, including its unfinished drain.
+        pending.abort();
+        assert!(pending.await.unwrap_err().is_cancelled());
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(5), disconnects.recv()).await?,
             Some(1)
+        );
+        assert_eq!(
+            sampler.connections.classifications.available_permits(),
+            MAX_CONCURRENT_REQUESTS
         );
     }
     Ok(())
@@ -383,6 +511,71 @@ impl WorkspaceRoutingResolver for RoutingPolicy {
     ) -> ModelProviderFuture<'_, std::io::Result<Option<WorkspaceRouting>>> {
         Box::pin(async { Ok(self.0.lock().unwrap().clone()) })
     }
+}
+
+#[tokio::test]
+async fn sampling_uses_new_credentials_after_logout_and_login() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let home = tempfile::tempdir()?;
+    let auth = AuthManager::from_auth_for_testing_with_home(
+        CodexAuth::from_api_key("initial-key"),
+        home.path().to_path_buf(),
+    );
+    let server = responses::start_mock_server().await;
+    let requests = responses::mount_sse_sequence(
+        &server,
+        vec![
+            responses::sse(vec![
+                responses::ev_output_text_delta("low"),
+                responses::ev_completed("before-logout"),
+            ]),
+            responses::sse(vec![
+                responses::ev_output_text_delta("low"),
+                responses::ev_completed("after-login"),
+            ]),
+        ],
+    )
+    .await;
+    let mut config = sampler_config(format!("{}/v1", server.uri()));
+    config.provider = create_model_provider(config.provider.info().clone(), Some(auth.clone()));
+    let sampler = LunaSampler::new(config);
+    // Keep both requests on HTTP without starting background WebSocket opens.
+    *sampler.connections.retry_after.lock().unwrap() = Some(Instant::now() + CONNECT_COOLDOWN);
+    assert_eq!(
+        sampler
+            .sample(sample_request("before-logout"))
+            .await
+            .expect("sample before logout"),
+        "low"
+    );
+
+    auth.logout().await?;
+    codex_login::login_with_api_key(
+        home.path(),
+        "replacement-key",
+        codex_login::AuthCredentialsStoreMode::File,
+        codex_login::AuthKeyringBackendKind::default(),
+    )?;
+    auth.reload().await;
+
+    assert_eq!(
+        sampler
+            .sample(sample_request("after-login"))
+            .await
+            .expect("sample after signing in again"),
+        "low"
+    );
+    let requests = requests.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        requests[0].header("authorization").as_deref(),
+        Some("Bearer initial-key")
+    );
+    assert_eq!(
+        requests[1].header("authorization").as_deref(),
+        Some("Bearer replacement-key")
+    );
+    Ok(())
 }
 
 #[tokio::test]
@@ -458,5 +651,844 @@ async fn http_cache_preserves_no_constraint_redirect_policy_and_configured_heade
             .redirect_policy,
         ClientRedirectPolicy::Reject,
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_transports_authenticate_each_classification() -> Result<()> {
+    use base64::Engine;
+    use codex_features::RuntimeAuthMode;
+    use codex_login::CodexAuth;
+    use codex_runtime_agent_instance::AgentHostAuthorization;
+    use codex_runtime_agent_instance::RuntimeAuthManager;
+    use codex_runtime_agent_instance::RuntimeRegistrationMetadata;
+    use codex_runtime_agent_instance::RuntimeRole;
+    use serde_json::json;
+    use wiremock::Mock;
+    use wiremock::MockServer;
+    use wiremock::ResponseTemplate;
+    use wiremock::matchers::method;
+    use wiremock::matchers::path;
+
+    struct MutableAuth(Mutex<CodexAuth>);
+    impl codex_login::ExternalAuth for MutableAuth {
+        fn resolve(&self) -> codex_login::ExternalAuthFuture<'_, CodexAuth> {
+            Box::pin(async { Ok(self.0.lock().unwrap().clone()) })
+        }
+
+        fn refresh(
+            &self,
+            _context: codex_login::ExternalAuthRefreshContext,
+        ) -> codex_login::ExternalAuthFuture<'_, CodexAuth> {
+            self.resolve()
+        }
+    }
+
+    skip_if_no_network!(Ok(()));
+    for mode in [RuntimeAuthMode::DualHeader, RuntimeAuthMode::AssertionOnly] {
+        for transport in [
+            "http",
+            "websocket",
+            "upgrade_required",
+            "legacy_endpoint",
+            "changed_auth",
+            "denied",
+        ] {
+            let websocket = transport == "websocket";
+            let denied = transport == "denied";
+            let changed_auth = transport == "changed_auth";
+            let source = Arc::new(MutableAuth(Mutex::new(CodexAuth::from_api_key(
+                "guardian-key",
+            ))));
+            let registration = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/register"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "runtime_agent_instance_id": "runtime-guardian",
+                    "agent_host_id": "host-guardian",
+                    "actor": {"kind": "platform", "user_id": "actor", "organization_id": "org", "project_id": null},
+                })))
+                .expect(1)
+                .mount(&registration)
+                .await;
+            let response = vec![
+                responses::ev_output_text_delta("low"),
+                responses::ev_completed("score"),
+            ];
+            let ws = if websocket {
+                // Each peer leaves another response available, so closure cannot force the retry.
+                Some(
+                    responses::start_websocket_server(vec![
+                        vec![response.clone(), response.clone()],
+                        vec![response.clone(), response.clone()],
+                    ])
+                    .await,
+                )
+            } else {
+                None
+            };
+            let http = MockServer::start().await;
+            let upgrade_response = if denied {
+                ResponseTemplate::new(403).set_body_json(json!({"error": {
+                    "code": "runtime_instance_paused", "type": "runtime_agent_error",
+                    "message": "The runtime agent instance is paused."
+                }}))
+            } else if transport == "legacy_endpoint" {
+                ResponseTemplate::new(404)
+            } else {
+                ResponseTemplate::new(426)
+            };
+            let handshake_source = Arc::clone(&source);
+            Mock::given(method("GET"))
+                .and(path("/responses"))
+                .respond_with(move |_request: &wiremock::Request| {
+                    if changed_auth {
+                        *handshake_source.0.lock().unwrap() =
+                            CodexAuth::from_api_key("replacement-key");
+                    }
+                    upgrade_response.clone()
+                })
+                .expect(match transport {
+                    "upgrade_required" | "legacy_endpoint" => 2,
+                    "changed_auth" | "denied" => 1,
+                    _ => 0,
+                })
+                .mount(&http)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/responses"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "text/event-stream")
+                        .set_body_string(responses::sse(response)),
+                )
+                .expect(if websocket || denied {
+                    0
+                } else if changed_auth {
+                    1
+                } else {
+                    2
+                })
+                .mount(&http)
+                .await;
+            let url = ws.as_ref().map_or_else(
+                || http.uri(),
+                |ws| ws.uri().replacen("ws://", "http://", /*count*/ 1),
+            );
+            let mut config = sampler_config(url);
+            let credentials =
+                AuthManager::from_auth_for_testing(CodexAuth::from_api_key("guardian-key"));
+            if changed_auth {
+                credentials.set_external_auth(source.clone()).await?;
+            }
+            let runtime = Arc::new(RuntimeAuthManager::new(
+                Arc::clone(&credentials),
+                AgentHostAuthorization::InstallationId {
+                    installation_id: uuid::Uuid::nil(),
+                },
+                RuntimeRegistrationMetadata {
+                    harness: Some("codex".into()),
+                    harness_version: None,
+                    role: RuntimeRole::Orchestrator,
+                },
+                format!("{}/register", registration.uri()).parse()?,
+            ));
+            let mut info = config.provider.info().clone();
+            info.supports_websockets = transport != "http";
+            config.provider = codex_model_provider::test_support::runtime_model_provider(
+                info,
+                Arc::clone(&credentials),
+                (runtime, mode),
+            );
+            let sampler = LunaSampler::new(config);
+            sampler.prewarm().await;
+            if let Some(ws) = &ws {
+                assert!(
+                    ws.handshakes().is_empty(),
+                    "prewarming must not admit runtime work"
+                );
+            }
+            if denied {
+                let error = sampler.sample(sample_request("denied")).await.unwrap_err();
+                assert!(
+                    matches!(
+                        error,
+                        LunaSamplerError::Api(ApiError::Transport(TransportError::Http {
+                            status: http::StatusCode::FORBIDDEN,
+                            ..
+                        }))
+                    ),
+                    "{error:?}"
+                );
+            } else {
+                assert_eq!(sampler.sample(sample_request("first")).await?, "low");
+                if changed_auth {
+                    assert_eq!(
+                        credentials.auth().await.unwrap().get_token()?,
+                        "replacement-key"
+                    );
+                } else {
+                    assert_eq!(sampler.sample(sample_request("second")).await?, "low");
+                }
+            }
+            let headers = if let Some(ws) = &ws {
+                assert_eq!(
+                    ws.connections().iter().map(Vec::len).collect::<Vec<_>>(),
+                    vec![1, 1]
+                );
+                ws.handshakes()
+                    .iter()
+                    .map(|h| {
+                        (
+                            h.header("authorization").unwrap(),
+                            h.header("x-openai-agent-assertion"),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                http.received_requests()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .map(|request| {
+                        (
+                            request.headers["authorization"]
+                                .to_str()
+                                .unwrap()
+                                .to_owned(),
+                            request
+                                .headers
+                                .get("x-openai-agent-assertion")
+                                .map(|value| value.to_str().unwrap().to_owned()),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let expected_attempts = match transport {
+                "upgrade_required" | "legacy_endpoint" => 4,
+                "denied" => 1,
+                _ => 2,
+            };
+            assert_eq!(headers.len(), expected_attempts);
+            let mut proofs = std::collections::BTreeSet::new();
+            for (authorization, supplemental) in headers {
+                let proof = match mode {
+                    RuntimeAuthMode::DualHeader => {
+                        assert_eq!(authorization, "Bearer guardian-key");
+                        supplemental.unwrap()
+                    }
+                    RuntimeAuthMode::AssertionOnly => {
+                        assert!(supplemental.is_none());
+                        authorization
+                            .strip_prefix("AgentAssertion ")
+                            .unwrap()
+                            .to_owned()
+                    }
+                };
+                let payload: serde_json::Value = serde_json::from_slice(
+                    &base64::engine::general_purpose::URL_SAFE_NO_PAD
+                        .decode(proof.split('.').nth(/*n*/ 2).unwrap())?,
+                )?;
+                assert_eq!(payload["runtime_agent_instance"], "runtime-guardian");
+                assert!(
+                    proofs.insert(proof),
+                    "each attempt must authenticate afresh"
+                );
+            }
+            registration.verify().await;
+            http.verify().await;
+            drop(sampler);
+            if let Some(ws) = ws {
+                ws.shutdown().await;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct PrewarmCounts {
+    live: AtomicUsize,
+    derives: AtomicUsize,
+    refuse: std::sync::atomic::AtomicBool,
+}
+struct PrewarmWork(Arc<PrewarmCounts>);
+impl PrewarmWork {
+    fn new(c: &Arc<PrewarmCounts>) -> Self {
+        c.live.fetch_add(1, Ordering::SeqCst);
+        Self(Arc::clone(c))
+    }
+}
+impl Drop for PrewarmWork {
+    fn drop(&mut self) {
+        self.0.live.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+impl codex_protocol::mcp_work::McpAttemptWork for PrewarmWork {
+    fn derive_attempt(
+        &self,
+    ) -> Result<
+        Box<dyn codex_protocol::mcp_work::McpAttemptWork>,
+        codex_protocol::mcp_work::McpAttemptRefused,
+    > {
+        self.0.derives.fetch_add(1, Ordering::SeqCst);
+        if self.0.refuse.load(Ordering::SeqCst) {
+            return Err(codex_protocol::mcp_work::McpAttemptRefused);
+        }
+        Ok(Box::new(Self::new(&self.0)))
+    }
+}
+#[tokio::test]
+async fn owned_prewarm_refill_keeps_work_after_its_waiter_is_cancelled() -> Result<()> {
+    let mut gateway = Gateway::new("http://127.0.0.1:9", "ws://127.0.0.1:9").await?;
+    let sampler = LunaSampler::new(sampler_config(gateway.url.clone()));
+    let counts = Arc::new(PrewarmCounts::default());
+    let work = PrewarmWork::new(&counts);
+    let pool = Arc::clone(&sampler.connections);
+    let waiter = tokio::spawn(async move {
+        pool.prewarm_with_work(Some(Box::new(work))).await;
+    });
+    let opens = INITIAL_WEBSOCKET_CONNECTIONS.min(MAX_CONCURRENT_OPENS);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while gateway.opens.load(Ordering::SeqCst) < opens {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    assert_eq!(counts.live.load(Ordering::SeqCst), opens + 1);
+    waiter.abort();
+    assert!(waiter.await.unwrap_err().is_cancelled());
+    assert_eq!(
+        counts.live.load(Ordering::SeqCst),
+        opens + 1,
+        "actual refill/open tasks, not the waiter, own work"
+    );
+    gateway.task.abort();
+    assert!((&mut gateway.task).await.unwrap_err().is_cancelled());
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while counts.live.load(Ordering::SeqCst) != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    assert!(
+        sampler
+            .connections
+            .idle_connections
+            .lock()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(counts.derives.load(Ordering::SeqCst), opens);
+    assert!(sampler.connections.replenishing.try_lock().is_ok());
+    Ok(())
+}
+#[tokio::test]
+async fn cached_classifier_sockets_retain_no_prewarm_work() -> Result<()> {
+    let server = responses::start_websocket_server_with_headers(vec![
+            responses::WebSocketConnectionConfig {
+                requests: Vec::new(),
+                response_headers: Vec::new(),
+                accept_delay: None,
+                close_after_requests: false,
+            };
+            INITIAL_WEBSOCKET_CONNECTIONS
+        ])
+    .await;
+    let sampler = LunaSampler::new(sampler_config(format!(
+        "http://{}/v1",
+        server.uri().trim_start_matches("ws://")
+    )));
+    let counts = Arc::new(PrewarmCounts::default());
+    sampler
+        .prewarm_with_work(Some(Box::new(PrewarmWork::new(&counts))))
+        .await;
+    assert_eq!(
+        counts.derives.load(Ordering::SeqCst),
+        INITIAL_WEBSOCKET_CONNECTIONS
+    );
+    assert_eq!(
+        sampler.connections.idle_connections.lock().unwrap().len(),
+        INITIAL_WEBSOCKET_CONNECTIONS
+    );
+    assert_eq!(counts.live.load(Ordering::SeqCst), 0);
+    sampler.connections.clear();
+    server.shutdown().await;
+    Ok(())
+}
+#[tokio::test]
+async fn expired_prewarm_work_opens_no_connection() -> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let sampler = LunaSampler::new(sampler_config(format!(
+        "http://{}/v1",
+        listener.local_addr()?
+    )));
+    let counts = Arc::new(PrewarmCounts::default());
+    counts.refuse.store(true, Ordering::SeqCst);
+    sampler
+        .prewarm_with_work(Some(Box::new(PrewarmWork::new(&counts))))
+        .await;
+    assert_eq!(counts.derives.load(Ordering::SeqCst), 1);
+    assert_eq!(counts.live.load(Ordering::SeqCst), 0);
+    assert!(
+        sampler
+            .connections
+            .idle_connections
+            .lock()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        sampler.connections.sockets.available_permits(),
+        MAX_CONCURRENT_REQUESTS
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), listener.accept())
+            .await
+            .is_err()
+    );
+    Ok(())
+}
+#[tokio::test]
+async fn cancelled_prewarm_lock_wait_releases_only_the_waiter_work() {
+    let sampler = LunaSampler::new(sampler_config("http://127.0.0.1:9/v1".to_owned()));
+    let guard = Arc::clone(&sampler.connections.replenishing)
+        .lock_owned()
+        .await;
+    let counts = Arc::new(PrewarmCounts::default());
+    let mut warm = Box::pin(sampler.prewarm_with_work(Some(Box::new(PrewarmWork::new(&counts)))));
+    assert!(
+        std::future::Future::poll(
+            warm.as_mut(),
+            &mut std::task::Context::from_waker(std::task::Waker::noop())
+        )
+        .is_pending()
+    );
+    assert_eq!(counts.live.load(Ordering::SeqCst), 1);
+    assert_eq!(counts.derives.load(Ordering::SeqCst), 0);
+    drop(warm);
+    assert_eq!(counts.live.load(Ordering::SeqCst), 0);
+    assert!(
+        sampler
+            .connections
+            .idle_connections
+            .lock()
+            .unwrap()
+            .is_empty()
+    );
+    drop(guard);
+}
+
+#[tokio::test]
+async fn classifier_shutdown_joins_detached_refill_and_connection_opens() -> Result<()> {
+    let gateway = Gateway::new("http://127.0.0.1:9", "ws://127.0.0.1:9").await?;
+    let sampler = LunaSampler::new(sampler_config(gateway.url.clone()));
+    let counts = Arc::new(PrewarmCounts::default());
+    let work = PrewarmWork::new(&counts);
+    let pool = Arc::clone(&sampler.connections);
+    let waiter = tokio::spawn(async move {
+        pool.prewarm_with_work(Some(Box::new(work))).await;
+    });
+    let opens = INITIAL_WEBSOCKET_CONNECTIONS.min(MAX_CONCURRENT_OPENS);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while gateway.opens.load(Ordering::SeqCst) < opens {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    waiter.abort();
+    assert!(waiter.await.unwrap_err().is_cancelled());
+    assert_eq!(counts.live.load(Ordering::SeqCst), opens + 1);
+    tokio::time::timeout(Duration::from_secs(5), sampler.shutdown()).await?;
+    assert_eq!(counts.live.load(Ordering::SeqCst), 0);
+    assert!(sampler.connections.workers.with_open(|| ()).is_none());
+    assert!(
+        sampler
+            .connections
+            .idle_connections
+            .lock()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(sampler.connections.replenish().is_none());
+    sampler
+        .prewarm_with_work(Some(Box::new(PrewarmWork::new(&counts))))
+        .await;
+    assert_eq!(counts.live.load(Ordering::SeqCst), 0);
+    assert_eq!(counts.derives.load(Ordering::SeqCst), opens);
+    assert_eq!(gateway.opens.load(Ordering::SeqCst), opens);
+    Ok(())
+}
+#[tokio::test]
+async fn classifier_shutdown_clears_idle_and_refuses_late_connection_return() -> Result<()> {
+    let server = responses::start_websocket_server_with_headers(vec![
+            responses::WebSocketConnectionConfig {
+                requests: Vec::new(),
+                response_headers: Vec::new(),
+                accept_delay: None,
+                close_after_requests: false,
+            };
+            INITIAL_WEBSOCKET_CONNECTIONS
+        ])
+    .await;
+    let sampler = LunaSampler::new(sampler_config(format!(
+        "http://{}/v1",
+        server.uri().trim_start_matches("ws://")
+    )));
+    let counts = Arc::new(PrewarmCounts::default());
+    sampler
+        .prewarm_with_work(Some(Box::new(PrewarmWork::new(&counts))))
+        .await;
+    assert_eq!(counts.live.load(Ordering::SeqCst), 0);
+    *sampler.connections.retry_after.lock().unwrap() = Some(Instant::now() + CONNECT_COOLDOWN);
+    let lease = sampler.connections.lease().await?;
+    assert!(matches!(lease.connection, Connection::Websocket(_)));
+    let mut stop = Box::pin(sampler.shutdown());
+    assert!(
+        std::future::Future::poll(
+            stop.as_mut(),
+            &mut std::task::Context::from_waker(std::task::Waker::noop()),
+        )
+        .is_pending()
+    );
+    assert!(sampler.connections.lease().await.is_err());
+    lease.reuse().await;
+    tokio::time::timeout(Duration::from_secs(5), stop).await?;
+    assert!(
+        sampler
+            .connections
+            .idle_connections
+            .lock()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        sampler
+            .connections
+            .idle_connections
+            .lock()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(sampler.connections.lease().await.is_err());
+    sampler.shutdown().await;
+    server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn required_sampling_and_leases_refuse_missing_or_expired_work_without_requests() -> Result<()>
+{
+    let server = responses::start_mock_server().await;
+    let mut config = sampler_config(server.uri());
+    config.require_account_work = true;
+    let sampler = LunaSampler::new(config);
+    assert!(matches!(
+        sampler.sample(sample_request("missing")).await,
+        Err(LunaSamplerError::AccountWorkRefused)
+    ));
+    assert!(matches!(
+        sampler.connections.lease().await,
+        Err(LunaSamplerError::AccountWorkRefused)
+    ));
+    assert!(sampler.connections.replenish().is_none());
+    sampler.prewarm().await;
+    let counts = Arc::new(PrewarmCounts::default());
+    let mut request = sample_request("expired");
+    request.account_work = Some(Box::new(PrewarmWork::new(&counts)));
+    counts.refuse.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        sampler.sample(request).await,
+        Err(LunaSamplerError::AccountWorkRefused)
+    ));
+    assert_eq!(counts.derives.load(Ordering::SeqCst), 1);
+    assert_eq!(counts.live.load(Ordering::SeqCst), 0);
+    assert!(server.received_requests().await.unwrap().is_empty());
+    sampler.shutdown().await;
+    Ok(())
+}
+#[tokio::test]
+async fn lease_work_is_captured_before_waiting_for_classification_capacity() -> Result<()> {
+    let mut config = sampler_config("http://127.0.0.1:9".into());
+    config.require_account_work = true;
+    let sampler = LunaSampler::new(config);
+    let pool = Arc::clone(&sampler.connections);
+    let permits = Arc::clone(&pool.classifications)
+        .acquire_many_owned(u32::try_from(MAX_CONCURRENT_REQUESTS)?)
+        .await?;
+    let counts = Arc::new(PrewarmCounts::default());
+    let root = PrewarmWork::new(&counts);
+    let mut pending = Box::pin(async move {
+        let _lease = pool.lease_with_work(Some(&root)).await;
+    });
+    assert!(
+        std::future::Future::poll(
+            pending.as_mut(),
+            &mut std::task::Context::from_waker(std::task::Waker::noop())
+        )
+        .is_pending()
+    );
+    assert_eq!(counts.live.load(Ordering::SeqCst), 2);
+    assert_eq!(counts.derives.load(Ordering::SeqCst), 1);
+    drop(pending);
+    assert_eq!(counts.live.load(Ordering::SeqCst), 0);
+    drop(permits);
+    sampler.shutdown().await;
+    Ok(())
+}
+#[tokio::test]
+async fn automatic_refill_owns_descendants_after_origin_is_dropped() -> Result<()> {
+    let mut gateway = Gateway::new("http://127.0.0.1:9", "ws://127.0.0.1:9").await?;
+    let mut config = sampler_config(gateway.url.clone());
+    config.require_account_work = true;
+    let sampler = LunaSampler::new(config);
+    let counts = Arc::new(PrewarmCounts::default());
+    let root = PrewarmWork::new(&counts);
+    let refill = sampler
+        .connections
+        .replenish_with_work(Some(&root))
+        .expect("admitted automatic refill");
+    drop(root);
+    let opens = INITIAL_WEBSOCKET_CONNECTIONS.min(MAX_CONCURRENT_OPENS);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while gateway.opens.load(Ordering::SeqCst) < opens {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    assert_eq!(counts.live.load(Ordering::SeqCst), opens + 1);
+    sampler.shutdown().await;
+    refill.await?;
+    assert_eq!(counts.live.load(Ordering::SeqCst), 0);
+    assert_eq!(counts.derives.load(Ordering::SeqCst), opens + 1);
+    gateway.task.abort();
+    assert!((&mut gateway.task).await.unwrap_err().is_cancelled());
+    Ok(())
+}
+#[tokio::test]
+async fn response_drain_keeps_lease_account_work_after_score_owner_and_stop_waiter_drop()
+-> Result<()> {
+    let server = responses::start_websocket_server_with_headers(vec![
+            responses::WebSocketConnectionConfig {
+                requests: Vec::new(),
+                response_headers: Vec::new(),
+                accept_delay: None,
+                close_after_requests: false
+            };
+            INITIAL_WEBSOCKET_CONNECTIONS
+        ])
+    .await;
+    let mut config = sampler_config(format!(
+        "http://{}/v1",
+        server.uri().trim_start_matches("ws://")
+    ));
+    config.require_account_work = true;
+    let sampler = LunaSampler::new(config);
+    let counts = Arc::new(PrewarmCounts::default());
+    sampler
+        .prewarm_with_work(Some(Box::new(PrewarmWork::new(&counts))))
+        .await;
+    assert_eq!(counts.live.load(Ordering::SeqCst), 0);
+    *sampler.connections.retry_after.lock().unwrap() = Some(Instant::now() + CONNECT_COOLDOWN);
+    let root = PrewarmWork::new(&counts);
+    let lease = sampler.connections.lease_with_work(Some(&root)).await?;
+    drop(root);
+    assert_eq!(counts.live.load(Ordering::SeqCst), 1);
+    assert!(matches!(lease.connection, Connection::Websocket(_)));
+    let (send, rx_event) = tokio::sync::mpsc::channel(1);
+    let (interrupt, cancelled) = tokio::sync::oneshot::channel();
+    let stream = codex_api::ResponseStream {
+        routing_affinity: None,
+        rx_event,
+        upstream_request_id: None,
+        interrupt: Some(interrupt),
+    };
+    let mut stop = Box::pin(sampler.shutdown());
+    assert!(
+        std::future::Future::poll(
+            stop.as_mut(),
+            &mut std::task::Context::from_waker(std::task::Waker::noop())
+        )
+        .is_pending()
+    );
+    drop(super::super::response::PendingResponse::new(
+        stream, lease, None,
+    ));
+    cancelled.await?;
+    assert_eq!(counts.live.load(Ordering::SeqCst), 1);
+    drop(stop);
+    drop(send);
+    tokio::time::timeout(Duration::from_secs(5), sampler.shutdown()).await?;
+    assert_eq!(counts.live.load(Ordering::SeqCst), 0);
+    server.shutdown().await;
+    Ok(())
+}
+
+// These cases require real loopback service; none silently skips networking.
+fn evidence_pool(base: String) -> Arc<ConnectionPool> {
+    let pool = ConnectionPool::new(Arc::new(sampler_config(base)));
+    *pool.retry_after.lock().unwrap() = Some(Instant::now() + CONNECT_COOLDOWN);
+    pool
+}
+
+fn evidence_request() -> ResponsesApiRequest {
+    ResponsesApiRequest {
+        model: "test-model".into(),
+        stream: true,
+        service_tier: None,
+        input: Vec::new(),
+        tools: None,
+        tool_choice: "auto".into(),
+        parallel_tool_calls: false,
+        reasoning: None,
+        store: false,
+        stream_options: None,
+        include: Vec::new(),
+        prompt_cache_key: None,
+        prompt_cache_options: None,
+        text: None,
+        client_metadata: None,
+        access_programs: None,
+    }
+}
+
+#[tokio::test]
+async fn http_rejection_evidence_is_actual_auth_not_lease_setup() -> Result<()> {
+    use wiremock::Mock;
+    use wiremock::MockServer;
+    use wiremock::ResponseTemplate;
+    use wiremock::matchers::header;
+    use wiremock::matchers::method;
+    use wiremock::matchers::path;
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .and(header("authorization", "Bearer test-api-key"))
+        .respond_with(ResponseTemplate::new(401))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let pool = evidence_pool(format!("{}/v1", server.uri()));
+    let (lease, evidence) =
+        tokio::time::timeout(Duration::from_secs(2), pool.lease_with_attempt(None)).await?;
+    let lease = lease?;
+    assert!(evidence.fingerprint().is_none());
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        lease.stream_request(&evidence_request()),
+    )
+    .await?;
+    assert!(matches!(
+        result,
+        Err(ApiError::Transport(TransportError::Http {
+            status: http::StatusCode::UNAUTHORIZED,
+            ..
+        }))
+    ));
+    assert!(
+        evidence.fingerprint()
+            == codex_login::AuthCredentialFingerprint::from_bearer_header("Bearer test-api-key")
+    );
+    drop(lease);
+    pool.shutdown().await;
+    server.verify().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn reused_websocket_retains_original_handshake_evidence() -> Result<()> {
+    let server = responses::start_websocket_server_with_headers(vec![
+        responses::WebSocketConnectionConfig {
+            requests: Vec::new(),
+            response_headers: Vec::new(),
+            accept_delay: None,
+            close_after_requests: false,
+        },
+    ])
+    .await;
+    let pool = evidence_pool(format!(
+        "{}/v1",
+        server.uri().replacen("ws://", "http://", 1)
+    ));
+    let permit = Arc::clone(&pool.sockets).acquire_owned().await?;
+    let connection =
+        tokio::time::timeout(Duration::from_secs(2), pool.open_connection(permit)).await??;
+    assert!(server.wait_for_handshakes(1, Duration::from_secs(2)).await);
+    let header = server
+        .single_handshake()
+        .header("authorization")
+        .expect("actual auth header");
+    let expected = codex_login::AuthCredentialFingerprint::from_bearer_header(&header);
+    assert!(expected.is_some());
+    pool.idle_connections.lock().unwrap().push(connection);
+    let (first, evidence) =
+        tokio::time::timeout(Duration::from_secs(2), pool.lease_with_attempt(None)).await?;
+    let first = first?;
+    assert!(matches!(&first.connection, Connection::Websocket(_)));
+    assert!(evidence.fingerprint() == expected);
+    first.reuse().await;
+    let (second, reused) =
+        tokio::time::timeout(Duration::from_secs(2), pool.lease_with_attempt(None)).await?;
+    let second = second?;
+    assert!(matches!(&second.connection, Connection::Websocket(_)));
+    assert!(reused.fingerprint() == expected);
+    server.single_handshake(); // Refuse a second physical handshake.
+    drop(second);
+    pool.shutdown().await;
+    server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_websocket_open_preserves_actual_rejected_auth() -> Result<()> {
+    use wiremock::Mock;
+    use wiremock::MockServer;
+    use wiremock::ResponseTemplate;
+    use wiremock::matchers::header;
+    use wiremock::matchers::method;
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(header("authorization", "Bearer test-api-key"))
+        .respond_with(ResponseTemplate::new(401))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let pool = evidence_pool(format!("{}/v1", server.uri()));
+    let setup = pool.client_setup().await?;
+    let permit = Arc::clone(&pool.sockets).acquire_owned().await?;
+    let evidence = RequestAuthEvidence::default();
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        pool.open_connection_with_setup(permit, setup, evidence.clone()),
+    )
+    .await?;
+    assert!(matches!(
+        result,
+        Err(LunaSamplerError::Api(ApiError::Transport(
+            TransportError::Http {
+                status: http::StatusCode::UNAUTHORIZED,
+                ..
+            }
+        )))
+    ));
+    assert!(
+        evidence.fingerprint()
+            == codex_login::AuthCredentialFingerprint::from_bearer_header("Bearer test-api-key")
+    );
+    pool.shutdown().await;
+    server.verify().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn refused_account_work_carries_no_credential_guess() -> Result<()> {
+    let mut config = sampler_config("http://127.0.0.1:1/v1".into());
+    config.require_account_work = true;
+    let pool = ConnectionPool::new(Arc::new(config));
+    let (result, evidence) =
+        tokio::time::timeout(Duration::from_secs(2), pool.lease_with_attempt(None)).await?;
+    assert!(matches!(result, Err(LunaSamplerError::AccountWorkRefused)));
+    assert!(evidence.fingerprint().is_none());
+    pool.shutdown().await;
     Ok(())
 }

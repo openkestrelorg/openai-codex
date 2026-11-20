@@ -19,6 +19,9 @@ use codex_protocol::config_types::ShellEnvironmentPolicy;
 use codex_protocol::exec_output::ExecToolCallOutput;
 use codex_protocol::exec_output::StreamOutput;
 use codex_protocol::shell_environment;
+use codex_protocol::shell_environment::CODEX_THREAD_ID_ENV_VAR;
+use codex_sandboxing::SandboxCleanupCustody;
+use codex_sandboxing::SandboxCleanupTightener;
 use codex_sandboxing::SandboxType;
 use codex_sandboxing::is_likely_sandbox_denied;
 use codex_utils_pty::ExecCommandSession;
@@ -47,6 +50,7 @@ use crate::network_policy_decisions::network_policy_decider;
 use crate::process::ExecProcessEventLog;
 use crate::process::sandbox_type_from_protocol;
 use crate::process_sandbox::prepare_exec_request_with_telemetry;
+use crate::protocol::ByteChunk;
 use crate::protocol::EXEC_CLOSED_METHOD;
 use crate::protocol::ExecClosedNotification;
 use crate::protocol::ExecEnvPolicy;
@@ -64,6 +68,7 @@ use crate::protocol::ProcessSandboxType;
 use crate::protocol::ProcessSignal;
 use crate::protocol::ReadParams;
 use crate::protocol::ReadResponse;
+use crate::protocol::SandboxCleanupSummary;
 use crate::protocol::SignalParams;
 use crate::protocol::SignalResponse;
 use crate::protocol::TerminateParams;
@@ -81,6 +86,7 @@ use crate::rpc_server_requests::RpcServerRequestSender;
 use crate::shell_snapshot::CapturePurpose;
 use crate::telemetry::ExecServerTelemetry;
 use crate::telemetry::ProcessMetricGuard;
+use crate::telemetry::record_recovery_retention_expired;
 
 const RETAINED_OUTPUT_BYTES_PER_PROCESS: usize = 1024 * 1024;
 // Each process/read chunk needs four JSON values. Keep retained replay below the
@@ -94,20 +100,15 @@ static NEXT_LOCAL_STDIN_WRITE_ID: AtomicU64 = AtomicU64::new(1);
 const EXITED_PROCESS_RETENTION: Duration = Duration::from_millis(25);
 #[cfg(not(test))]
 const EXITED_PROCESS_RETENTION: Duration = Duration::from_secs(30);
-
-#[derive(Clone)]
-struct RetainedOutputChunk {
-    seq: u64,
-    stream: ExecOutputStream,
-    chunk: Vec<u8>,
-}
+/// Existing reference cleanup grace; earlier caller bounds always win.
+const SANDBOX_CLEANUP_GRACE: Duration = Duration::from_secs(2);
 
 struct RunningProcess {
     session: ExecCommandSession,
     tty: bool,
     pipe_stdin: bool,
     accepted_stdin_write_ids: Arc<Mutex<AcceptedStdinWriteIds>>,
-    output: VecDeque<RetainedOutputChunk>,
+    output: VecDeque<ProcessOutputChunk>,
     retained_bytes: usize,
     next_seq: u64,
     exit_code: Option<i32>,
@@ -122,6 +123,26 @@ struct RunningProcess {
     sandbox_denied: bool,
     network_proxy_handle: Option<NetworkProxyHandle>,
     network_policy_shutdown: Option<CancellationToken>,
+    /// The executor's custody of a Linux sandbox launch. Taken by the exit
+    /// watcher when it starts collecting the launcher's cleanup report.
+    sandbox_cleanup_custody: Option<SandboxCleanupCustody>,
+    /// Kept separately so terminate/shutdown can still tighten the deadline
+    /// while collection holds the custody.
+    sandbox_cleanup_tightener: Option<SandboxCleanupTightener>,
+    /// `process/closed` waits until the cleanup report has been collected.
+    sandbox_cleanup_pending: bool,
+    sandbox_cleanup: Option<SandboxCleanupSummary>,
+}
+
+impl RunningProcess {
+    /// Explicit retirement (terminate or shutdown) bounds the launcher's
+    /// cleanup by `cleanup_deadline`. Only ever moves the deadline earlier, so
+    /// an earlier latch is kept.
+    fn tighten_sandbox_cleanup(&self, cleanup_deadline: std::time::Instant) {
+        if let Some(tightener) = &self.sandbox_cleanup_tightener {
+            tightener.tighten(cleanup_deadline);
+        }
+    }
 }
 
 /// Bounded cache of stdin write ids that have already been accepted for one process.
@@ -155,7 +176,30 @@ impl AcceptedStdinWriteIds {
     }
 }
 
-struct ProcessStart;
+/// A launch in progress. A termination that arrives before the process is
+/// tracked cancels the start and records the caller's cleanup deadline here.
+#[derive(Default)]
+struct ProcessStart {
+    cleanup_deadline: std::sync::Mutex<Option<std::time::Instant>>,
+}
+
+impl ProcessStart {
+    /// Keeps the earliest requested deadline.
+    fn request_cleanup_deadline(&self, cleanup_deadline: std::time::Instant) {
+        let mut current = self
+            .cleanup_deadline
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *current = Some(current.map_or(cleanup_deadline, |current| current.min(cleanup_deadline)));
+    }
+
+    fn cleanup_deadline(&self) -> Option<std::time::Instant> {
+        *self
+            .cleanup_deadline
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
 
 enum ProcessEntry {
     Starting(Arc<ProcessStart>),
@@ -166,6 +210,8 @@ struct Inner {
     notifications: std::sync::RwLock<Option<RpcNotificationSender>>,
     requests: Arc<std::sync::RwLock<Option<RpcServerRequestSender>>>,
     processes: Mutex<HashMap<ProcessId, ProcessEntry>>,
+    rpc_output_retention: Option<Duration>,
+    credential_brokers: codex_network_proxy::RemoteCredentialBrokerCache,
     #[cfg(unix)]
     shell_snapshots: crate::shell_snapshot::ShellSnapshotCache,
     telemetry: ExecServerTelemetry,
@@ -203,6 +249,7 @@ impl LocalProcess {
             RpcNotificationSender::new(outgoing_tx),
             ExecServerTelemetry::default(),
             runtime_paths,
+            /*rpc_output_retention*/ None,
         )
     }
 
@@ -210,14 +257,21 @@ impl LocalProcess {
         notifications: RpcNotificationSender,
         telemetry: ExecServerTelemetry,
         runtime_paths: ExecServerRuntimeOptions,
+        output_retention: Duration,
     ) -> Self {
-        Self::with_runtime_paths(notifications, telemetry, Some(runtime_paths))
+        Self::with_runtime_paths(
+            notifications,
+            telemetry,
+            Some(runtime_paths),
+            Some(output_retention),
+        )
     }
 
     fn with_runtime_paths(
         notifications: RpcNotificationSender,
         telemetry: ExecServerTelemetry,
         runtime_paths: Option<ExecServerRuntimeOptions>,
+        rpc_output_retention: Option<Duration>,
     ) -> Self {
         let requests = notifications.request_sender();
         Self {
@@ -225,6 +279,8 @@ impl LocalProcess {
                 notifications: std::sync::RwLock::new(Some(notifications)),
                 requests: Arc::new(std::sync::RwLock::new(Some(requests))),
                 processes: Mutex::new(HashMap::new()),
+                rpc_output_retention,
+                credential_brokers: codex_network_proxy::RemoteCredentialBrokerCache::default(),
                 #[cfg(unix)]
                 shell_snapshots: crate::shell_snapshot::ShellSnapshotCache::default(),
                 telemetry,
@@ -234,24 +290,30 @@ impl LocalProcess {
     }
 
     pub(crate) async fn shutdown(&self) {
+        let cleanup_deadline = std::time::Instant::now() + SANDBOX_CLEANUP_GRACE;
         let remaining = {
             let mut processes = self.inner.processes.lock().await;
             processes
                 .drain()
-                .filter_map(|(_, process)| match process {
-                    ProcessEntry::Starting(_) => None,
-                    ProcessEntry::Running(process) => Some(process),
+                .filter_map(|(process_id, process)| match process {
+                    ProcessEntry::Starting(start) => {
+                        start.request_cleanup_deadline(cleanup_deadline);
+                        None
+                    }
+                    ProcessEntry::Running(process) => Some((process_id, process)),
                 })
                 .collect::<Vec<_>>()
         };
-        for mut process in remaining {
+        for (process_id, mut process) in remaining {
             if let Some(network_policy_shutdown) = process.network_policy_shutdown.take() {
                 network_policy_shutdown.cancel();
             }
             if let Some(metrics) = process.metrics.take() {
                 metrics.finish("terminated");
             }
+            process.tighten_sandbox_cleanup(cleanup_deadline);
             process.session.terminate();
+            retire_untracked_sandbox_cleanup(process_id, process.sandbox_cleanup_custody.take());
         }
     }
 
@@ -367,17 +429,16 @@ impl LocalProcess {
                 "shell snapshots are unsupported on this platform".to_string(),
             ));
         }
-        let prepared = prepare_exec_request_with_telemetry(
+        let mut prepared = prepare_exec_request_with_telemetry(
             &params,
             child_env(&params),
             self.runtime_paths.as_ref(),
             network_policy_decider,
             network_policy_audit_observer,
+            &self.inner.credential_brokers,
             &telemetry,
         )
         .await?;
-        #[cfg(unix)]
-        let mut prepared = prepared;
         #[cfg(unix)]
         let snapshot_file = self
             .inner
@@ -387,11 +448,16 @@ impl LocalProcess {
                 &mut prepared,
                 &self.inner.telemetry,
                 CapturePurpose::Execution,
+                &self.inner.credential_brokers,
             )
             .await?;
         if prepared.command.is_empty() {
             return Err(invalid_params("argv must not be empty".to_string()));
         }
+        // Snapshot replay has already rewritten the command: attach custody
+        // to the final launcher argv, before reserving Starting.
+        let mut sandbox_cleanup_custody =
+            take_sandbox_cleanup_custody(prepared.sandbox, &mut prepared.command)?;
         let sandbox_type = match prepared.sandbox {
             SandboxType::None => Some(ProcessSandboxType::None),
             SandboxType::MacosSeatbelt => Some(ProcessSandboxType::MacosSeatbelt),
@@ -400,7 +466,7 @@ impl LocalProcess {
             SandboxType::WindowsMxc => Some(ProcessSandboxType::WindowsMxc),
         };
 
-        let start = Arc::new(ProcessStart);
+        let start = Arc::new(ProcessStart::default());
         {
             let mut process_map = self.inner.processes.lock().await;
             if process_map.contains_key(&process_id) {
@@ -415,12 +481,15 @@ impl LocalProcess {
         }
 
         #[cfg(unix)]
-        let inherited_fds = snapshot_file
+        let mut inherited_fds = snapshot_file
             .iter()
             .map(std::os::fd::AsRawFd::as_raw_fd)
             .collect::<Vec<_>>();
         #[cfg(not(unix))]
-        let inherited_fds = Vec::new();
+        let mut inherited_fds = Vec::new();
+        if let Some(custody) = &sandbox_cleanup_custody {
+            inherited_fds.extend(custody.inherited_fds());
+        }
         let spawned_result = codex_sandboxing::spawn_process(codex_sandboxing::SpawnRequest {
             command: &prepared.command,
             cwd: prepared.cwd.as_path(),
@@ -433,20 +502,39 @@ impl LocalProcess {
             inherited_fds: codex_utils_pty::ChildFds::Attached(&inherited_fds),
         })
         .await;
+        // The spawn opened its pin before any wait task could reap the child.
+        // Take it immediately, success or failure, before a lock or await.
+        if let Some(custody) = &mut sandbox_cleanup_custody {
+            custody.spawned_with_pin(
+                spawned_result
+                    .as_ref()
+                    .ok()
+                    .and_then(|spawned| spawned.session.take_launcher_pin()),
+            );
+        }
         #[cfg(unix)]
         drop(snapshot_file);
         let spawned = match spawned_result {
             Ok(spawned) => spawned,
             Err(err) => {
                 telemetry.log(ProcessTelemetryEvent::SpawnFailed, prepared.sandbox);
-                let mut process_map = self.inner.processes.lock().await;
-                if matches!(
-                    process_map.get(&process_id),
-                    Some(ProcessEntry::Starting(current)) if Arc::ptr_eq(current, &start)
-                ) {
-                    process_map.remove(&process_id);
+                {
+                    let mut process_map = self.inner.processes.lock().await;
+                    if matches!(
+                        process_map.get(&process_id),
+                        Some(ProcessEntry::Starting(current)) if Arc::ptr_eq(current, &start)
+                    ) {
+                        process_map.remove(&process_id);
+                    }
                 }
-                return Err(internal_error(err.to_string()));
+                let cleanup = match sandbox_cleanup_custody {
+                    Some(custody) => Some(custody.collect(SANDBOX_CLEANUP_GRACE).await),
+                    None => None,
+                };
+                return Err(crate::protocol::attach_sandbox_cleanup_to_error(
+                    internal_error(err.to_string()),
+                    cleanup,
+                ));
             }
         };
         let metrics = self.inner.telemetry.process_started(&process_id);
@@ -464,8 +552,16 @@ impl LocalProcess {
                 Some(ProcessEntry::Starting(current)) if Arc::ptr_eq(current, &start)
             ) {
                 drop(process_map);
+                if let Some(custody) = &sandbox_cleanup_custody {
+                    custody.tighten(
+                        start
+                            .cleanup_deadline()
+                            .unwrap_or_else(|| std::time::Instant::now() + SANDBOX_CLEANUP_GRACE),
+                    );
+                }
                 spawned.session.terminate();
                 metrics.finish("terminated");
+                retire_untracked_sandbox_cleanup(process_id.clone(), sandbox_cleanup_custody);
                 return Err(invalid_request(format!(
                     "process {process_id} start was cancelled"
                 )));
@@ -494,6 +590,12 @@ impl LocalProcess {
                     sandbox_denied: false,
                     network_proxy_handle: prepared.network_proxy_handle,
                     network_policy_shutdown,
+                    sandbox_cleanup_tightener: sandbox_cleanup_custody
+                        .as_ref()
+                        .map(SandboxCleanupCustody::tightener),
+                    sandbox_cleanup_pending: sandbox_cleanup_custody.is_some(),
+                    sandbox_cleanup_custody,
+                    sandbox_cleanup: None,
                 })),
             );
         }
@@ -578,16 +680,12 @@ impl LocalProcess {
                 let mut total_bytes = 0;
                 let mut next_seq = process.next_seq;
                 for retained in process.output.iter().filter(|chunk| chunk.seq > after_seq) {
-                    let chunk_len = retained.chunk.len();
+                    let chunk_len = retained.chunk.0.len();
                     if !chunks.is_empty() && total_bytes + chunk_len > max_bytes {
                         break;
                     }
                     total_bytes += chunk_len;
-                    chunks.push(ProcessOutputChunk {
-                        seq: retained.seq,
-                        stream: retained.stream,
-                        chunk: retained.chunk.clone().into(),
-                    });
+                    chunks.push(retained.clone());
                     next_seq = retained.seq + 1;
                     if total_bytes >= max_bytes {
                         break;
@@ -598,6 +696,7 @@ impl LocalProcess {
                 }
                 (
                     ReadResponse {
+                        sandbox_cleanup: process.sandbox_cleanup,
                         chunks,
                         next_seq,
                         exited: process.exit_code.is_some(),
@@ -723,13 +822,40 @@ impl LocalProcess {
         &self,
         params: TerminateParams,
     ) -> Result<TerminateResponse, JSONRPCErrorError> {
+        // A relative wire budget is anchored once, before awaiting a lock.
+        // The caller separately keeps its own original deadline; clocks on
+        // different hosts are not claimed to be identical.
+        let received_at = std::time::Instant::now();
+        let cleanup_deadline = params.cleanup_deadline_ms.map(|cleanup_deadline_ms| {
+            // An unrepresentable deadline is no bound; fall back to the grace.
+            received_at
+                .checked_add(Duration::from_millis(cleanup_deadline_ms))
+                .unwrap_or(received_at + SANDBOX_CLEANUP_GRACE)
+        });
+        self.terminate_process_until(&params.process_id, cleanup_deadline)
+            .await
+    }
+
+    /// Terminates a process. With `cleanup_deadline`, its sandbox cleanup is
+    /// tightened to exactly that instant (an earlier latch is kept); without
+    /// one, to now plus the termination grace.
+    async fn terminate_process_until(
+        &self,
+        process_id: &ProcessId,
+        cleanup_deadline: Option<std::time::Instant>,
+    ) -> Result<TerminateResponse, JSONRPCErrorError> {
+        let cleanup_deadline =
+            cleanup_deadline.unwrap_or_else(|| std::time::Instant::now() + SANDBOX_CLEANUP_GRACE);
         let running = {
             let mut process_map = self.inner.processes.lock().await;
-            match process_map.get_mut(&params.process_id) {
+            match process_map.get_mut(process_id) {
                 Some(ProcessEntry::Running(process)) => {
                     if let Some(network_policy_shutdown) = &process.network_policy_shutdown {
                         network_policy_shutdown.cancel();
                     }
+                    // Termination stops the work and bounds cleanup; it never
+                    // extends a deadline (the tightener only moves it earlier).
+                    process.tighten_sandbox_cleanup(cleanup_deadline);
                     if process.exit_code.is_some() {
                         return Ok(TerminateResponse { running: false });
                     }
@@ -737,8 +863,10 @@ impl LocalProcess {
                     process.session.terminate();
                     true
                 }
-                Some(ProcessEntry::Starting(_)) => {
-                    process_map.remove(&params.process_id);
+                Some(ProcessEntry::Starting(start)) => {
+                    let start = Arc::clone(start);
+                    process_map.remove(process_id);
+                    start.request_cleanup_deadline(cleanup_deadline);
                     true
                 }
                 None => false,
@@ -746,6 +874,74 @@ impl LocalProcess {
         };
 
         Ok(TerminateResponse { running })
+    }
+}
+
+/// Takes the executor's custody of a Linux sandbox launch and attaches it to
+/// the final launcher argv. `None` for every launch that is not the Linux
+/// sandbox launcher. The executor has no original retirement deadline for a
+/// process, so the deadline starts unset; terminate, shutdown, or collection
+/// after exit sets it.
+fn take_sandbox_cleanup_custody(
+    sandbox: SandboxType,
+    command: &mut Vec<String>,
+) -> Result<Option<SandboxCleanupCustody>, JSONRPCErrorError> {
+    let custody = SandboxCleanupCustody::for_launch(
+        sandbox, /*cleanup_deadline*/ None, /*scope*/ None,
+    )
+    .map_err(|err| internal_error(format!("failed to take sandbox cleanup custody: {err}")))?;
+    if let Some(custody) = &custody {
+        custody.attach_to_launcher_argv(command).map_err(|err| {
+            internal_error(format!("failed to attach sandbox cleanup custody: {err}"))
+        })?;
+    }
+    Ok(custody)
+}
+
+/// Collects the cleanup report of a launch the executor no longer tracks
+/// (shutdown or a cancelled start). The caller has already bounded the
+/// deadline; collection runs off the async runtime and only logs, because
+/// no `process/closed` will be published for it.
+fn retire_untracked_sandbox_cleanup(process_id: ProcessId, custody: Option<SandboxCleanupCustody>) {
+    let Some(custody) = custody else {
+        return;
+    };
+    tokio::spawn(async move {
+        let sandbox_cleanup = custody.collect(SANDBOX_CLEANUP_GRACE).await;
+        tracing::info!(
+            process.id = %process_id,
+            sandbox_cleanup = ?sandbox_cleanup,
+            "collected sandbox cleanup of a retired process"
+        );
+    });
+}
+
+/// Collects the launcher's cleanup report after the process exited, before
+/// `process/closed` is published. Never past the cleanup deadline: without
+/// an earlier one, collection itself grants only the cleanup grace.
+async fn collect_sandbox_cleanup(process_id: &ProcessId, inner: &Inner) {
+    let custody = {
+        let mut processes = inner.processes.lock().await;
+        match processes.get_mut(process_id) {
+            Some(ProcessEntry::Running(process)) => process.sandbox_cleanup_custody.take(),
+            Some(ProcessEntry::Starting(_)) | None => None,
+        }
+    };
+    let Some(custody) = custody else {
+        return;
+    };
+    let sandbox_cleanup = custody.collect(SANDBOX_CLEANUP_GRACE).await;
+    tracing::debug!(sandbox_cleanup = ?sandbox_cleanup, "collected sandbox cleanup");
+    let mut processes = inner.processes.lock().await;
+    if let Some(ProcessEntry::Running(process)) = processes.get_mut(process_id) {
+        process.sandbox_cleanup = Some(sandbox_cleanup);
+        process.sandbox_cleanup_pending = false;
+    } else {
+        tracing::info!(
+            process.id = %process_id,
+            sandbox_cleanup = ?sandbox_cleanup,
+            "collected sandbox cleanup of a retired process"
+        );
     }
 }
 
@@ -761,7 +957,30 @@ fn child_env(params: &ExecParams) -> HashMap<String, String> {
     };
     env.remove(crate::CODEX_EXEC_SERVER_EXIT_ON_STDIN_CLOSE_ENV_VAR);
     env.retain(|name, _| !shell_environment::is_non_inheritable_env_var(name));
+    apply_exec_metadata(&mut env, params.metadata.as_ref());
     env
+}
+
+pub(crate) fn apply_exec_metadata(
+    env: &mut HashMap<String, String>,
+    metadata: Option<&crate::protocol::ExecMetadata>,
+) {
+    if let Some(metadata) = metadata {
+        #[cfg(windows)]
+        env.retain(|name, _| !name.eq_ignore_ascii_case(CODEX_THREAD_ID_ENV_VAR));
+        match metadata.thread_id {
+            Some(thread_id) => {
+                env.insert(CODEX_THREAD_ID_ENV_VAR.to_string(), thread_id.to_string());
+            }
+            None => {
+                env.remove(CODEX_THREAD_ID_ENV_VAR);
+            }
+        }
+    }
+    shell_environment::set_tool_call_id_env_var(
+        env,
+        metadata.and_then(|metadata| metadata.tool_call_id.as_deref()),
+    );
 }
 
 pub(crate) fn shell_environment_policy(env_policy: &ExecEnvPolicy) -> ShellEnvironmentPolicy {
@@ -824,6 +1043,7 @@ impl ExecBackend for LocalProcess {
                 self.runtime_paths.as_ref(),
                 /*network_policy_decider*/ None,
                 /*network_policy_audit_observer*/ None,
+                &self.inner.credential_brokers,
                 &ProcessTelemetry::default(),
             )
             .await
@@ -835,6 +1055,7 @@ impl ExecBackend for LocalProcess {
                     &mut prepared,
                     &self.inner.telemetry,
                     CapturePurpose::Prewarm,
+                    &self.inner.credential_brokers,
                 )
                 .await
                 .map(|_| ())
@@ -901,6 +1122,19 @@ impl ExecProcess for LocalExecProcess {
     fn terminate(&self) -> ExecProcessFuture<'_, ()> {
         Box::pin(LocalExecProcess::terminate(self))
     }
+
+    fn terminate_with_cleanup_deadline(
+        &self,
+        deadline: std::time::Instant,
+    ) -> ExecProcessFuture<'_, ()> {
+        Box::pin(async move {
+            self.backend
+                .terminate_process_until(&self.process_id, Some(deadline))
+                .await
+                .map_err(map_handler_error)?;
+            Ok(())
+        })
+    }
 }
 
 impl LocalProcess {
@@ -954,6 +1188,7 @@ impl LocalProcess {
 
     async fn terminate(&self, process_id: &ProcessId) -> Result<(), ExecServerError> {
         self.terminate_process(TerminateParams {
+            cleanup_deadline_ms: None,
             process_id: process_id.clone(),
         })
         .await
@@ -984,6 +1219,7 @@ async fn stream_output(
 ) {
     while let Some(chunk) = receiver.recv().await {
         let _chunk_len = chunk.len();
+        let chunk = ByteChunk::from(chunk);
         let notification = {
             let mut processes = inner.processes.lock().await;
             let Some(entry) = processes.get_mut(&process_id) else {
@@ -994,26 +1230,19 @@ async fn stream_output(
             };
             let seq = process.next_seq;
             process.next_seq += 1;
-            process.retained_bytes += chunk.len();
-            process.output.push_back(RetainedOutputChunk {
-                seq,
-                stream,
-                chunk: chunk.clone(),
-            });
+            process.retained_bytes += chunk.0.len();
+            let output = ProcessOutputChunk { seq, stream, chunk };
+            process.output.push_back(output.clone());
             while process.retained_bytes > RETAINED_OUTPUT_BYTES_PER_PROCESS
                 || process.output.len() > RETAINED_OUTPUT_CHUNKS_PER_PROCESS
             {
                 let Some(evicted) = process.output.pop_front() else {
                     break;
                 };
-                process.retained_bytes = process.retained_bytes.saturating_sub(evicted.chunk.len());
+                process.retained_bytes =
+                    process.retained_bytes.saturating_sub(evicted.chunk.0.len());
             }
             let _ = process.wake_tx.send(seq);
-            let output = ProcessOutputChunk {
-                seq,
-                stream,
-                chunk: chunk.into(),
-            };
             process
                 .events
                 .publish(ExecProcessEvent::Output(output.clone()));
@@ -1087,11 +1316,11 @@ fn watch_exit(
                     for chunk in &process.output {
                         match chunk.stream {
                             ExecOutputStream::Stdout | ExecOutputStream::Pty => {
-                                stdout.extend_from_slice(&chunk.chunk);
+                                stdout.extend_from_slice(&chunk.chunk.0);
                             }
-                            ExecOutputStream::Stderr => stderr.extend_from_slice(&chunk.chunk),
+                            ExecOutputStream::Stderr => stderr.extend_from_slice(&chunk.chunk.0),
                         }
-                        aggregated.extend_from_slice(&chunk.chunk);
+                        aggregated.extend_from_slice(&chunk.chunk.0);
                     }
                     let exec_output = ExecToolCallOutput {
                         exit_code,
@@ -1141,6 +1370,8 @@ fn watch_exit(
                 .await;
         }
 
+        // Exited stays prompt; Closed waits for original cleanup evidence.
+        collect_sandbox_cleanup(&process_id, &inner).await;
         maybe_emit_closed(process_id, Arc::clone(&inner)).await;
     }
     .instrument(process_span)
@@ -1168,7 +1399,11 @@ async fn maybe_emit_closed(process_id: ProcessId, inner: Arc<Inner>) {
             return;
         };
 
-        if process.closed || process.open_streams != 0 || process.exit_code.is_none() {
+        if process.closed
+            || process.open_streams != 0
+            || process.exit_code.is_none()
+            || process.sandbox_cleanup_pending
+        {
             return;
         }
 
@@ -1179,9 +1414,13 @@ async fn maybe_emit_closed(process_id: ProcessId, inner: Arc<Inner>) {
         let seq = process.next_seq;
         process.next_seq += 1;
         let _ = process.wake_tx.send(seq);
-        process.events.publish(ExecProcessEvent::Closed { seq });
+        process.events.publish(ExecProcessEvent::Closed {
+            seq,
+            sandbox_cleanup: process.sandbox_cleanup,
+        });
         (
             ExecClosedNotification {
+                sandbox_cleanup: process.sandbox_cleanup,
                 process_id: process_id.clone(),
                 seq,
             },
@@ -1198,17 +1437,31 @@ async fn maybe_emit_closed(process_id: ProcessId, inner: Arc<Inner>) {
 
     output_notify.notify_waiters();
     let cleanup_process_id = process_id.clone();
-    let cleanup_inner = Arc::clone(&inner);
+    let cleanup_inner = Arc::downgrade(&inner);
+    let retention = inner
+        .rpc_output_retention
+        .unwrap_or(EXITED_PROCESS_RETENTION);
     tokio::spawn(async move {
-        tokio::time::sleep(EXITED_PROCESS_RETENTION).await;
-        let mut processes = cleanup_inner.processes.lock().await;
-        match processes.entry(cleanup_process_id) {
-            Entry::Occupied(entry) => {
-                if matches!(entry.get(), ProcessEntry::Running(process) if process.closed) {
-                    entry.remove();
-                }
+        tokio::time::sleep(retention).await;
+        let Some(cleanup_inner) = cleanup_inner.upgrade() else {
+            return;
+        };
+        {
+            let mut processes = cleanup_inner.processes.lock().await;
+            let Entry::Occupied(entry) = processes.entry(cleanup_process_id) else {
+                return;
+            };
+            if !matches!(entry.get(), ProcessEntry::Running(process)
+                if process.closed && Arc::ptr_eq(&process.output_notify, &output_notify))
+            {
+                return;
             }
-            Entry::Vacant(_) => {}
+            entry.remove();
+        }
+        if cleanup_inner.rpc_output_retention.is_some()
+            && notification_sender(&cleanup_inner).is_none()
+        {
+            record_recovery_retention_expired("closed_output_timer", retention);
         }
     });
 
@@ -1230,6 +1483,8 @@ fn notification_sender(inner: &Inner) -> Option<RpcNotificationSender> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    use crate::protocol::SandboxCleanupState;
     use codex_exec_server_protocol::JSONRPCMessage;
     use codex_exec_server_protocol::JSONRPCResponse;
     use codex_exec_server_protocol::RequestId;
@@ -1304,6 +1559,7 @@ mod tests {
             RpcNotificationSender::new(outgoing_tx),
             ExecServerTelemetry::default(),
             /*runtime_paths*/ None,
+            /*rpc_output_retention*/ None,
         );
         let proxy_config = RemoteNetworkProxyConfig::from_effective_config(&NetworkProxyConfig {
             enabled: true,
@@ -1413,6 +1669,7 @@ mod tests {
                 RpcNotificationSender::new(outgoing_tx),
                 telemetry,
                 /*runtime_paths*/ None,
+                /*rpc_output_retention*/ None,
             ),
             metrics,
             exporter,
@@ -1548,9 +1805,14 @@ mod tests {
 
     #[test]
     fn child_env_applies_policy_then_overlay() {
+        let thread_id =
+            codex_protocol::ThreadId::from_string("019d25f0-6728-7ce2-908f-c3c187323e5b")
+                .expect("thread id");
         let mut params = test_exec_params(HashMap::from([
             ("OVERLAY".to_string(), "overlay".to_string()),
             ("POLICY_SET".to_string(), "overlay-wins".to_string()),
+            ("CODEX_THREAD_ID".into(), "overlay-thread".into()),
+            ("CODEX_TOOL_CALL_ID".into(), "overlay-call".into()),
             (
                 "openai_identity_token_file".to_string(),
                 "/run/identity-token".to_string(),
@@ -1563,19 +1825,89 @@ mod tests {
             r#set: HashMap::from([
                 ("POLICY_SET".to_string(), "policy".to_string()),
                 ("OpenAI_Federation_Rule_Id".to_string(), "rule".to_string()),
+                ("CODEX_THREAD_ID".into(), "policy-thread".into()),
+                ("CODEX_TOOL_CALL_ID".into(), "policy-call".into()),
             ]),
             include_only: Vec::new(),
+        });
+        params.metadata = Some(crate::protocol::ExecMetadata {
+            thread_id: Some(thread_id),
+            tool_call_id: Some("current-call".into()),
         });
 
         let mut expected = HashMap::from([
             ("OVERLAY".to_string(), "overlay".to_string()),
             ("POLICY_SET".to_string(), "overlay-wins".to_string()),
+            ("CODEX_THREAD_ID".into(), thread_id.to_string()),
+            ("CODEX_TOOL_CALL_ID".into(), "current-call".into()),
         ]);
         if cfg!(target_os = "windows") {
             expected.insert("PATHEXT".to_string(), ".COM;.EXE;.BAT;.CMD".to_string());
         }
 
         assert_eq!(child_env(&params), expected);
+    }
+
+    #[test]
+    fn child_env_partial_metadata_removes_stale_counterpart() {
+        let thread_id =
+            codex_protocol::ThreadId::from_string("019d25f0-6728-7ce2-908f-c3c187323e5b")
+                .expect("thread id");
+        for (thread_id, call_id) in [
+            (Some(thread_id), None),
+            (None, Some("exec-call-only")),
+            (None, None),
+        ] {
+            let mut params = test_exec_params(HashMap::from([
+                ("CODEX_THREAD_ID".into(), "stale-thread".into()),
+                ("Codex_Thread_Id".into(), "mixed-case-thread".into()),
+                ("codex_thread_id".into(), "lowercase-thread".into()),
+                ("CODEX_TOOL_CALL_ID".into(), "stale-call".into()),
+                ("OTHER".into(), "unchanged".into()),
+            ]));
+            params.metadata = Some(crate::protocol::ExecMetadata {
+                thread_id,
+                tool_call_id: call_id.map(str::to_string),
+            });
+
+            let mut expected = HashMap::from([("OTHER".into(), "unchanged".into())]);
+            #[cfg(not(windows))]
+            expected.insert("Codex_Thread_Id".into(), "mixed-case-thread".into());
+            #[cfg(not(windows))]
+            expected.insert("codex_thread_id".into(), "lowercase-thread".into());
+            if let Some(thread_id) = thread_id {
+                expected.insert("CODEX_THREAD_ID".into(), thread_id.to_string());
+            }
+            if let Some(call_id) = call_id {
+                expected.insert("CODEX_TOOL_CALL_ID".into(), call_id.to_string());
+            }
+            assert_eq!(
+                child_env(&params),
+                expected,
+                "metadata: {:?}",
+                params.metadata
+            );
+        }
+    }
+
+    #[test]
+    fn child_env_without_metadata_preserves_thread_only_context() {
+        let params = test_exec_params(HashMap::from([
+            ("CODEX_THREAD_ID".into(), "prewarm-thread".into()),
+            ("Codex_Thread_Id".into(), "mixed-case-thread".into()),
+            ("CODEX_TOOL_CALL_ID".into(), "stale-call".into()),
+            ("Codex_Tool_Call_Id".into(), "mixed-case-call".into()),
+        ]));
+
+        assert_eq!(
+            child_env(&params),
+            HashMap::from([
+                ("CODEX_THREAD_ID".into(), "prewarm-thread".into()),
+                ("Codex_Thread_Id".into(), "mixed-case-thread".into()),
+                #[cfg(not(windows))]
+                ("Codex_Tool_Call_Id".into(), "mixed-case-call".into()),
+            ]),
+        );
     }
 
     #[tokio::test]
@@ -1598,6 +1930,7 @@ mod tests {
         assert_eq!(
             backend
                 .terminate_process(TerminateParams {
+                    cleanup_deadline_ms: None,
                     process_id: process.process_id.clone(),
                 })
                 .await
@@ -1634,6 +1967,7 @@ mod tests {
         assert_eq!(
             backend
                 .terminate_process(TerminateParams {
+                    cleanup_deadline_ms: None,
                     process_id: process.process_id.clone(),
                 })
                 .await
@@ -1670,6 +2004,7 @@ mod tests {
         assert_eq!(
             exit_response,
             ReadResponse {
+                sandbox_cleanup: None,
                 chunks: Vec::new(),
                 next_seq: 2,
                 exited: true,
@@ -1734,10 +2069,10 @@ mod tests {
                 panic!("process should be running");
             };
             running.output = (1..=retained_chunk_count)
-                .map(|seq| RetainedOutputChunk {
+                .map(|seq| ProcessOutputChunk {
                     seq,
                     stream: ExecOutputStream::Stdout,
-                    chunk: vec![b'x'],
+                    chunk: vec![b'x'].into(),
                 })
                 .collect();
             running.retained_bytes = RETAINED_OUTPUT_CHUNKS_PER_PROCESS;
@@ -1792,6 +2127,7 @@ mod tests {
         assert_eq!(
             response,
             ReadResponse {
+                sandbox_cleanup: None,
                 chunks: expected_chunks,
                 next_seq: retained_chunk_count + 2,
                 exited: false,
@@ -1845,6 +2181,8 @@ mod tests {
         let state = NetworkProxyState::from_remote_launch_config(
             RemoteNetworkProxyLaunchConfig::new(proxy_config),
             codex_utils_path_uri::Platform::native(),
+            &codex_network_proxy::RemoteCredentialBrokerCache::default(),
+            &HashMap::new(),
         )
         .expect("build network proxy state");
         let proxy = NetworkProxy::builder()
@@ -1977,6 +2315,483 @@ mod tests {
         backend.shutdown().await;
     }
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn sandboxed_launch_attaches_cleanup_custody_to_launcher_argv_and_fds() {
+        let command_directory = tempfile::tempdir().expect("command directory");
+        let cwd = PathUri::from_host_native_path(command_directory.path()).expect("cwd URI");
+        let self_exe = std::env::current_exe().expect("current executable");
+        let runtime_paths =
+            ExecServerRuntimeOptions::new(self_exe.clone(), Some(self_exe)).expect("runtime paths");
+        let mut params = test_exec_params(HashMap::new());
+        params.argv = vec!["/bin/sh".to_string(), "-c".to_string(), "true".to_string()];
+        params.cwd = cwd.clone();
+        params.sandbox = Some(crate::FileSystemSandboxContext::from_permission_profile(
+            codex_protocol::models::PermissionProfile::workspace_write(),
+            cwd,
+        ));
+        let mut prepared = prepare_exec_request_with_telemetry(
+            &params,
+            HashMap::new(),
+            Some(&runtime_paths),
+            /*network_policy_decider*/ None,
+            /*network_policy_audit_observer*/ None,
+            &codex_network_proxy::RemoteCredentialBrokerCache::default(),
+            &ProcessTelemetry::default(),
+        )
+        .await
+        .expect("prepare sandboxed request");
+        assert_eq!(prepared.sandbox, SandboxType::LinuxSeccomp);
+        let launcher_argv = prepared.command.clone();
+
+        let custody = take_sandbox_cleanup_custody(prepared.sandbox, &mut prepared.command)
+            .expect("take sandbox cleanup custody")
+            .expect("Linux sandbox launches have cleanup custody");
+
+        let fds = custody.inherited_fds();
+        let separator = prepared
+            .command
+            .iter()
+            .position(|arg| arg == "--")
+            .expect("launcher argv separator");
+        assert_eq!(
+            prepared.command[separator - 4..separator].to_vec(),
+            vec![
+                "--cleanup-deadline-fd".to_string(),
+                fds[0].to_string(),
+                "--cleanup-report-fd".to_string(),
+                fds[1].to_string(),
+            ]
+        );
+        // Exec-server processes have no command timeout, hence no original deadline.
+        assert_eq!(custody.deadline(), None);
+        assert!(
+            !prepared
+                .command
+                .iter()
+                .any(|arg| arg == "--cleanup-deadline-monotonic-ns")
+        );
+        let mut without_custody = prepared.command.clone();
+        without_custody.drain(separator - 4..separator);
+        assert_eq!(without_custody, launcher_argv);
+        // The spawn clears CLOEXEC only in the launcher; the executor's copies stay private.
+        for fd in fds {
+            // SAFETY: fcntl only inspects the descriptor flags.
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            assert!(
+                flags >= 0 && flags & libc::FD_CLOEXEC != 0,
+                "fd {fd} flags {flags}"
+            );
+        }
+    }
+
+    #[test]
+    fn unsandboxed_launch_has_no_cleanup_custody() {
+        let mut command = vec!["/bin/true".to_string()];
+
+        let custody = take_sandbox_cleanup_custody(SandboxType::None, &mut command)
+            .expect("unsandboxed launches need no custody");
+
+        assert!(custody.is_none());
+        assert_eq!(command, vec!["/bin/true".to_string()]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn terminate_tightens_sandbox_cleanup_deadline() {
+        let backend = LocalProcess::default();
+        let mut process = spawn_test_process(&backend, "terminate-cleanup").await;
+        install_cleanup_custody(
+            &backend,
+            &process.process_id,
+            /*spawned*/ true,
+            /*cleanup_deadline*/ None,
+        )
+        .await;
+
+        let before_terminate = std::time::Instant::now();
+        backend
+            .terminate_process(TerminateParams {
+                process_id: process.process_id.clone(),
+                cleanup_deadline_ms: None,
+            })
+            .await
+            .expect("terminate process");
+        let after_terminate = std::time::Instant::now();
+
+        let deadline = cleanup_deadline(&backend, &process.process_id)
+            .await
+            .expect("terminate must set a cleanup deadline");
+        assert!(deadline >= before_terminate + SANDBOX_CLEANUP_GRACE);
+        assert!(deadline <= after_terminate + SANDBOX_CLEANUP_GRACE);
+
+        // A later termination request never extends the deadline.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        backend
+            .terminate_process(TerminateParams {
+                process_id: process.process_id.clone(),
+                cleanup_deadline_ms: None,
+            })
+            .await
+            .expect("terminate process again");
+        assert_eq!(
+            cleanup_deadline(&backend, &process.process_id).await,
+            Some(deadline)
+        );
+
+        process.exit(/*exit_code*/ 0);
+        drop(process.stdout_tx);
+        drop(process.stderr_tx);
+        let closed = timeout(
+            Duration::from_secs(5),
+            read_process_until_closed(&backend, &process.process_id),
+        )
+        .await
+        .expect("process should close by the tightened cleanup deadline");
+        // The launcher's ends closed without a declaration or receipt. Report
+        // EOF proves nothing, so collection runs to the tightened deadline and
+        // the launch stays unproven: timed out, never joined.
+        assert_eq!(
+            closed.sandbox_cleanup,
+            Some(SandboxCleanupSummary {
+                state: SandboxCleanupState::TimedOut,
+                reaped: 0,
+                preserved_unproven: 0,
+                host_owned: 0,
+                handed_off: 0,
+                timed_out: 0,
+                joined: false,
+            })
+        );
+        backend.shutdown().await;
+    }
+
+    /// The local `ExecProcess` path tightens to exactly the caller's instant,
+    /// without adding a fresh termination grace.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn terminate_with_cleanup_deadline_tightens_to_the_callers_instant() {
+        let backend = LocalProcess::default();
+        let process = spawn_test_process(&backend, "terminate-caller-deadline").await;
+        install_cleanup_custody(
+            &backend,
+            &process.process_id,
+            /*spawned*/ true,
+            /*cleanup_deadline*/ None,
+        )
+        .await;
+        let exec_process = local_exec_process(&backend, &process.process_id).await;
+
+        let caller_deadline = std::time::Instant::now() + Duration::from_millis(7_250);
+        ExecProcess::terminate_with_cleanup_deadline(&exec_process, caller_deadline)
+            .await
+            .expect("terminate with cleanup deadline");
+
+        assert_eq!(
+            cleanup_deadline(&backend, &process.process_id).await,
+            Some(caller_deadline)
+        );
+        backend.shutdown().await;
+    }
+
+    /// `process/terminate` with `cleanupDeadlineMs` anchors the caller's
+    /// remaining time at receipt instead of the fixed grace.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn terminate_request_applies_cleanup_deadline_ms_at_receipt() {
+        let backend = LocalProcess::default();
+        let process = spawn_test_process(&backend, "terminate-wire-deadline").await;
+        install_cleanup_custody(
+            &backend,
+            &process.process_id,
+            /*spawned*/ true,
+            /*cleanup_deadline*/ None,
+        )
+        .await;
+
+        let before = std::time::Instant::now();
+        backend
+            .terminate_process(TerminateParams {
+                process_id: process.process_id.clone(),
+                cleanup_deadline_ms: Some(7_250),
+            })
+            .await
+            .expect("terminate process");
+        let after = std::time::Instant::now();
+
+        let deadline = cleanup_deadline(&backend, &process.process_id)
+            .await
+            .expect("terminate must set a cleanup deadline");
+        let requested = Duration::from_millis(7_250);
+        assert!(deadline >= before + requested && deadline <= after + requested);
+        backend.shutdown().await;
+    }
+
+    /// A caller deadline later than the launch's current one never extends it.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn terminate_with_cleanup_deadline_keeps_an_earlier_latch() {
+        let backend = LocalProcess::default();
+        let process = spawn_test_process(&backend, "terminate-earlier-latch").await;
+        let earlier = std::time::Instant::now() + Duration::from_secs(1);
+        install_cleanup_custody(
+            &backend,
+            &process.process_id,
+            /*spawned*/ true,
+            Some(earlier),
+        )
+        .await;
+        let exec_process = local_exec_process(&backend, &process.process_id).await;
+
+        ExecProcess::terminate_with_cleanup_deadline(
+            &exec_process,
+            earlier + Duration::from_secs(30),
+        )
+        .await
+        .expect("terminate with later deadline");
+        backend
+            .terminate_process(TerminateParams {
+                process_id: process.process_id.clone(),
+                cleanup_deadline_ms: Some(60_000),
+            })
+            .await
+            .expect("terminate request with later deadline");
+
+        assert_eq!(
+            cleanup_deadline(&backend, &process.process_id).await,
+            Some(earlier)
+        );
+        backend.shutdown().await;
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn local_exec_process(
+        backend: &LocalProcess,
+        process_id: &ProcessId,
+    ) -> LocalExecProcess {
+        let (wake_tx, events) = {
+            let processes = backend.inner.processes.lock().await;
+            let Some(ProcessEntry::Running(running)) = processes.get(process_id) else {
+                panic!("test process should be running");
+            };
+            (running.wake_tx.clone(), running.events.clone())
+        };
+        LocalExecProcess {
+            process_id: process_id.clone(),
+            backend: backend.clone(),
+            wake_tx,
+            events,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn closed_waits_for_sandbox_cleanup_and_carries_summary() {
+        let (outgoing_tx, mut outgoing_rx) = mpsc::channel(NOTIFICATION_CHANNEL_CAPACITY);
+        let backend = LocalProcess::with_runtime_paths(
+            RpcNotificationSender::new(outgoing_tx),
+            ExecServerTelemetry::default(),
+            /*runtime_paths*/ None,
+            /*rpc_output_retention*/ None,
+        );
+        let mut process = spawn_test_process(&backend, "closed-cleanup").await;
+        // A live launcher keeps its report open; collection must stop at the
+        // cleanup deadline instead of waiting for it.
+        install_cleanup_custody(
+            &backend,
+            &process.process_id,
+            /*spawned*/ false,
+            Some(std::time::Instant::now() + Duration::from_millis(500)),
+        )
+        .await;
+        let mut events = {
+            let processes = backend.inner.processes.lock().await;
+            let Some(ProcessEntry::Running(running)) = processes.get(&process.process_id) else {
+                panic!("test process should be running");
+            };
+            running.events.subscribe()
+        };
+
+        process.exit(/*exit_code*/ 0);
+        drop(process.stdout_tx);
+        drop(process.stderr_tx);
+        let exit_response =
+            read_process_until_change(&backend, &process.process_id, /*after_seq*/ None).await;
+        assert!(exit_response.exited);
+        assert!(
+            !exit_response.closed,
+            "closed must wait for cleanup collection"
+        );
+
+        let closed = timeout(
+            Duration::from_secs(2),
+            read_process_until_closed(&backend, &process.process_id),
+        )
+        .await
+        .expect("process should close at the cleanup deadline");
+        let expected = SandboxCleanupSummary {
+            state: SandboxCleanupState::TimedOut,
+            reaped: 0,
+            preserved_unproven: 0,
+            host_owned: 0,
+            handed_off: 0,
+            timed_out: 0,
+            joined: false,
+        };
+        // The cleanup deadline passing never relabels the command's own exit.
+        assert_eq!(
+            (closed.exit_code, closed.sandbox_cleanup),
+            (Some(0), Some(expected))
+        );
+
+        let closed_event = timeout(Duration::from_secs(1), async {
+            loop {
+                if let ExecProcessEvent::Closed {
+                    sandbox_cleanup, ..
+                } = events.recv().await.expect("process event")
+                {
+                    break sandbox_cleanup;
+                }
+            }
+        })
+        .await
+        .expect("closed event");
+        assert_eq!(closed_event, Some(expected));
+
+        let notification = timeout(Duration::from_secs(1), async {
+            loop {
+                match outgoing_rx.recv().await {
+                    Some(RpcServerOutboundMessage::Notification(notification))
+                        if notification.method == EXEC_CLOSED_METHOD =>
+                    {
+                        break serde_json::from_value::<ExecClosedNotification>(
+                            notification.params.expect("closed notification params"),
+                        )
+                        .expect("deserialize closed notification");
+                    }
+                    Some(_) => {}
+                    None => panic!("outbound notifications closed"),
+                }
+            }
+        })
+        .await
+        .expect("closed notification");
+        assert_eq!(notification.sandbox_cleanup, Some(expected));
+        backend.shutdown().await;
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn install_cleanup_custody(
+        backend: &LocalProcess,
+        process_id: &ProcessId,
+        spawned: bool,
+        cleanup_deadline: Option<std::time::Instant>,
+    ) {
+        let mut custody = SandboxCleanupCustody::for_launch(
+            SandboxType::LinuxSeccomp,
+            cleanup_deadline,
+            /*scope*/ None,
+        )
+        .expect("create cleanup custody")
+        .expect("Linux sandbox launches have cleanup custody");
+        if spawned {
+            // No launcher process in these tests: nothing to pin. Without a
+            // helper declaration the launch can never be proven joined.
+            custody.spawned(/*launcher_pid*/ None);
+        }
+        let mut processes = backend.inner.processes.lock().await;
+        let Some(ProcessEntry::Running(running)) = processes.get_mut(process_id) else {
+            panic!("test process should be running");
+        };
+        running.sandbox_cleanup_tightener = Some(custody.tightener());
+        running.sandbox_cleanup_pending = true;
+        running.sandbox_cleanup_custody = Some(custody);
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn cleanup_deadline(
+        backend: &LocalProcess,
+        process_id: &ProcessId,
+    ) -> Option<std::time::Instant> {
+        let processes = backend.inner.processes.lock().await;
+        let Some(ProcessEntry::Running(running)) = processes.get(process_id) else {
+            panic!("test process should be running");
+        };
+        running
+            .sandbox_cleanup_custody
+            .as_ref()
+            .and_then(SandboxCleanupCustody::deadline)
+    }
+
+    #[tokio::test]
+    async fn zero_budget_terminate_latches_a_cancelled_start_without_a_closed_event() {
+        let backend = LocalProcess::default();
+        let process_id = ProcessId::from("cancelled-start");
+        let start = Arc::new(ProcessStart::default());
+        backend
+            .inner
+            .processes
+            .lock()
+            .await
+            .insert(process_id.clone(), ProcessEntry::Starting(start.clone()));
+        let before = std::time::Instant::now();
+        let response = backend
+            .terminate_process(TerminateParams {
+                process_id: process_id.clone(),
+                cleanup_deadline_ms: Some(0),
+            })
+            .await
+            .expect("terminate starting");
+        let after = std::time::Instant::now();
+        assert!(response.running);
+        let latched = start
+            .cleanup_deadline()
+            .expect("latched before cancellation");
+        assert!(latched >= before && latched <= after);
+        assert!(
+            !backend
+                .inner
+                .processes
+                .lock()
+                .await
+                .contains_key(&process_id)
+        );
+        // No Running process exists, so the exit/close publisher has no entry
+        // to turn this cancelled start into a successful command completion.
+        maybe_emit_closed(process_id.clone(), backend.inner.clone()).await;
+        assert!(
+            !backend
+                .inner
+                .processes
+                .lock()
+                .await
+                .contains_key(&process_id)
+        );
+        backend.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_latches_starting_deadlines_before_releasing_the_start_reservation() {
+        let backend = LocalProcess::default();
+        let process_id = ProcessId::from("shutdown-start");
+        let start = Arc::new(ProcessStart::default());
+        let earlier = std::time::Instant::now();
+        start.request_cleanup_deadline(earlier);
+        backend
+            .inner
+            .processes
+            .lock()
+            .await
+            .insert(process_id, ProcessEntry::Starting(start.clone()));
+        backend.shutdown().await;
+        assert_eq!(
+            start.cleanup_deadline(),
+            Some(earlier),
+            "shutdown never extends an earlier cancellation bound"
+        );
+        assert!(backend.inner.processes.lock().await.is_empty());
+    }
+
     struct TestProcess {
         process_id: ProcessId,
         stdout_tx: mpsc::Sender<Vec<u8>>,
@@ -2029,6 +2844,10 @@ mod tests {
                 sandbox_denied: false,
                 network_proxy_handle: None,
                 network_policy_shutdown: None,
+                sandbox_cleanup_custody: None,
+                sandbox_cleanup_tightener: None,
+                sandbox_cleanup_pending: false,
+                sandbox_cleanup: None,
             })),
         );
         assert!(previous.is_none());

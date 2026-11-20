@@ -3,8 +3,10 @@
 use super::AppServerSession;
 use super::AppServerStartedThread;
 use super::HistoryHydrationScope;
+use super::PendingRetention;
 use super::ResumeModelSettings;
 use super::ThreadHistorySupport;
+use super::ThreadSettingsOwner;
 use super::bootstrap_request_error;
 use super::is_history_pagination_unsupported;
 use super::started_thread_from_resume_response;
@@ -27,10 +29,11 @@ use color_eyre::eyre::Result;
 // Bound recovery to recent messages when item paging is unavailable.
 const READ_ONLY_HISTORY_TURN_LIMIT: u32 = 100;
 
-#[derive(Clone, Copy)]
+/// Only the caller that will install a writable view may request adoption.
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum ResumePurpose {
-    Adopt,
     Observe,
+    Adopt,
 }
 
 impl AppServerSession {
@@ -63,7 +66,7 @@ impl AppServerSession {
             tracing::warn!("Failed to page read-only thread history; trying summary pages");
             let request_id = self.next_request_id();
             let page: ThreadTurnsListResponse = self
-                .client
+                .request_handle
                 .request_typed(ClientRequest::ThreadTurnsList {
                     request_id,
                     params: ThreadTurnsListParams {
@@ -98,11 +101,11 @@ impl AppServerSession {
             config.workspace_roots.clone(),
             Vec::new(),
             thread.reasoning_effort,
-            config.personality,
             local_settings,
         )
         .await
         .map_err(color_eyre::eyre::Report::msg)?;
+        self.freeze_viewed_receipt(thread_id);
         Ok((
             AppServerStartedThread {
                 session,
@@ -115,8 +118,8 @@ impl AppServerSession {
     }
 
     pub(crate) fn with_local_codex_home(mut self, codex_home: &AbsolutePathBuf) -> Self {
-        self.task_tool_capabilities_dir = (!self.uses_embedded_app_server())
-            .then(|| codex_home.join("tui-thread-reference-capabilities"));
+        self.task_tool_capabilities_dir =
+            Some(codex_home.join("tui-thread-reference-capabilities"));
         self
     }
 
@@ -144,44 +147,74 @@ impl AppServerSession {
         thread_id: ThreadId,
         model_settings: ResumeModelSettings,
     ) -> Result<AppServerStartedThread> {
-        self.resume_thread_with_purpose(
+        Box::pin(self.resume_thread_with_permission_overrides(
             local_settings,
             config,
             thread_id,
             model_settings,
-            ResumePurpose::Adopt,
-        )
+            crate::resume_permissions::ResumePermissions::default(),
+        ))
         .await
     }
 
-    pub(crate) async fn observe_thread(
+    pub(crate) async fn resume_thread_with_permission_overrides(
         &mut self,
         local_settings: &crate::local_settings::LocalSettings,
         config: Config,
         thread_id: ThreadId,
         model_settings: ResumeModelSettings,
+        permission_overrides: crate::resume_permissions::ResumePermissions,
     ) -> Result<AppServerStartedThread> {
-        self.resume_thread_with_purpose(
+        Box::pin(self.resume_thread_for_purpose(
             local_settings,
             config,
             thread_id,
             model_settings,
+            permission_overrides,
             ResumePurpose::Observe,
-        )
+        ))
         .await
+        .map(|(started, _retention)| started)
     }
 
-    async fn resume_thread_with_purpose(
+    pub(crate) async fn prepare_retained_resume(
         &mut self,
         local_settings: &crate::local_settings::LocalSettings,
         config: Config,
         thread_id: ThreadId,
         model_settings: ResumeModelSettings,
+        permission_overrides: crate::resume_permissions::ResumePermissions,
+    ) -> Result<(AppServerStartedThread, Option<PendingRetention>)> {
+        Box::pin(self.resume_thread_for_purpose(
+            local_settings,
+            config,
+            thread_id,
+            model_settings,
+            permission_overrides,
+            ResumePurpose::Adopt,
+        ))
+        .await
+    }
+
+    async fn resume_thread_for_purpose(
+        &mut self,
+        local_settings: &crate::local_settings::LocalSettings,
+        config: Config,
+        thread_id: ThreadId,
+        model_settings: ResumeModelSettings,
+        permission_overrides: crate::resume_permissions::ResumePermissions,
         purpose: ResumePurpose,
-    ) -> Result<AppServerStartedThread> {
+    ) -> Result<(AppServerStartedThread, Option<PendingRetention>)> {
+        if self.thread_params_mode().settings_owner() == ThreadSettingsOwner::Client {
+            self.thread_tool_transport()
+                .check_namespace(&self.request_handle, &config.cwd)
+                .await?;
+        }
         let session_config = if matches!(
             model_settings,
-            ResumeModelSettings::RestoreFromThread | ResumeModelSettings::PreserveExistingThread
+            ResumeModelSettings::RestoreFromThread
+                | ResumeModelSettings::PreserveExistingThread
+                | ResumeModelSettings::PreserveSideConversation
         ) {
             config.clone()
         } else {
@@ -193,40 +226,49 @@ impl AppServerSession {
             self.thread_params_mode(),
             self.remote_cwd_override.as_deref(),
             model_settings,
+            permission_overrides,
         );
-        self.thread_tool_transport()
-            .configure_mcp(&mut params.config);
-        let mut rollout_maintenance_guard = None;
-        params.exclude_turns = if self.history_support == ThreadHistorySupport::Paginated {
-            let known_legacy_history = self
+        if self.thread_params_mode().settings_owner() == ThreadSettingsOwner::Client
+            && model_settings == ResumeModelSettings::OverrideFromCurrentConfig
+        {
+            params.model_provider = self.explicit_model_provider(&config);
+        }
+        if self.thread_params_mode().settings_owner() == ThreadSettingsOwner::Client {
+            self.thread_tool_transport()
+                .configure_mcp(&mut params.config);
+        }
+        params.retain_for_connection = purpose == ResumePurpose::Adopt;
+        let paginated = self.history_support == ThreadHistorySupport::Paginated;
+        let cached_legacy = paginated
+            && self
                 .history_pagination
                 .get(&thread_id)
-                .is_some_and(|state| state.history_mode == ThreadHistoryMode::Legacy)
-                && (!self.uses_embedded_app_server()
-                    || ({
-                        // The guard prevents migration through the full resume,
-                        // regardless of the server's migration feature settings.
-                        rollout_maintenance_guard =
-                            codex_rollout::try_acquire_rollout_maintenance_lock(
-                                config.codex_home.as_path(),
-                            )
-                            .ok()
-                            .flatten();
-                        rollout_maintenance_guard.is_some()
-                    } && self
-                        .thread_read(thread_id, /*include_turns*/ false)
-                        .await
-                        .is_ok_and(|thread| thread.history_mode == ThreadHistoryMode::Legacy)));
-            !known_legacy_history
+                .is_some_and(|state| state.history_mode == ThreadHistoryMode::Legacy);
+        // Hold the maintenance lock through a full legacy resume to prevent migration.
+        let mut rollout_maintenance_guard = if cached_legacy && self.uses_embedded_app_server() {
+            codex_rollout::try_acquire_rollout_maintenance_lock(config.codex_home.as_path())
+                .ok()
+                .flatten()
         } else {
-            false
+            None
         };
+        // Capture the receipt before the resume-time history boundary. Later results are delivered live.
+        self.unread_revisions.remove(&thread_id);
+        let metadata = Box::pin(self.thread_read(thread_id, /*include_turns*/ false))
+            .await
+            .ok();
+        let known_legacy = cached_legacy
+            && (!self.uses_embedded_app_server()
+                || (rollout_maintenance_guard.is_some()
+                    && metadata
+                        .is_some_and(|thread| thread.history_mode == ThreadHistoryMode::Legacy)));
+        params.exclude_turns = paginated && !known_legacy;
         if params.exclude_turns {
             rollout_maintenance_guard = None;
         }
         let request_id = self.next_request_id();
         let resume_response = self
-            .client
+            .request_handle
             .request_typed(ClientRequest::ThreadResume {
                 request_id,
                 params: params.clone(),
@@ -241,7 +283,7 @@ impl AppServerSession {
                 self.history_support = ThreadHistorySupport::LegacyOnly;
                 params.exclude_turns = false;
                 let request_id = self.next_request_id();
-                self.client
+                self.request_handle
                     .request_typed(ClientRequest::ThreadResume { request_id, params })
                     .await
                     .map_err(|err| {
@@ -255,14 +297,28 @@ impl AppServerSession {
                 ));
             }
         };
-        let retention = match purpose {
-            ResumePurpose::Adopt => Some(
-                self.retention
-                    .retain_thread(self.request_handle(), response.thread.id.clone())
-                    .await?,
-            ),
-            ResumePurpose::Observe => None,
+        let retention = if purpose == ResumePurpose::Adopt {
+            match self
+                .retention
+                .adopt_thread(
+                    self.request_handle(),
+                    response.thread.id.clone(),
+                    response.retention.clone(),
+                )
+                .await
+            {
+                Ok(retention) => Some(retention),
+                Err(error) => {
+                    self.retention.warn_adoption(&response.thread.id, &error);
+                    None
+                }
+            }
+        } else {
+            None
         };
+        if let Some(subscribed) = &mut self.attachment_subscribed {
+            *subscribed = true;
+        }
         self.hydrate_initial_thread_history(
             &mut response.thread,
             response.turns_backwards_cursor.clone(),
@@ -278,7 +334,6 @@ impl AppServerSession {
         let mut started = started_thread_from_resume_response(
             response,
             local_settings,
-            &config,
             self.thread_params_mode(),
         )
         .await?;
@@ -287,10 +342,7 @@ impl AppServerSession {
             self.remember_task_tool_thread(thread_id);
             started.task_tools_available = true;
         }
-        if let Some(retention) = retention {
-            retention.commit();
-        }
-        Ok(started)
+        Ok((started, retention))
     }
 }
 

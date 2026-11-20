@@ -1,11 +1,9 @@
 use crate::FunctionCallError;
 use crate::ToolName;
 use crate::ToolPayload;
+use codex_attachment_store::AttachmentStore;
 use codex_extension_items::ExtensionItem;
-use codex_file_system::ExecutorFileSystem;
-use codex_file_system::FileSystemSandboxContext;
-use codex_protocol::mcp_work::McpAttemptAccess;
-use codex_protocol::mcp_work::McpAttemptRefused;
+use codex_file_system::EnvironmentAccess;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::EventMsg;
 use codex_utils_output_truncation::TruncationPolicy;
@@ -13,7 +11,6 @@ use codex_utils_output_truncation::with_serialization_allowance;
 use codex_utils_path_uri::PathUri;
 use std::fmt;
 use std::future::Future;
-use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::LazyLock;
@@ -87,19 +84,36 @@ pub trait TurnItemEmitter: Send + Sync {
     fn emit_completed<'a>(&'a self, item: ExtensionTurnItem) -> TurnItemEmissionFuture<'a>;
 }
 
-/// Host-owned turn environment summary visible to extension tools.
+/// Callback-scoped view of a turn environment for extension tools.
+///
+/// The host retains its runtime and configuration, and supplies access with this callback's
+/// grants already applied. Borrowing the accessor prevents retaining it for a later callback.
 #[derive(Clone)]
 pub struct ToolEnvironment<'call> {
     /// Stable host environment id used to route executor-scoped capabilities.
     pub environment_id: String,
     /// Effective working directory for this turn in the environment.
     pub cwd: PathUri,
-    /// Filesystem implementation for this environment.
-    pub file_system: Arc<dyn ExecutorFileSystem>,
-    /// Sandbox context to use for filesystem operations.
-    pub file_system_sandbox_context: FileSystemSandboxContext,
-    // TODO(anp): Replace the marker with callback-scoped environment access.
-    pub _lifetime: PhantomData<&'call ()>,
+    file_system: &'call dyn EnvironmentAccess,
+}
+
+impl<'call> ToolEnvironment<'call> {
+    pub fn new(
+        environment_id: String,
+        cwd: PathUri,
+        file_system: &'call dyn EnvironmentAccess,
+    ) -> Self {
+        Self {
+            environment_id,
+            cwd,
+            file_system,
+        }
+    }
+
+    /// Borrows filesystem access with the permissions captured for this callback.
+    pub fn fs(&self) -> &dyn EnvironmentAccess {
+        self.file_system
+    }
 }
 
 /// Turn-item emitter used when a caller does not expose visible item emission.
@@ -132,6 +146,11 @@ pub enum ToolCallSource {
 
 #[derive(Clone)]
 pub struct ToolCall<'call> {
+    /// Borrowed authority for this callback only; never store it with a retained tool.
+    pub mcp_access: Result<
+        codex_protocol::mcp_work::McpAttemptAccess<'call>,
+        codex_protocol::mcp_work::McpAttemptRefused,
+    >,
     pub turn_id: String,
     pub call_id: String,
     pub tool_name: ToolName,
@@ -141,9 +160,8 @@ pub struct ToolCall<'call> {
     pub source: ToolCallSource,
     pub conversation_history: ConversationHistory,
     pub turn_item_emitter: Arc<dyn TurnItemEmitter>,
-    /// Borrowed authority for MCP effects only. A failed capture must not be
-    /// treated as ungated access; local-only tools may ignore it.
-    pub mcp_access: Result<McpAttemptAccess<'call>, McpAttemptRefused>,
+    pub attachment_store: Arc<dyn AttachmentStore>,
+    pub ephemeral: bool,
     pub environments: Vec<ToolEnvironment<'call>>,
     pub payload: ToolPayload,
 }
@@ -163,7 +181,8 @@ impl std::fmt::Debug for ToolCall<'_> {
             .field("source", &self.source)
             .field("conversation_history", &self.conversation_history)
             .field("turn_item_emitter", &"<host turn item emitter>")
-            .field("mcp_access", &self.mcp_access)
+            .field("attachment_store", &"<host attachment store>")
+            .field("ephemeral", &self.ephemeral)
             .field("environment_count", &self.environments.len())
             .field("payload", &self.payload)
             .finish()

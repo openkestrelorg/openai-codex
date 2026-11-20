@@ -33,6 +33,7 @@ pub(crate) struct ProductionResetInventory {
     pub(crate) models_refresh_worker: Arc<Mutex<ModelsRefreshWorker>>,
     pub(crate) model_catalog: Arc<ModelCatalog>,
     pub(crate) http_client_factory: HttpClientFactory,
+    pub(crate) requirements: codex_config::ConfigRequirementsToml,
     pub(crate) auth_manager: Arc<AuthManager>,
     pub(crate) remote_control_handle: Option<RemoteControlHandle>,
 }
@@ -77,6 +78,10 @@ impl ResetInventory for ProductionResetInventory {
                 return Err(ResetInventoryError::ConstructorsIncomplete);
             }
             self.thread_manager.invalidate_mcp_runtimes().await;
+            self.thread_manager
+                .mcp_manager()
+                .hosted_endpoint_custody()
+                .reset_for_account_transition();
 
             // Resolve and publish the strict new-generation cloud loader before
             // rebuilding configuration or deriving residency/telemetry routes.
@@ -86,6 +91,7 @@ impl ResetInventory for ProductionResetInventory {
                     Arc::clone(&self.auth_manager),
                     self.chatgpt_base_url.clone(),
                     self.http_client_factory.clone(),
+                    &self.requirements,
                 ),
             )
             .await

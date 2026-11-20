@@ -91,7 +91,7 @@ pub struct SessionStartOutcome {
     pub hook_events: Vec<HookCompletedEvent>,
     pub should_stop: bool,
     pub stop_reason: Option<String>,
-    pub additional_contexts: Vec<String>,
+    pub additional_contexts: Vec<crate::HookContext>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -134,9 +134,9 @@ pub(crate) async fn run(
         };
     }
 
-    let (input_json, turn_id) = match request.target {
+    let (input, turn_id) = match request.target {
         StartHookTarget::SessionStart { source } => {
-            let input_json = match serde_json::to_string(&SessionStartCommandInput::new(
+            let input = match serde_json::to_value(SessionStartCommandInput::new(
                 request.session_id.to_string(),
                 request.transcript_path.clone(),
                 request.cwd.display().to_string(),
@@ -145,7 +145,7 @@ pub(crate) async fn run(
                 source.as_str().to_string(),
                 request.clear_context.clone(),
             )) {
-                Ok(input_json) => input_json,
+                Ok(input) => input,
                 Err(error) => {
                     return serialization_failure_outcome(
                         common::serialization_failure_hook_events(
@@ -156,7 +156,7 @@ pub(crate) async fn run(
                     );
                 }
             };
-            (input_json, turn_id)
+            (input, turn_id)
         }
         StartHookTarget::SubagentStart {
             turn_id: subagent_turn_id,
@@ -174,8 +174,8 @@ pub(crate) async fn run(
                 agent_id,
                 agent_type,
             };
-            let input_json = match serde_json::to_string(&input) {
-                Ok(input_json) => input_json,
+            let input = match serde_json::to_value(input) {
+                Ok(input) => input,
                 Err(error) => {
                     return serialization_failure_outcome(
                         common::serialization_failure_hook_events(
@@ -186,14 +186,14 @@ pub(crate) async fn run(
                     );
                 }
             };
-            (input_json, Some(subagent_turn_id))
+            (input, Some(subagent_turn_id))
         }
     };
 
     let results = dispatcher::execute_handlers(
         engine,
         matched,
-        input_json,
+        &input,
         request.cwd.as_path(),
         turn_id,
         parse_completed,
@@ -275,6 +275,7 @@ fn parse_completed(
                             &mut additional_contexts_for_model,
                             handler,
                             additional_context,
+                            &run_result.context_metadata,
                         );
                     }
                     let _ = parsed.universal.suppress_output;
@@ -316,6 +317,7 @@ fn parse_completed(
                         &mut additional_contexts_for_model,
                         handler,
                         additional_context,
+                        &run_result.context_metadata,
                     );
                 }
             }
@@ -394,7 +396,7 @@ mod tests {
                 should_stop: false,
                 stop_reason: None,
                 additional_contexts_for_model: vec![AdditionalContext {
-                    text: "hello from hook".to_string(),
+                    context: crate::HookContext::harness("hello from hook".to_string()),
                     limit: AdditionalContextLimit::from_config(Some(7)),
                 }],
             }
@@ -427,7 +429,7 @@ mod tests {
                 should_stop: true,
                 stop_reason: Some("pause".to_string()),
                 additional_contexts_for_model: vec![AdditionalContext {
-                    text: "do not inject".to_string(),
+                    context: crate::HookContext::harness("do not inject".to_string()),
                     limit: Default::default(),
                 }],
             }
@@ -494,7 +496,7 @@ mod tests {
                 should_stop: false,
                 stop_reason: None,
                 additional_contexts_for_model: vec![AdditionalContext {
-                    text: "hello from subagent hook".to_string(),
+                    context: crate::HookContext::harness("hello from subagent hook".to_string()),
                     limit: AdditionalContextLimit::from_config(Some(4_096)),
                 }],
             }
@@ -528,7 +530,7 @@ mod tests {
                 should_stop: false,
                 stop_reason: None,
                 additional_contexts_for_model: vec![AdditionalContext {
-                    text: "child context".to_string(),
+                    context: crate::HookContext::harness("child context".to_string()),
                     limit: Default::default(),
                 }],
             }
@@ -551,6 +553,7 @@ mod tests {
     fn handler_for(event_name: HookEventName) -> ConfiguredHandler {
         ConfiguredHandler {
             builtin: false,
+            plugin_trust: None,
             event_name,
             matcher: None,
             timeout_sec: 600,
@@ -569,6 +572,7 @@ mod tests {
 
     fn run_result(exit_code: Option<i32>, stdout: &str, stderr: &str) -> HandlerRunResult {
         HandlerRunResult {
+            context_metadata: codex_protocol::models::ContentItemMetadata::harness(),
             started_at: 1,
             completed_at: 2,
             duration_ms: 1,

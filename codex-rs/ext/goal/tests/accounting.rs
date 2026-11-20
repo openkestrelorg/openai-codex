@@ -62,6 +62,7 @@ fn goal_accounting_ignores_plan_mode_turns() {
 #[test]
 fn empty_continuations_require_three_turns_without_activity_or_goal_changes() {
     let empty_final = TurnItem::AgentMessage(AgentMessageItem {
+        moderation: None,
         id: "empty".into(),
         content: vec![AgentMessageContent::Text { text: " \n".into() }],
         phase: Some(MessagePhase::FinalAnswer),
@@ -76,6 +77,11 @@ fn empty_continuations_require_three_turns_without_activity_or_goal_changes() {
         ("goal", 5),
         ("reset", 6),
         ("missing final", 6),
+        ("partial answer", 6),
+        ("abort", 3),
+        ("mixed", 3),
+        ("tool after abort", 6),
+        ("user after abort", 6),
     ] {
         let state = GoalAccountingState::default();
         for turn in 1..=blocking_turn {
@@ -87,14 +93,27 @@ fn empty_continuations_require_three_turns_without_activity_or_goal_changes() {
             };
             state.start_turn(&id, ModeKind::Default, &TokenUsage::default());
             state.mark_turn_goal_active(&id, goal_id);
-            if !(turn == 3 && interruption == "missing final") {
+            let aborted = matches!(
+                interruption,
+                "abort" | "tool after abort" | "user after abort"
+            ) || (interruption == "mixed" && turn == 2);
+            if turn == 3 && interruption == "partial answer" {
+                let mut partial = empty_final.clone();
+                if let TurnItem::AgentMessage(message) = &mut partial {
+                    message.phase = Some(MessagePhase::PartialAnswer);
+                }
+                state.record_item(&id, &partial);
+            } else if !(aborted || turn == 3 && interruption == "missing final") {
                 state.record_item(&id, &empty_final);
             }
-            // Admission can finish after output arrives, but before turn-stop evaluation.
-            if !(turn == 3 && interruption == "user") {
+            if aborted {
+                state.interrupt_turn(&id);
+            }
+            // Admission can finish even after abort, but before idle evaluation.
+            if !(turn == 3 && matches!(interruption, "user" | "user after abort")) {
                 state.mark_goal_continuation(id.clone());
             }
-            if turn == 3 && interruption == "tool" {
+            if turn == 3 && matches!(interruption, "tool" | "tool after abort") {
                 state.record_tool_outcome(
                     &id,
                     &ToolName::plain("shell"),
@@ -249,20 +268,6 @@ fn goal_accounting_preserves_concurrent_descendant_usage_across_checkpoints() {
     assert_eq!(8, second.token_delta);
 }
 
-// Existing accounting scenarios model an accepted turn. Publish through the
-// same preparation/commit path as the host instead of seeding the owner early.
-impl GoalAccountingState {
-    fn start_turn(&self, turn_id: &str, mode: ModeKind, usage: &TokenUsage) {
-        let prepared: accounting::GoalTurnPreparation = self.prepare_turn(turn_id, mode, usage);
-        self.commit_prepared_turn(turn_id, &prepared);
-    }
-
-    fn mark_turn_goal_active(&self, turn_id: &str, goal_id: &str) {
-        assert_eq!(Some(turn_id.to_owned()), self.current_turn_id());
-        self.mark_current_turn_goal_active(goal_id);
-    }
-}
-
 fn token_usage(
     input_tokens: i64,
     cached_input_tokens: i64,
@@ -278,5 +283,17 @@ fn token_usage(
         reasoning_output_tokens,
         total_tokens,
         codex_rollout_budget_units: None,
+    }
+}
+
+// Accepted-turn fixture helpers go through the production staged commit path.
+impl GoalAccountingState {
+    fn start_turn(&self, id: &str, mode: ModeKind, usage: &TokenUsage) {
+        let prepared: accounting::GoalTurnPreparation = self.prepare_turn(id, mode, usage);
+        self.commit_prepared_turn(id, &prepared);
+    }
+    fn mark_turn_goal_active(&self, id: &str, goal: &str) {
+        assert_eq!(Some(id.to_owned()), self.current_turn_id());
+        self.mark_current_turn_goal_active(goal);
     }
 }

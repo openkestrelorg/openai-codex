@@ -47,6 +47,7 @@ pub(crate) struct SpawnChildRequest<'a> {
     pub network: Option<&'a NetworkProxy>,
     pub stdio_policy: StdioPolicy,
     pub env: HashMap<String, String>,
+    pub inherited_fds: Vec<i32>,
 }
 
 pub(crate) async fn spawn_child_async(request: SpawnChildRequest<'_>) -> std::io::Result<Child> {
@@ -59,15 +60,35 @@ pub(crate) async fn spawn_child_async(request: SpawnChildRequest<'_>) -> std::io
         network,
         stdio_policy,
         mut env,
+        inherited_fds,
     } = request;
+
+    #[cfg(not(target_os = "linux"))]
+    debug_assert!(
+        inherited_fds.is_empty(),
+        "cleanup descriptors are Linux-only"
+    );
 
     env.retain(|name, _| !is_non_inheritable_env_var(name));
 
+    // Both command arguments and environment variables can contain credentials.
     trace!(
-        "spawn_child_async: {program:?} {args:?} {arg0:?} {cwd:?} {network_sandbox_policy:?} {stdio_policy:?} {env:?}"
+        ?program,
+        ?cwd,
+        ?network_sandbox_policy,
+        ?stdio_policy,
+        arg_count = args.len(),
+        has_arg0_override = arg0.is_some(),
+        env_count = env.len(),
+        "spawn_child_async"
     );
 
-    let mut cmd = Command::new(&program);
+    let mut cmd = match stdio_policy {
+        StdioPolicy::RedirectForShellTool => {
+            Command::from(codex_utils_process::background_command(&program))
+        }
+        StdioPolicy::Inherit => Command::new(&program),
+    };
     #[cfg(unix)]
     cmd.arg0(arg0.map_or_else(|| program.to_string_lossy().to_string(), String::from));
     cmd.args(args);
@@ -75,11 +96,6 @@ pub(crate) async fn spawn_child_async(request: SpawnChildRequest<'_>) -> std::io
     if let Some(network) = network {
         network.apply_to_env(&mut env);
     }
-    // macOS fd cleanup must keep the shell escalation socket.
-    #[cfg(target_os = "macos")]
-    let inherited_fd = env
-        .get(codex_shell_escalation::ESCALATE_SOCKET_ENV_VAR)
-        .and_then(|fd| fd.parse().ok());
     cmd.env_clear();
     cmd.envs(env);
 
@@ -104,13 +120,21 @@ pub(crate) async fn spawn_child_async(request: SpawnChildRequest<'_>) -> std::io
             // This relies on prctl(2), so it only works on Linux.
             #[cfg(target_os = "linux")]
             {
+                // Only the launcher inherits these owned cleanup descriptors.
+                // Preserve unrelated descriptor flags, clearing CLOEXEC only.
+                for fd in &inherited_fds {
+                    let flags = libc::fcntl(*fd, libc::F_GETFD);
+                    if flags < 0 || libc::fcntl(*fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
                 // This prctl call effectively requests, "deliver SIGTERM when my
                 // current parent dies."
                 codex_utils_pty::process_group::set_parent_death_signal(parent_pid)?;
             }
-            // macOS cannot receive the fd with close-on-exec set atomically.
+            // Close descriptors accidentally inherited by the child.
             #[cfg(target_os = "macos")]
-            codex_utils_pty::pty::close_inherited_fds_except(inherited_fd.as_slice());
+            codex_utils_pty::pty::close_inherited_fds_except(&[]);
             Ok(())
         });
     }
@@ -135,3 +159,7 @@ pub(crate) async fn spawn_child_async(request: SpawnChildRequest<'_>) -> std::io
 
     cmd.kill_on_drop(true).spawn()
 }
+
+#[cfg(test)]
+#[path = "spawn_tests.rs"]
+mod tests;

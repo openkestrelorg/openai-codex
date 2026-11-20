@@ -1,13 +1,25 @@
 //! Remote forks must retain server roots after reloading the client's configuration.
 
 use super::session_lifecycle_requests::recorded_params;
+use super::session_lifecycle_requests::start_recording_app_server;
 use super::session_lifecycle_requests::start_recording_remote_app_server;
 use super::*;
+use crate::app_server_session::ThreadParamsMode;
 use app_test_support::create_fake_rollout;
+use codex_app_server_client::AppServerEvent;
 use pretty_assertions::assert_eq;
 
 #[tokio::test]
 async fn remote_fork_dispatch_preserves_server_workspace_roots() -> Result<()> {
+    check_fork_dispatch(ThreadParamsMode::Remote).await
+}
+
+#[tokio::test]
+async fn local_daemon_fork_dispatch_preserves_idle_source_and_children() -> Result<()> {
+    check_fork_dispatch(ThreadParamsMode::Embedded).await
+}
+
+async fn check_fork_dispatch(mode: ThreadParamsMode) -> Result<()> {
     let mut app = Box::pin(make_test_app()).await;
     let client_home = tempdir()?;
     let server_home = tempdir()?;
@@ -33,8 +45,20 @@ async fn remote_fork_dispatch_preserves_server_workspace_roots() -> Result<()> {
         })
         .build()
         .await?;
-    let (server, requests, proxy) =
-        Box::pin(start_recording_remote_app_server(&server_config)).await?;
+    let (server, requests, proxy) = match mode {
+        ThreadParamsMode::Remote | ThreadParamsMode::Cloud => {
+            Box::pin(start_recording_remote_app_server(&server_config)).await?
+        }
+        ThreadParamsMode::Embedded => {
+            app.config = server_config.clone();
+            Box::pin(start_recording_app_server(
+                &server_config,
+                /*blocked_thread_list*/ None,
+                /*failed_thread_name*/ None,
+            ))
+            .await?
+        }
+    };
     let mut server = server.with_remote_cwd_override(Some(remote_cwd.to_path_buf()));
     let source_thread_id = ThreadId::from_string(
         &create_fake_rollout(
@@ -59,8 +83,30 @@ async fn remote_fork_dispatch_preserves_server_workspace_roots() -> Result<()> {
     assert_eq!(started.session.runtime_workspace_roots, expected_roots);
     app.enqueue_primary_thread_session(started.session, started.turns)
         .await?;
+    app.thread_event_listener_tasks
+        .insert(source_thread_id, tokio::spawn(std::future::pending::<()>()));
     let mut tui = crate::tui::test_support::make_test_tui()?;
-
+    let pending = if mode == ThreadParamsMode::Remote {
+        let approval = exec_approval_request(
+            source_thread_id,
+            "source-turn",
+            "command",
+            /*approval_id*/ None,
+        );
+        app.handle_app_server_event(
+            &server,
+            AppServerEvent::ServerRequest(Box::new(approval.clone())),
+        )
+        .await;
+        app.drain_active_thread_events(&mut tui).await?;
+        vec![approval]
+    } else {
+        Vec::new()
+    };
+    let child_id = ThreadId::new();
+    app.upsert_agent_picker_thread(
+        child_id, /*agent_nickname*/ None, /*agent_role*/ None, /*is_closed*/ false,
+    );
     Box::pin(app.handle_event(
         &mut tui,
         &mut server,
@@ -69,12 +115,78 @@ async fn remote_fork_dispatch_preserves_server_workspace_roots() -> Result<()> {
     .await?;
 
     assert_ne!(app.chat_widget.thread_id(), Some(source_thread_id));
+    assert!(
+        recorded_params(&requests, "thread/fork")
+            .iter()
+            .all(|params| params["retainForConnection"] == true)
+    );
+    let installed = app
+        .current_displayed_thread_id()
+        .expect("fork is displayed");
+    // Serialize behind any abandoned fork release before observing the grant.
+    let (_, provisional_probe) = Box::pin(server.prepare_retained_resume(
+        &app.local_settings,
+        app.config.clone(),
+        installed,
+        crate::app_server_session::ResumeModelSettings::PreserveExistingThread,
+        crate::resume_permissions::ResumePermissions::default(),
+    ))
+    .await?;
+    let held: codex_app_server_protocol::ThreadRetentionAcquireResponse = server
+        .request_handle()
+        .request_typed(ClientRequest::ThreadRetentionAcquire {
+            request_id: server.next_request_id(),
+            params: codex_app_server_protocol::ThreadRetentionAcquireParams {
+                thread_id: installed.to_string(),
+            },
+        })
+        .await?;
+    assert!(matches!(
+        held,
+        codex_app_server_protocol::ThreadRetentionAcquireResponse::AlreadyHeld { .. }
+    ));
+
     assert_eq!(app.chat_widget.config_ref().workspace_roots, expected_roots);
+    assert!(
+        recorded_params(&requests, "thread/retention/release").is_empty(),
+        "installed fork must not abandon its grant before the serialized probe"
+    );
+    drop(provisional_probe);
     let fork_roots: Vec<_> = recorded_params(&requests, "thread/fork")
         .into_iter()
         .map(|params| params["runtimeWorkspaceRoots"].clone())
         .collect();
     assert_eq!(fork_roots, vec![serde_json::json!(expected_roots)]);
+    assert!(recorded_params(&requests, "thread/unsubscribe").is_empty());
+    assert!(!app.thread_event_listener_tasks[&source_thread_id].is_finished());
+    assert_eq!(
+        app.agents_overview.dispatched_requests[&source_thread_id]
+            .iter()
+            .map(|pending| &pending.request)
+            .collect::<Vec<_>>(),
+        pending.iter().collect::<Vec<_>>()
+    );
+    assert!(app.agents_overview.dispatched_requests[&child_id].is_empty());
+    let question = request_user_input_request(source_thread_id, "source-turn", "question");
+    app.handle_app_server_event(
+        &server,
+        AppServerEvent::ServerRequest(Box::new(question.clone())),
+    )
+    .await;
+    assert_eq!(
+        app.agents_overview.dispatched_requests[&source_thread_id]
+            .last()
+            .map(|pending| &pending.request),
+        Some(&question)
+    );
+    assert!(!app.chat_widget.has_active_view());
+    Box::pin(app.select_agents_overview_thread(&mut tui, &mut server, source_thread_id)).await?;
+    app.drain_active_thread_events(&mut tui).await?;
+    assert!(
+        app.pending_app_server_requests
+            .contains_server_request(&question)
+    );
+    app.discard_thread_local_state(source_thread_id).await;
     server.shutdown().await?;
     proxy.await??;
     Ok(())

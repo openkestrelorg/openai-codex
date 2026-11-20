@@ -154,10 +154,15 @@ impl Harness {
             AnalyticsEventsClient::disabled(),
         ));
         let processor = Arc::new(MessageProcessor::new(MessageProcessorArgs {
-            telemetry_reset: crate::otel_reset_control::TelemetryResetControl::default(),
+            managed_transition_control_socket_endpoint: None,
+            managed_transition_process_instance_id: None,
+            telemetry_reset: Default::default(),
+            control_endpoint: None,
+            cloud_skill_provider: None,
             outgoing: Arc::clone(&outgoing),
             analytics_events_client: AnalyticsEventsClient::disabled(),
             arg0_paths: Arg0DispatchPaths::default(),
+            startup_cwd: Some(config.cwd.to_path_buf()),
             config,
             config_manager,
             environment_manager: Arc::new(EnvironmentManager::default_for_tests()),
@@ -165,9 +170,11 @@ impl Harness {
             log_db: None,
             state_db: None,
             config_warnings: Vec::new(),
+            startup_warnings_tx: mpsc::unbounded_channel().0,
             session_source: SessionSource::Cli,
             auth_manager: Arc::clone(&auth),
             user_verification: Arc::clone(&service),
+            runtime_auth_slot: None,
             installation_id: "11111111-1111-4111-8111-111111111111".into(),
             code_mode_session_provider: None,
             rpc_transport: match origin {
@@ -179,9 +186,6 @@ impl Harness {
             },
             remote_control_handle: None,
             plugin_startup_tasks: None,
-            managed_transition_control_socket_endpoint: None,
-            managed_transition_process_instance_id: None,
-            control_endpoint: None,
         }));
         Ok(Self {
             processor,

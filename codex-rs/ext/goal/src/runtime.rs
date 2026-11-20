@@ -5,8 +5,6 @@ use std::sync::atomic::Ordering;
 
 use codex_core::StartIfIdleSubmission;
 use codex_core::ThreadManager;
-use codex_core::TurnInput;
-use codex_core::TurnInputRequest;
 use codex_core::TurnStartOptions;
 use codex_protocol::ThreadId;
 use codex_protocol::models::ResponseItem;
@@ -18,7 +16,7 @@ use crate::analytics::GoalAnalytics;
 use crate::analytics::GoalEventAttribution;
 use crate::events::GoalEventEmitter;
 use crate::metrics::GoalMetrics;
-use crate::steering::continuation_steering_item;
+use crate::steering::continuation_request;
 use crate::steering::objective_updated_steering_item;
 use crate::tool::protocol_goal_from_state;
 use tokio::sync::Semaphore;
@@ -192,10 +190,23 @@ impl GoalRuntimeHandle {
         &self,
         goal: codex_state::ThreadGoal,
         previous_goal: Option<PreviousGoalSnapshot>,
+        account_work: Result<
+            Option<&dyn codex_extension_api::HostOperationWork>,
+            codex_protocol::mcp_work::McpAttemptRefused,
+        >,
     ) -> Result<(), String> {
         if !self.is_enabled() {
             return Ok(());
         }
+        // Derive once before steering/configuration/preparation waits. The
+        // caller's original request retains its own independent operation.
+        let work = account_work.and_then(|work| {
+            work.map(|work| {
+                work.derive_operation()
+                    .map_err(|_| codex_protocol::mcp_work::McpAttemptRefused)
+            })
+            .transpose()
+        });
 
         self.inner.accounting_state.reset_empty_responses();
         let replaced_existing_goal = previous_goal
@@ -234,11 +245,13 @@ impl GoalRuntimeHandle {
                         .accounting_state
                         .mark_idle_goal_active(goal.goal_id.clone());
                 }
-                if objective_changed {
+                if objective_changed && work.is_ok() {
                     let item = objective_updated_steering_item(&protocol_goal_from_state(goal));
                     self.inject_active_turn_steering(item).await;
                 }
-                self.continue_if_idle().await?;
+                if let Ok(work) = work {
+                    self.continue_if_idle_with_work(work.as_deref()).await?;
+                }
             }
             codex_state::ThreadGoalStatus::BudgetLimited => {
                 if self.inner.accounting_state.current_turn_id().is_none() {
@@ -286,6 +299,19 @@ impl GoalRuntimeHandle {
         // Hold this through accounting and the status update so external goal
         // mutations and idle continuation cannot interleave between them.
         let _goal_state_permit = self.goal_state_permit().await?;
+        let accounting = &self.inner.accounting_state;
+        let _turn_start_permit = if matches!(reason, ActiveGoalStopReason::EmptyResponse)
+            && accounting.interrupted_turn_id().as_deref() == Some(turn_id)
+        {
+            Some(
+                accounting
+                    .turn_start_permit()
+                    .await
+                    .map_err(|err| err.to_string())?,
+            )
+        } else {
+            None
+        };
         let Some(accounting_goal_id) = self
             .inner
             .accounting_state
@@ -309,9 +335,7 @@ impl GoalRuntimeHandle {
                 None,
             ),
             ActiveGoalStopReason::EmptyResponse => {
-                let Some(expected_goal_id) =
-                    self.inner.accounting_state.empty_response_goal(turn_id)
-                else {
+                let Some(expected_goal_id) = accounting.empty_response_goal(turn_id) else {
                     return Ok(());
                 };
                 if accounting_goal_id != expected_goal_id {
@@ -423,7 +447,10 @@ impl GoalRuntimeHandle {
         Ok(())
     }
 
-    pub(crate) async fn continue_if_idle(&self) -> Result<(), String> {
+    pub(crate) async fn continue_if_idle_with_work(
+        &self,
+        work: Option<&dyn codex_extension_api::HostOperationWork>,
+    ) -> Result<(), String> {
         if !self.tools_available() {
             self.inner.accounting_state.clear_active_goal();
             return Ok(());
@@ -472,21 +499,21 @@ impl GoalRuntimeHandle {
             .get::<TurnStartOptions>()
             .map(|options| options.as_ref().clone())
             .unwrap_or_default();
-        let item = continuation_steering_item(
+        let request = continuation_request(
             &protocol_goal_from_state(goal),
             thread.config().await.update_plan_enabled,
         );
 
-        match thread
-            .start_turn_if_idle(
-                TurnInputRequest::new(TurnInput::ResponseItem(item)).on_start(TurnStartOptions {
-                    turn_trigger: Some("goal".to_string()),
-                    ..start_options
-                }),
-            )
-            .await
-        {
-            Ok(StartIfIdleSubmission::Started { turn_id }) => {
+        let request = request.on_start(TurnStartOptions {
+            turn_trigger: Some("goal".to_string()),
+            ..start_options
+        });
+        let submission = match work {
+            Some(work) => thread.start_turn_if_idle_with_work(request, work).await,
+            None => thread.start_turn_if_idle(request).await,
+        };
+        match submission {
+            Ok(StartIfIdleSubmission::Started { turn_id, .. }) => {
                 // Turn-stop evaluation takes the same permit, so even a fast response
                 // cannot finish before this host-admitted continuation is identified.
                 self.inner.accounting_state.mark_goal_continuation(turn_id);
@@ -509,6 +536,7 @@ impl GoalRuntimeHandle {
             .inner
             .accounting_state
             .current_turn_id()
+            .or_else(|| self.inner.accounting_state.interrupted_turn_id())
             .is_some_and(|turn_id| {
                 self.inner
                     .accounting_state

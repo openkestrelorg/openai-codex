@@ -12,6 +12,11 @@ use super::identities_match;
 use super::start_control_socket_acceptor;
 #[cfg(unix)]
 use super::start_control_socket_acceptor_with_bound_hook;
+#[cfg(unix)]
+use super::unix_socket::acquire_removable_app_server_startup_lock;
+#[cfg(unix)]
+use super::unix_socket::try_acquire_removable_app_server_startup_lock;
+use crate::websocket_compression::WebSocketCompression;
 use codex_app_server_protocol::JSONRPCMessage;
 use codex_app_server_protocol::JSONRPCNotification;
 use codex_core::config::find_codex_home;
@@ -56,11 +61,14 @@ async fn bound_hook_failure_removes_rendezvous_and_physical_socket_before_retry(
     let socket_path = test_socket_path(temp_dir.path());
     let (events, mut received) = mpsc::channel::<TransportEvent>(CHANNEL_CAPACITY);
     let mut physical_path = None;
+    let owner_custody = crate::OwnerCustody::new(CancellationToken::new());
     let failure = start_control_socket_acceptor_with_bound_hook(
         socket_path.clone(),
         events,
         CancellationToken::new(),
         DaemonShutdownAccess::Disabled,
+        WebSocketCompression::Plain,
+        owner_custody.expiry(),
         || {
             let physical = std::fs::read_link(socket_path.as_path()).expect("rendezvous published");
             assert!(
@@ -86,11 +94,14 @@ async fn bound_hook_failure_removes_rendezvous_and_physical_socket_before_retry(
     let (events, _received) = mpsc::channel::<TransportEvent>(CHANNEL_CAPACITY);
     let shutdown = CancellationToken::new();
     let mut published = false;
+    let owner_custody = crate::OwnerCustody::new(CancellationToken::new());
     let acceptor = start_control_socket_acceptor_with_bound_hook(
         socket_path.clone(),
         events,
         shutdown.clone(),
         DaemonShutdownAccess::Disabled,
+        WebSocketCompression::Plain,
+        owner_custody.expiry(),
         || {
             published = true;
             Ok(())
@@ -143,16 +154,21 @@ async fn long_control_socket_paths_connect_to_distinct_daemons() {
         let (transport_event_tx, _transport_event_rx) =
             mpsc::channel::<TransportEvent>(CHANNEL_CAPACITY);
         let shutdown_token = CancellationToken::new();
+        // The caller owns the custody through join and shutdown.
+        let owner_custody = crate::OwnerCustody::new(CancellationToken::new());
         let acceptor = start_control_socket_acceptor(
             socket_path.clone(),
             transport_event_tx,
             shutdown_token.clone(),
             DaemonShutdownAccess::Disabled,
+            WebSocketCompression::Plain,
+            &owner_custody,
         )
         .await
         .expect("control socket acceptor should start");
         sockets.push(socket_path);
-        acceptors.push((shutdown_token, acceptor));
+        // The custody must outlive the acceptor (through join and shutdown).
+        acceptors.push((shutdown_token, acceptor, owner_custody));
     }
 
     assert_ne!(
@@ -164,9 +180,10 @@ async fn long_control_socket_paths_connect_to_distinct_daemons() {
             .await
             .expect("client should connect through long path");
     }
-    for (shutdown_token, acceptor) in acceptors {
+    for (shutdown_token, acceptor, owner_custody) in acceptors {
         shutdown_token.cancel();
         acceptor.await.expect("acceptor should stop");
+        drop(owner_custody);
     }
 }
 
@@ -177,11 +194,15 @@ async fn control_socket_acceptor_upgrades_and_forwards_websocket_text_messages_a
     let (transport_event_tx, mut transport_event_rx) =
         mpsc::channel::<TransportEvent>(CHANNEL_CAPACITY);
     let shutdown_token = CancellationToken::new();
+    // The caller owns the custody through join and shutdown.
+    let owner_custody = crate::OwnerCustody::new(CancellationToken::new());
     let accept_handle = start_control_socket_acceptor(
         socket_path.clone(),
         transport_event_tx,
         shutdown_token.clone(),
         DaemonShutdownAccess::Disabled,
+        WebSocketCompression::Plain,
+        &owner_custody,
     )
     .await
     .expect("control socket acceptor should start");
@@ -290,6 +311,172 @@ async fn control_socket_acceptor_upgrades_and_forwards_websocket_text_messages_a
 /// parent test chooses whether that executable has the same file identity as
 /// the listener or a deliberately copied (different) identity.
 #[cfg(unix)]
+/// Public control-socket expiry: work retained at the owner deadline is held
+/// by the caller's `OwnerCustody` (not by the acceptor or the connection),
+/// is never polled after expiry, and is released exactly once when the
+/// caller drops that custody.
+#[tokio::test]
+async fn control_socket_work_retained_at_expiry_is_released_by_the_callers_custody() {
+    let temp_dir = tempfile::TempDir::new().expect("temp dir");
+    let socket_path = test_socket_path(temp_dir.path());
+    let (transport_event_tx, mut transport_event_rx) =
+        mpsc::channel::<TransportEvent>(CHANNEL_CAPACITY);
+    let shutdown_token = CancellationToken::new();
+    let owner_custody = crate::OwnerCustody::new(CancellationToken::new());
+    let owner = owner_custody.expiry();
+    // The owner deadline has already passed: bounded work is stopped before
+    // its first poll (no wall-clock wait needed).
+    owner
+        .arm(tokio::time::Instant::now())
+        .expect("the caller's custody is live");
+    let accept_handle = start_control_socket_acceptor(
+        socket_path.clone(),
+        transport_event_tx,
+        shutdown_token.clone(),
+        DaemonShutdownAccess::Disabled,
+        WebSocketCompression::Plain,
+        &owner_custody,
+    )
+    .await
+    .expect("control socket acceptor should start");
+
+    let stream = connect_to_socket(socket_path.as_path())
+        .await
+        .expect("client should connect");
+    let (mut websocket, _response) = client_async("ws://localhost/rpc", stream)
+        .await
+        .expect("websocket upgrade should complete");
+    let opened = timeout(Duration::from_secs(5), transport_event_rx.recv())
+        .await
+        .expect("connection opened event should arrive")
+        .expect("connection opened event");
+    let TransportEvent::ConnectionOpened { writer, .. } = opened else {
+        panic!("expected connection opened event");
+    };
+    // The server stops admitting; the next request must be refused.
+    transport_event_rx.close();
+    let request = JSONRPCMessage::Request(codex_app_server_protocol::JSONRPCRequest {
+        id: codex_app_server_protocol::RequestId::Integer(9),
+        method: "config/read".to_string(),
+        params: None,
+        trace: None,
+    });
+    websocket
+        .send(WebSocketMessage::Text(
+            serde_json::to_string(&request)
+                .expect("request should serialize")
+                .into(),
+        ))
+        .await
+        .expect("request should send");
+    // The connection ends after the refusal; no frame (in particular no
+    // refusal reply, which stayed retained unpolled) reaches the client.
+    let mut frames = Vec::new();
+    timeout(Duration::from_secs(5), async {
+        while let Some(Ok(frame)) = websocket.next().await {
+            frames.push(frame);
+        }
+    })
+    .await
+    .expect("connection should end after the refusal");
+    assert!(
+        frames
+            .iter()
+            .all(|frame| !matches!(frame, WebSocketMessage::Text(_))),
+        "the retained refusal was never polled: {frames:?}"
+    );
+
+    // Retained by the caller's custody, counted as abandoned.
+    assert_eq!(owner.returned_tasks(), vec!["not_admitted_refusal"]);
+    assert_eq!(owner_custody.retained_tasks(), vec!["not_admitted_refusal"]);
+    assert_eq!(owner.abandoned_output().messages, 1);
+    // The retained future holds the only other writer clone.
+    assert_eq!(writer.strong_count(), 2);
+
+    shutdown_token.cancel();
+    accept_handle.await.expect("acceptor should join");
+    // Joined and shut down: still held, only by the caller's custody.
+    assert_eq!(writer.strong_count(), 2);
+    drop(owner_custody);
+    assert_eq!(writer.strong_count(), 1, "released exactly once");
+    assert_socket_path_removed(socket_path.as_path());
+}
+
+/// Public control-socket owner release: when the caller drops its custody
+/// mid-connection, the acceptor wakes and stops admitting connections, and
+/// the open connection drives no further request.
+#[tokio::test]
+async fn control_socket_stops_admitting_when_the_callers_custody_is_dropped() {
+    let temp_dir = tempfile::TempDir::new().expect("temp dir");
+    let socket_path = test_socket_path(temp_dir.path());
+    let (transport_event_tx, mut transport_event_rx) =
+        mpsc::channel::<TransportEvent>(CHANNEL_CAPACITY);
+    let shutdown_token = CancellationToken::new();
+    let owner_custody = crate::OwnerCustody::new(CancellationToken::new());
+    let accept_handle = start_control_socket_acceptor(
+        socket_path.clone(),
+        transport_event_tx,
+        shutdown_token.clone(),
+        DaemonShutdownAccess::Disabled,
+        WebSocketCompression::Plain,
+        &owner_custody,
+    )
+    .await
+    .expect("control socket acceptor should start");
+    let stream = connect_to_socket(socket_path.as_path())
+        .await
+        .expect("client should connect");
+    let (mut websocket, _response) = client_async("ws://localhost/rpc", stream)
+        .await
+        .expect("websocket upgrade should complete");
+    let opened = timeout(Duration::from_secs(5), transport_event_rx.recv())
+        .await
+        .expect("connection opened event should arrive")
+        .expect("connection opened event");
+    assert!(matches!(opened, TransportEvent::ConnectionOpened { .. }));
+
+    // The caller drops its custody mid-connection (shutdown is NOT cancelled).
+    drop(owner_custody);
+    timeout(Duration::from_secs(5), accept_handle)
+        .await
+        .expect("the acceptor wakes and stops on the owner's release")
+        .expect("acceptor task");
+
+    // The open connection drives no new request after the release.
+    let request = JSONRPCMessage::Request(codex_app_server_protocol::JSONRPCRequest {
+        id: codex_app_server_protocol::RequestId::Integer(9),
+        method: "config/read".to_string(),
+        params: None,
+        trace: None,
+    });
+    let _ = websocket
+        .send(WebSocketMessage::Text(
+            serde_json::to_string(&request)
+                .expect("request should serialize")
+                .into(),
+        ))
+        .await;
+    let mut events = Vec::new();
+    timeout(Duration::from_secs(5), async {
+        while let Some(event) = transport_event_rx.recv().await {
+            events.push(event);
+        }
+    })
+    .await
+    .expect("the connection stops, so every event sender is dropped");
+    assert!(
+        events
+            .iter()
+            .all(|event| !matches!(event, TransportEvent::IncomingMessage { .. })),
+        "no request is admitted after the owner's release"
+    );
+
+    // No new connection is admitted either.
+    assert_socket_path_removed(socket_path.as_path());
+    assert!(connect_to_socket(socket_path.as_path()).await.is_err());
+    assert!(!shutdown_token.is_cancelled());
+}
+
 #[test]
 fn unix_socket_peer_helper_connects() {
     let Ok(socket_path) = std::env::var(UNIX_SOCKET_PEER_HELPER_SOCKET_ENV) else {
@@ -335,11 +522,15 @@ async fn control_socket_entitles_only_a_same_image_peer() {
     let (transport_event_tx, mut transport_event_rx) =
         mpsc::channel::<TransportEvent>(CHANNEL_CAPACITY);
     let shutdown_token = CancellationToken::new();
+    // The caller owns the custody through join and shutdown.
+    let owner_custody = crate::OwnerCustody::new(CancellationToken::new());
     let accept_handle = start_control_socket_acceptor(
         socket_path.clone(),
         transport_event_tx,
         shutdown_token.clone(),
         DaemonShutdownAccess::Disabled,
+        WebSocketCompression::Plain,
+        &owner_custody,
     )
     .await
     .expect("control socket acceptor should start");
@@ -539,11 +730,15 @@ async fn shutdown_is_only_accepted_on_managed_local_socket_for_its_own_pid() {
     let socket_path = test_socket_path(temp_dir.path());
     let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
     let shutdown = CancellationToken::new();
+    // The caller owns the custody through join and shutdown.
+    let owner_custody = crate::OwnerCustody::new(CancellationToken::new());
     let acceptor = start_control_socket_acceptor(
         socket_path.clone(),
         tx,
         shutdown.clone(),
         DaemonShutdownAccess::Disabled,
+        WebSocketCompression::Plain,
+        &owner_custody,
     )
     .await
     .expect("acceptor");
@@ -562,11 +757,15 @@ async fn shutdown_is_only_accepted_on_managed_local_socket_for_its_own_pid() {
 
     let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
     let shutdown = CancellationToken::new();
+    // The caller owns the custody through join and shutdown.
+    let owner_custody = crate::OwnerCustody::new(CancellationToken::new());
     let acceptor = start_control_socket_acceptor(
         socket_path.clone(),
         tx,
         shutdown.clone(),
         DaemonShutdownAccess::Managed,
+        WebSocketCompression::Plain,
+        &owner_custody,
     )
     .await
     .expect("managed acceptor");
@@ -638,6 +837,44 @@ async fn app_server_startup_lock_serializes_waiters() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn removable_startup_lock_attempt_is_nonblocking() {
+    let temp_dir = tempfile::TempDir::new().expect("temp dir");
+    let lock_path = AbsolutePathBuf::from_absolute_path(temp_dir.path().join("socket.lock"))
+        .expect("lock path should resolve");
+    let _lock = try_acquire_removable_app_server_startup_lock(lock_path.clone())
+        .expect("first lock should succeed");
+    let error = timeout(
+        Duration::from_secs(1),
+        tokio::task::spawn_blocking(move || {
+            try_acquire_removable_app_server_startup_lock(lock_path)
+        }),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .err()
+    .unwrap();
+    assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn removable_startup_lock_rejects_a_dangling_symlink_collision() {
+    let temp_dir = tempfile::TempDir::new().expect("temp dir");
+    let lock_path = AbsolutePathBuf::from_absolute_path(temp_dir.path().join("socket.lock"))
+        .expect("lock path should resolve");
+    std::os::unix::fs::symlink(temp_dir.path().join("missing/target"), lock_path.as_path())
+        .expect("dangling symlink should be created");
+
+    let error = acquire_removable_app_server_startup_lock(lock_path)
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn control_socket_rejects_writable_parent_without_changing_permissions() {
     use std::os::unix::fs::PermissionsExt;
 
@@ -645,11 +882,15 @@ async fn control_socket_rejects_writable_parent_without_changing_permissions() {
     std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
     let path = AbsolutePathBuf::from_absolute_path(directory.path().join("rpc.sock")).unwrap();
     let (tx, _rx) = mpsc::channel(CHANNEL_CAPACITY);
+    // The caller owns the custody through join and shutdown.
+    let owner_custody = crate::OwnerCustody::new(CancellationToken::new());
     let error = start_control_socket_acceptor(
         path.clone(),
         tx,
         CancellationToken::new(),
         DaemonShutdownAccess::Disabled,
+        WebSocketCompression::Plain,
+        &owner_custody,
     )
     .await
     .unwrap_err();
@@ -678,11 +919,15 @@ async fn control_socket_file_is_private_after_bind() {
     let (transport_event_tx, _transport_event_rx) =
         mpsc::channel::<TransportEvent>(CHANNEL_CAPACITY);
     let shutdown_token = CancellationToken::new();
+    // The caller owns the custody through join and shutdown.
+    let owner_custody = crate::OwnerCustody::new(CancellationToken::new());
     let accept_handle = start_control_socket_acceptor(
         socket_path.clone(),
         transport_event_tx,
         shutdown_token.clone(),
         DaemonShutdownAccess::Disabled,
+        WebSocketCompression::Plain,
+        &owner_custody,
     )
     .await
     .expect("control socket acceptor should start");
@@ -697,6 +942,10 @@ async fn control_socket_file_is_private_after_bind() {
     );
     let physical_path = std::fs::read_link(socket_path.as_path()).expect("rendezvous symlink");
     assert_eq!(
+        super::verified_local_daemon_socket(socket_path.as_path()).unwrap(),
+        Some(AbsolutePathBuf::from_absolute_path(physical_path.clone()).unwrap())
+    );
+    assert_eq!(
         physical_path.parent(),
         Some(
             codex_uds::shared_daemon_socket_directory()
@@ -704,28 +953,45 @@ async fn control_socket_file_is_private_after_bind() {
                 .as_path()
         )
     );
+    assert!(physical_path.with_extension("lock").exists());
 
     shutdown_token.cancel();
     accept_handle.await.expect("acceptor should join");
     assert!(!physical_path.exists());
+    assert!(!physical_path.with_extension("lock").exists());
     assert!(std::fs::symlink_metadata(socket_path.as_path()).is_err());
+
+    // SSH/socat may bind directly at the same advertised path.
+    let forwarded = tokio::net::UnixListener::bind(socket_path.as_path()).unwrap();
+    assert_eq!(
+        super::verified_local_daemon_socket(socket_path.as_path()).unwrap(),
+        None
+    );
+    drop(forwarded);
+    std::fs::remove_file(socket_path.as_path()).unwrap();
 
     // Simulate a dangling rendezvous left by an interrupted cleanup.
     std::os::unix::fs::symlink(&physical_path, socket_path.as_path()).unwrap();
     let (sender, _receiver) = mpsc::channel::<TransportEvent>(CHANNEL_CAPACITY);
     let shutdown = CancellationToken::new();
+    // The caller owns the custody through join and shutdown.
+    let owner_custody = crate::OwnerCustody::new(CancellationToken::new());
     let (first, second) = tokio::join!(
         start_control_socket_acceptor(
             socket_path.clone(),
             sender.clone(),
             shutdown.clone(),
             DaemonShutdownAccess::Disabled,
+            WebSocketCompression::Plain,
+            &owner_custody,
         ),
         start_control_socket_acceptor(
             socket_path.clone(),
             sender,
             shutdown.clone(),
             DaemonShutdownAccess::Disabled,
+            WebSocketCompression::Plain,
+            &owner_custody,
         ),
     );
     let (acceptor, error) = match (first, second) {
@@ -756,11 +1022,15 @@ async fn control_socket_pins_directory_until_shutdown() {
     let moved = temp_dir.path().join("moved");
     let (tx, _rx) = mpsc::channel::<TransportEvent>(CHANNEL_CAPACITY);
     let shutdown = CancellationToken::new();
+    // The caller owns the custody through join and shutdown.
+    let owner_custody = crate::OwnerCustody::new(CancellationToken::new());
     let acceptor = start_control_socket_acceptor(
         socket_path.clone(),
         tx,
         shutdown.clone(),
         DaemonShutdownAccess::Disabled,
+        WebSocketCompression::Plain,
+        &owner_custody,
     )
     .await
     .expect("acceptor");
@@ -810,4 +1080,59 @@ fn assert_socket_path_removed(socket_path: &Path) {
 fn assert_socket_path_removed(_socket_path: &Path) {
     // uds_windows uses a regular filesystem path as its rendezvous point,
     // but there is no Unix socket filesystem node to assert on.
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+#[tokio::test]
+async fn accepted_same_image_provenance_is_reestablished_on_reconnect() {
+    let home = tempfile::tempdir().unwrap();
+    let socket = AbsolutePathBuf::from_absolute_path(home.path().join("peer.sock")).unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(CHANNEL_CAPACITY);
+    let stop = CancellationToken::new();
+    let owner_custody = crate::OwnerCustody::new(CancellationToken::new());
+    let acceptor = start_control_socket_acceptor(
+        socket.clone(),
+        tx,
+        stop.clone(),
+        DaemonShutdownAccess::Disabled,
+        WebSocketCompression::Plain,
+        &owner_custody,
+    )
+    .await
+    .unwrap();
+    let expected = super::PeerExecutableIdentity::capture_running_process().unwrap();
+    let mut ids = Vec::new();
+    for _ in 0..2 {
+        let stream = UnixStream::connect(socket.as_path()).await.unwrap();
+        let (mut client, _) = tokio_tungstenite::client_async("ws://localhost/rpc", stream)
+            .await
+            .unwrap();
+        let (id, proof) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match rx.recv().await.unwrap() {
+                    TransportEvent::ConnectionOpened {
+                        connection_id,
+                        provenance,
+                        ..
+                    } => break (connection_id, provenance),
+                    TransportEvent::ConnectionClosed { .. } => {}
+                    other => panic!("unexpected event: {other:?}"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            proof,
+            super::ConnectionProvenance::UnixPeerExecutable(expected)
+        );
+        ids.push(id);
+        client.close(None).await.unwrap();
+    }
+    assert_ne!(ids[0], ids[1]);
+    stop.cancel();
+    tokio::time::timeout(std::time::Duration::from_secs(5), acceptor)
+        .await
+        .unwrap()
+        .unwrap();
 }

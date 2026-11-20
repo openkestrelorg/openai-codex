@@ -95,8 +95,10 @@ impl ManagedTuiWorktree {
 
 async fn latest_thread_cwd(path: Option<PathBuf>, fallback: PathBuf) -> PathBuf {
     let Some(path) = path else { return fallback };
-    tokio::task::spawn_blocking(move || {
-        let reader = codex_rollout::open_rollout_seekable_reader(&path).ok()?;
+    let (stop, keep_running) = tokio::sync::oneshot::channel::<()>();
+    let result = tokio::task::spawn_blocking(move || {
+        let reader =
+            codex_rollout::open_rollout_seekable_reader(&path, || stop.is_closed()).ok()?;
         let mut scanner = codex_rollout::ReverseJsonlScanner::new(reader).ok()?;
         while let Some(outcome) = scanner.scan_next_rollout_line().ok()? {
             if let codex_rollout::ScanOutcome::Parsed(codex_rollout::RolloutLine {
@@ -112,7 +114,9 @@ async fn latest_thread_cwd(path: Option<PathBuf>, fallback: PathBuf) -> PathBuf 
     .await
     .ok()
     .flatten()
-    .unwrap_or(fallback)
+    .unwrap_or(fallback);
+    drop(keep_running);
+    result
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -127,7 +131,6 @@ pub(super) async fn prepare(
     arg0_paths: &Arg0DispatchPaths,
     source_bundle: CloudConfigBundleLoader,
     embedded_network_policy: &codex_app_server_client::EmbeddedNetworkPolicy,
-    host: Arc<InProcessHost>,
 ) -> color_eyre::Result<(Config, CloudConfigBundleLoader, ManagedTuiWorktree)> {
     if let Some(id_or_name) = cli.fork_session_id.as_deref() {
         let prepared = if should_load_configured_environments(&loader_overrides, target) {
@@ -150,6 +153,7 @@ pub(super) async fn prepare(
             init_state_db_for_app_server_target(&source, &AppServerTarget::Embedded).await?;
         let mut lookup_config = source.clone();
         lookup_config.analytics_enabled = Some(false);
+        let embedded_host = Arc::new(codex_app_server_client::InProcessHost::default());
         let client = start_embedded_app_server(
             arg0_paths.clone(),
             lookup_config,
@@ -162,17 +166,23 @@ pub(super) async fn prepare(
             state,
             Arc::new(environment),
             embedded_network_policy.clone(),
-            host,
+            Arc::clone(&embedded_host),
         )
         .await?;
         let mut lookup = AppServerSession::new(
+            crate::backend_id::BackendId::new(),
             AppServerClient::InProcess(client),
             crate::app_server_session::ThreadParamsMode::Embedded,
         );
         let resolved = async {
-            let target = lookup_session_target_with_app_server(&mut lookup, &source, id_or_name)
-                .await?
-                .ok_or_else(|| color_eyre::eyre::eyre!("Session not found: {id_or_name}"))?;
+            let target = lookup_session_target_with_app_server(
+                crate::resume_picker::SessionPickerAction::Fork,
+                &mut lookup,
+                &source,
+                id_or_name,
+            )
+            .await?
+            .ok_or_else(|| color_eyre::eyre::eyre!("Session not found: {id_or_name}"))?;
             lookup
                 .thread_read(target.thread_id, /*include_turns*/ false)
                 .await
@@ -211,11 +221,6 @@ pub(super) async fn prepare(
             )
             .await;
         }
-    }
-    if !source.features.enabled(codex_features::Feature::Worktrees) {
-        color_eyre::eyre::bail!(
-            "`--worktree` requires the worktrees feature; enable it with `--enable worktrees`"
-        );
     }
     if source.active_project.is_untrusted() {
         color_eyre::eyre::bail!(

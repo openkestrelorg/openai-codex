@@ -3,10 +3,14 @@
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use futures::future::Shared;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
+use std::task::Context;
+use std::task::Poll;
 use tokio::task::AbortHandle;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
@@ -65,8 +69,11 @@ impl TaskAbortHandle {
         self.abort.abort();
     }
 
-    pub(crate) fn detach(mut self) {
+    /// Release abort-on-drop ownership while retaining an exact join observer.
+    /// The registry remains the final owner if this observer is cancelled.
+    pub(crate) fn detach(mut self) -> Self {
         self.armed = false;
+        self
     }
 }
 
@@ -194,3 +201,20 @@ impl TaskJoinRegistry {
         }
     }
 }
+
+// Preserve 0.169's join-before-timing-freeze and suspend-before-writer-close
+// ordering without transferring the registry's original join ownership.
+impl Future for TaskAbortHandle {
+    type Output = bool;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match &mut self.get_mut().completion {
+            Some(completion) => Pin::new(completion).poll(cx),
+            None => Poll::Ready(false),
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "retirement_tests.rs"]
+mod tests;

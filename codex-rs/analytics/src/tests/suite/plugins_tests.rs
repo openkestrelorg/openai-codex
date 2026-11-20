@@ -286,8 +286,11 @@ fn plugin_used_dedupe_is_keyed_by_turn_and_plugin() {
     let (sender, _receiver) = mpsc::channel(1);
     let queue = AnalyticsEventsQueue {
         sender,
+        product_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         app_used_emitted_keys: Arc::new(Mutex::new(HashSet::new())),
         plugin_used_emitted_keys: Arc::new(Mutex::new(HashSet::new())),
+        auth_changes: tokio::sync::watch::channel(codex_login::AuthChangeState::default()).1,
+        owner_manager: std::sync::Weak::new(),
     };
     let plugin = sample_plugin_metadata();
 

@@ -5,7 +5,7 @@
 //! suspension, panic, and cancellation. The transition drain polls retained
 //! receipts itself: this registry spawns no watcher and never requests shutdown.
 
-use crate::managed_transition::AccountWorkPermitGuard;
+use crate::account_work_permits::AccountWorkPermitGuard;
 use codex_protocol::host_turn_work::HostTurnWork;
 use futures::FutureExt;
 use futures::StreamExt;

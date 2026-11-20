@@ -80,7 +80,7 @@ use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::Result;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ServerRequest;
-use codex_app_server_protocol::ThreadItem;
+use codex_app_server_protocol::ThreadItemPayload;
 use codex_arg0::Arg0DispatchPaths;
 use codex_config::CloudConfigBundleLoader;
 use codex_config::LoaderOverrides;
@@ -104,6 +104,7 @@ use tracing::warn;
 #[path = "in_process_bootstrap.rs"]
 mod bootstrap;
 mod shutdown;
+pub use shutdown::EmbeddedTaskOwner as ClientWorkerOwner;
 pub use shutdown::InProcessHost;
 pub use shutdown::ProcessorCleanupExecution;
 pub use shutdown::ProcessorCleanupProgress;
@@ -112,10 +113,10 @@ pub use shutdown::TaskObservation;
 pub use shutdown::TaskTermination;
 
 const IN_PROCESS_CONNECTION_ID: ConnectionId = ConnectionId(0);
-// Covers both bounded runtime drains plus the analytics client's 25-second best-effort flush.
-const SHUTDOWN_ACK_TIMEOUT: Duration = Duration::from_secs(35);
 #[cfg(test)]
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+// Covers both bounded runtime drains plus the analytics client's 25-second best-effort flush.
+pub(crate) const SHUTDOWN_ACK_TIMEOUT: Duration = Duration::from_secs(35);
 /// Default bounded channel capacity for in-process runtime queues.
 pub const DEFAULT_IN_PROCESS_CHANNEL_CAPACITY: usize = CHANNEL_CAPACITY;
 
@@ -124,14 +125,19 @@ type PendingClientRequestResponse = std::result::Result<Result, JSONRPCErrorErro
 fn server_notification_requires_delivery(notification: &ServerNotification) -> bool {
     matches!(
         notification,
-        ServerNotification::TurnCompleted(_)
+        ServerNotification::ProcessOutputDelta(_)
+            | ServerNotification::ProcessExited(_)
+            | ServerNotification::TurnCompleted(_)
             | ServerNotification::ThreadQueueChanged(_)
             | ServerNotification::ThreadSettingsUpdated(_)
             | ServerNotification::ThreadAttachmentUpdated(_)
             | ServerNotification::ExternalAgentConfigImportCompleted(_)
             | ServerNotification::ItemCompleted(ItemCompletedNotification {
-                item: ThreadItem::AgentMessage {
-                    delivery: Some(AgentMessageDelivery::Async),
+                item: codex_app_server_protocol::ThreadItem {
+                    payload: ThreadItemPayload::AgentMessage {
+                        delivery: Some(AgentMessageDelivery::Async),
+                        ..
+                    },
                     ..
                 },
                 ..
@@ -364,6 +370,7 @@ impl InProcessClientHandle {
     /// facade uses this to avoid stacking a second acknowledgement/join budget
     /// around the runtime's own retained cleanup observation.
     pub async fn shutdown_until(self, deadline: tokio::time::Instant) -> IoResult<()> {
+        drop(self.event_rx);
         let runtime_handle = self.runtime_handle;
         let custody = self._custody;
         if tokio::time::Instant::now() >= deadline {
@@ -375,14 +382,24 @@ impl InProcessClientHandle {
         }
         let (done_tx, done_rx) = oneshot::channel();
 
-        if self
-            .client
-            .client_tx
-            .send(InProcessClientMessage::Shutdown { done_tx })
-            .await
-            .is_ok()
-            && timeout_at(deadline, done_rx).await.is_err()
-        {
+        // A wedged runtime can leave its bounded queue full. The owner-drop
+        // path has no outer timeout, so submission shares the same deadline.
+        // The elapsed check above keeps an expired deadline from polling it.
+        let Ok(submitted) = timeout_at(
+            deadline,
+            self.client
+                .client_tx
+                .send(InProcessClientMessage::Shutdown { done_tx }),
+        )
+        .await
+        else {
+            let _ = custody.observe_until(deadline).await;
+            return Err(IoError::new(
+                ErrorKind::TimedOut,
+                "in-process app-server shutdown submission timed out",
+            ));
+        };
+        if submitted.is_ok() && timeout_at(deadline, done_rx).await.is_err() {
             let _ = custody.observe_until(deadline).await;
             return Err(IoError::new(
                 ErrorKind::TimedOut,
@@ -435,14 +452,12 @@ impl InProcessClientHandle {
 /// This function sends `initialize` followed by `initialized` before returning
 /// the handle, so callers receive a ready-to-use runtime. If initialize fails,
 /// the runtime is shut down and an `InvalidData` error is returned.
-#[deprecated(note = "use start_in_host with host custody that survives startup and shutdown")]
+#[deprecated(note = "use start_in_host with custody retained across startup and shutdown")]
 pub async fn start(args: InProcessStartArgs) -> IoResult<InProcessClientHandle> {
     start_with_custody(args, Arc::new(shutdown::RuntimeCustody::default())).await
 }
 
-/// Starts with custody reserved in the caller's host before the first await.
-/// The host must be retained across startup cancellation and incomplete
-/// shutdown. The returned client also retains its exact runtime slot.
+/// Reserve original runtime custody before the first startup await.
 pub async fn start_in_host(
     host: &InProcessHost,
     args: InProcessStartArgs,
@@ -464,6 +479,7 @@ async fn start_with_custody(
         });
     }
     let initialize = args.initialize.clone();
+    // Keep embedded startup state off callers' stacks, which are smaller on Windows.
     let client = Box::pin(start_uninitialized(args, custody)).await?;
 
     let initialize_response = client
@@ -517,6 +533,9 @@ async fn start_uninitialized(
         args.thread_config_loader,
     )
     .with_embedded_network_policy(args.embedded_network_policy);
+    // Keep the caller's project context independent of any fallback policy config.
+    let startup_cwd =
+        (!args.config.config_layer_stack.is_projectless()).then(|| args.config.cwd.to_path_buf());
     let auth_manager = bootstrap::configure(
         &config_manager,
         &mut args.config,
@@ -532,13 +551,23 @@ async fn start_uninitialized(
     let runtime_ticket = shutdown::RuntimeCustodyTicket(Arc::downgrade(&custody));
     let runtime_handle = custody.spawn(shutdown::RuntimeTask::Runtime, async move {
         let (outgoing_tx, outgoing_rx) = mpsc::channel::<OutgoingEnvelope>(channel_capacity);
-        let analytics_events_client =
-            analytics_events_client_from_config(Arc::clone(&auth_manager), args.config.as_ref());
+        let runtime_auth_slot = args
+            .config
+            .features
+            .enabled(codex_features::Feature::RuntimeAgentInstances)
+            .then(codex_runtime_agent_instance::RuntimeAuthSlot::default);
+        let analytics_events_client = analytics_events_client_from_config(
+            Arc::clone(&auth_manager),
+            args.config.as_ref(),
+            runtime_auth_slot.clone(),
+        );
         let analytics_events_flush_client = analytics_events_client.clone();
-        let outgoing_message_sender = Arc::new(OutgoingMessageSender::new(
-            outgoing_tx,
-            analytics_events_client.clone(),
-        ));
+        // A client can be waiting for process/kill while nobody is polling next_event.
+        let (process_reply_tx, mut process_reply_rx) = mpsc::channel(channel_capacity);
+        let outgoing_message_sender = Arc::new(
+            OutgoingMessageSender::new(outgoing_tx, analytics_events_client.clone())
+                .with_process_reply_sender(process_reply_tx),
+        );
 
         let log_write_warning = crate::log_write_warning::LogWriteWarningReporter::new(
             args.feedback.clone(),
@@ -580,39 +609,44 @@ async fn start_uninitialized(
 
         let processor_outgoing = Arc::clone(&outgoing_message_sender);
         let (processor_tx, mut processor_rx) = mpsc::channel::<ProcessorCommand>(channel_capacity);
-        // Establish custody before the processor task can be polled. The
-        // enclosing runtime retains these owners independently of that task's
-        // join; the host shutdown controller will retain the enclosing owner.
+        let (startup_warnings_tx, mut startup_warnings_rx) = mpsc::unbounded_channel();
         let processor_owner = Arc::new(MessageProcessor::new(MessageProcessorArgs {
-            telemetry_reset: crate::otel_reset_control::TelemetryResetControl::default(),
+            managed_transition_control_socket_endpoint: None,
+            managed_transition_process_instance_id: None,
+            telemetry_reset: Default::default(),
+            control_endpoint: None,
+            cloud_skill_provider: None,
             outgoing: Arc::clone(&processor_outgoing),
             analytics_events_client,
             arg0_paths: args.arg0_paths,
             config: args.config,
+            startup_cwd,
             config_manager,
             environment_manager: args.environment_manager,
             feedback: args.feedback,
             log_db: args.log_db,
             state_db: args.state_db,
             config_warnings: args.config_warnings,
+            startup_warnings_tx,
             session_source: args.session_source,
             user_verification: Arc::new(crate::user_verification::Service::new(Arc::clone(
                 &auth_manager,
             ))),
             auth_manager,
+            runtime_auth_slot,
             installation_id,
             code_mode_session_provider: None,
             rpc_transport: AppServerRpcTransport::InProcess,
             remote_control_handle: None,
             plugin_startup_tasks: Some(PluginStartupConfig::Current),
-            managed_transition_control_socket_endpoint: None,
-            managed_transition_process_instance_id: None,
-            control_endpoint: None,
         }));
-        let session_owner = Arc::new(ConnectionSessionState::in_process());
+        let session_owner = Arc::new(ConnectionSessionState::with_provenance(
+            crate::transport::ConnectionOrigin::InProcess,
+            crate::transport::ConnectionProvenance::InProcess,
+            crate::thread_state::RetentionPrincipalId::connection_owned(),
+        ));
         let processor_cleanup_owner = Arc::new(shutdown::ProcessorCleanupOwner::new(
-            Arc::clone(&processor_owner),
-            Arc::clone(&session_owner),
+            Arc::clone(&processor_owner), Arc::clone(&session_owner),
         ));
         if runtime_ticket.attach_cleanup(Arc::clone(&processor_cleanup_owner)).is_err() {
             warn!("in-process processor cleanup custody unavailable");
@@ -668,6 +702,9 @@ async fn start_uninitialized(
                             }
                         }
                     }
+                    Some(message) = startup_warnings_rx.recv(), if session.initialized() => {
+                        crate::startup_warnings::send_warning(&processor_outgoing, message).await;
+                    }
                     created = thread_created_rx.recv(), if listen_for_threads => {
                         match created {
                             Ok(thread_id) => {
@@ -691,10 +728,8 @@ async fn start_uninitialized(
                 }
             }
 
-            // Cleanup is driven by the retained host observer, which binds
-            // the original shutdown deadline before polling its Shared
-            // future. The processor task's own join is not cleanup evidence
-            // and must not mint a second budget here.
+            // Original cleanup is driven by the retained host under its one
+            // absolute deadline, independently of this task's terminal join.
         }) else {
             warn!("in-process processor task custody unavailable");
             return;
@@ -702,6 +737,7 @@ async fn start_uninitialized(
         let mut pending_request_responses =
             HashMap::<RequestId, oneshot::Sender<PendingClientRequestResponse>>::new();
         let mut shutdown_ack = None;
+        let mut pending_event: Option<(InProcessServerEvent, Option<oneshot::Sender<()>>)> = None;
 
         loop {
             tokio::select! {
@@ -778,7 +814,27 @@ async fn start_uninitialized(
                         }
                     }
                 }
-                queued_message = writer_rx.recv() => {
+                permit = event_tx.reserve(), if pending_event.is_some() => {
+                    let Ok(permit) = permit else { break };
+                    let Some((event, written)) = pending_event.take() else { continue };
+                    permit.send(event);
+                    if let Some(written) = written {
+                        let _ = written.send(());
+                    }
+                }
+                queued_message = async {
+                    tokio::select! {
+                        reply = process_reply_rx.recv() => match reply {
+                            Some(OutgoingEnvelope::ToConnection { message, write_complete_tx, .. }) => {
+                                Some(QueuedOutgoingMessage { message, write_complete_tx })
+                            }
+                            Some(OutgoingEnvelope::Broadcast { .. }) => unreachable!("replies are connection scoped"),
+                            None => None,
+                        },
+                        // Leave ordinary replies and events queued until the pending event fits.
+                        event = writer_rx.recv(), if pending_event.is_none() => event,
+                    }
+                } => {
                     let Some(queued_message) = queued_message else {
                         break;
                     };
@@ -842,16 +898,13 @@ async fn start_uninitialized(
                         OutgoingMessage::AppServerNotification(envelope) => {
                             let notification = envelope.notification;
                             if server_notification_requires_delivery(&notification) {
-                                if event_tx
-                                    .send(InProcessServerEvent::ServerNotification(Box::new(
-                                        notification,
-                                    )))
-                                    .await
-                                    .is_err()
-                                {
-                                    break;
-                                }
-                            } else if let Err(send_error) =
+                                pending_event = Some((
+                                    InProcessServerEvent::ServerNotification(Box::new(notification)),
+                                    queued_message.write_complete_tx,
+                                ));
+                                continue;
+                            }
+                            if let Err(send_error) =
                                 event_tx.try_send(InProcessServerEvent::ServerNotification(
                                     Box::new(notification),
                                 ))
@@ -875,7 +928,9 @@ async fn start_uninitialized(
             }
         }
 
+        drop(pending_event);
         drop(writer_rx);
+        drop(process_reply_rx);
         drop(processor_tx);
         outgoing_message_sender
             .cancel_all_requests(Some(internal_error(
@@ -891,17 +946,11 @@ async fn start_uninitialized(
             )));
         }
 
-        // The cleanup owner is retained independently of this task. Do not
-        // abort it on a nested timer: a joined processor is not a cleanup
-        // receipt, and aborting here would destroy the only cleanup driver.
         let _ = processor_handle.join().await;
         let _ = outbound_shutdown_tx.send(());
         let _ = outbound_handle.join().await;
 
         analytics_events_flush_client.flush().await;
-
-        // Keep processor/session custody through the complete runtime tail,
-        // including an observed processor abort. This is not cleanup proof.
         drop(processor_cleanup_owner);
         drop(session_owner);
         drop(processor_owner);
@@ -928,9 +977,12 @@ mod tests {
     use codex_app_server_protocol::ConfigRequirementsReadResponse;
     use codex_app_server_protocol::ExternalAgentConfigImportCompletedNotification;
     use codex_app_server_protocol::SessionSource as ApiSessionSource;
+    use codex_app_server_protocol::ThreadAttachmentAddParams;
     use codex_app_server_protocol::ThreadAttachmentOperation;
+    use codex_app_server_protocol::ThreadAttachmentRemoveParams;
     use codex_app_server_protocol::ThreadAttachmentUpdatedNotification;
     use codex_app_server_protocol::ThreadQueueChangedNotification;
+    use codex_app_server_protocol::ThreadSetNameParams;
     use codex_app_server_protocol::ThreadStartParams;
     use codex_app_server_protocol::ThreadStartResponse;
     use codex_app_server_protocol::Turn;
@@ -938,6 +990,7 @@ mod tests {
     use codex_app_server_protocol::TurnItemsView;
     use codex_app_server_protocol::TurnStatus;
     use codex_core::config::ConfigBuilder;
+    use futures::FutureExt;
     use pretty_assertions::assert_eq;
     use std::path::Path;
     use tempfile::TempDir;
@@ -1006,18 +1059,25 @@ mod tests {
     }
 
     #[allow(deprecated)]
-    async fn start_test_client_with_capacity(
+    async fn start_test_client_with_options(
         session_source: SessionSource,
         channel_capacity: usize,
+        capabilities: Option<codex_app_server_protocol::InitializeCapabilities>,
     ) -> InProcessClientHandle {
-        let (args, codex_home) = test_start_args(session_source, channel_capacity).await;
+        let (mut args, codex_home) = test_start_args(session_source, channel_capacity).await;
+        args.initialize.capabilities = capabilities;
         let mut client = start(args).await.expect("in-process runtime should start");
         client._test_codex_home = Some(codex_home);
         client
     }
 
     async fn start_test_client(session_source: SessionSource) -> InProcessClientHandle {
-        start_test_client_with_capacity(session_source, DEFAULT_IN_PROCESS_CHANNEL_CAPACITY).await
+        start_test_client_with_options(
+            session_source,
+            DEFAULT_IN_PROCESS_CHANNEL_CAPACITY,
+            /*capabilities*/ None,
+        )
+        .await
     }
 
     #[tokio::test]
@@ -1039,6 +1099,47 @@ mod tests {
             .shutdown()
             .await
             .expect("in-process runtime should shutdown cleanly");
+    }
+
+    /// Importing a project makes its change visible to an embedder before the import reply.
+    #[tokio::test]
+    async fn project_import_delivers_change_before_reply() {
+        let mut client = start_test_client_with_options(
+            SessionSource::Cli,
+            DEFAULT_IN_PROCESS_CHANNEL_CAPACITY,
+            Some(codex_app_server_protocol::InitializeCapabilities {
+                experimental_api: true,
+                ..Default::default()
+            }),
+        )
+        .await;
+        let params = codex_app_server_protocol::ProjectImportParams {
+            name: "Imported".into(),
+            roots: Vec::new(),
+            metadata: None,
+            threads: None,
+            idempotency_key: "test-import".into(),
+        };
+        client
+            .request(ClientRequest::ProjectImport {
+                request_id: RequestId::Integer(1),
+                params,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        loop {
+            let event = client
+                .event_rx
+                .try_recv()
+                .expect("project/changed must already be queued");
+            if let InProcessServerEvent::ServerNotification(notification) = event
+                && matches!(*notification, ServerNotification::ProjectChanged(_))
+            {
+                break;
+            }
+        }
+        client.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -1071,8 +1172,12 @@ mod tests {
 
     #[tokio::test]
     async fn in_process_start_clamps_zero_channel_capacity() {
-        let client =
-            start_test_client_with_capacity(SessionSource::Cli, /*channel_capacity*/ 0).await;
+        let client = start_test_client_with_options(
+            SessionSource::Cli,
+            /*channel_capacity*/ 0,
+            /*capabilities*/ None,
+        )
+        .await;
         let response = loop {
             match client
                 .request(ClientRequest::ConfigRequirementsRead {
@@ -1135,18 +1240,20 @@ mod tests {
             runtime_completed.store(true, Ordering::Release);
             let _ = done_tx.send(());
         });
+        let custody = Arc::new(shutdown::RuntimeCustody::default());
+        let runtime_handle = Arc::new(shutdown::EmbeddedTaskOwner::from_handle(runtime_handle));
         let client = InProcessClientHandle {
             client: InProcessClientSender { client_tx },
             event_rx,
-            runtime_handle: Arc::new(shutdown::EmbeddedTaskOwner::from_handle(runtime_handle)),
-            _custody: Arc::new(shutdown::RuntimeCustody::default()),
+            runtime_handle,
+            _custody: custody,
             _test_codex_home: None,
         };
 
         let error = client
             .shutdown()
             .await
-            .expect_err("a runtime join without cleanup evidence is incomplete");
+            .expect_err("a task-only fixture has no processor cleanup proof");
         assert_eq!(error.kind(), ErrorKind::Other);
         assert!(completed.load(Ordering::Acquire));
     }
@@ -1158,6 +1265,7 @@ mod tests {
                 thread_id: "thread-1".to_string(),
                 turn: Turn {
                     id: "turn-1".to_string(),
+                    root_turn_id: None,
                     items: Vec::new(),
                     items_view: TurnItemsView::NotLoaded,
                     status: TurnStatus::Completed,
@@ -1191,8 +1299,11 @@ mod tests {
             })
         ));
         assert!(server_notification_requires_delivery(
-            &ServerNotification::ItemCompleted(ItemCompletedNotification {
-                item: ThreadItem::AgentMessage {
+            &ServerNotification::ItemCompleted(ItemCompletedNotification::new(
+                "thread-1".to_string(),
+                "turn-1".to_string(),
+                ThreadItemPayload::AgentMessage {
+                    moderation: None,
                     id: "item-1".to_string(),
                     text: "Still working".to_string(),
                     phase: None,
@@ -1200,10 +1311,268 @@ mod tests {
                     delivery: Some(AgentMessageDelivery::Async),
                     questions: None,
                 },
-                thread_id: "thread-1".to_string(),
-                turn_id: "turn-1".to_string(),
-                completed_at_ms: 0,
-            })
+                /*started_at_ms*/ None,
+                /*completed_at_ms*/ 0
+            ))
         ));
+    }
+
+    #[cfg(unix)]
+    async fn spawn_streaming_test_process(
+        cwd: &Path,
+        handle: &str,
+        script: &str,
+    ) -> InProcessClientHandle {
+        use codex_app_server_protocol::InitializeCapabilities;
+        use codex_app_server_protocol::ProcessSpawnParams;
+
+        let client = start_test_client_with_options(
+            SessionSource::Cli,
+            /*channel_capacity*/ 2,
+            Some(InitializeCapabilities {
+                experimental_api: true,
+                ..Default::default()
+            }),
+        )
+        .await;
+        client
+            .request(ClientRequest::ProcessSpawn {
+                request_id: RequestId::Integer(1),
+                params: ProcessSpawnParams {
+                    process_handle: handle.into(),
+                    command: vec!["/bin/sh".into(), "-c".into(), script.into()],
+                    cwd: cwd.try_into().unwrap(),
+                    tty: false,
+                    stream_stdin: false,
+                    stream_stdout_stderr: true,
+                    output_bytes_cap: Some(None),
+                    timeout_ms: None,
+                    env: None,
+                    size: None,
+                },
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        client
+    }
+
+    /// A kill after child exit must promptly report it has exited while the client is still
+    /// waiting to consume the complete download and its successful exit notification.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn process_output_and_exit_survive_a_full_in_process_event_queue() {
+        use base64::Engine;
+        use base64::engine::general_purpose::STANDARD;
+        use codex_app_server_protocol::ProcessKillParams;
+
+        let dir = TempDir::new().unwrap();
+        let contents: Vec<u8> = (0..128 * 1024u32).flat_map(u32::to_le_bytes).collect();
+        std::fs::write(dir.path().join("input"), &contents).unwrap();
+        let mut client = spawn_streaming_test_process(
+            dir.path(),
+            "download",
+            concat!(
+                "p=$$; (while kill -0 $p 2>/dev/null; do sleep 0.05; done; touch exited) ",
+                "</dev/null >/dev/null 2>&1 & exec cat input",
+            ),
+        )
+        .await;
+
+        timeout(Duration::from_secs(10), async {
+            // The pipe readers can hold this payload while delivery is stalled.
+            while client.event_rx.capacity() != 0 || !dir.path().join("exited").exists() {
+                tokio::task::yield_now().await;
+            }
+            let error = client
+                .request(ClientRequest::ProcessKill {
+                    request_id: RequestId::Integer(2),
+                    params: ProcessKillParams {
+                        process_handle: "download".into(),
+                    },
+                })
+                .await
+                .unwrap()
+                .unwrap_err();
+            assert_eq!(error.message, "process \"download\" is no longer running");
+            let mut received = Vec::new();
+            loop {
+                if let InProcessServerEvent::ServerNotification(notification) =
+                    client.next_event().await.unwrap()
+                {
+                    match *notification {
+                        ServerNotification::ProcessOutputDelta(delta) => {
+                            received.extend(STANDARD.decode(delta.delta_base64).unwrap());
+                        }
+                        ServerNotification::ProcessExited(exit) => {
+                            assert_eq!(exit.exit_code, 0);
+                            assert_eq!(received.len(), contents.len());
+                            assert_eq!(received, contents);
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        })
+        .await
+        .expect("process output and exit must both reach the consumer");
+        client.shutdown().await.unwrap();
+    }
+
+    /// Unread output must not block process control replies or a subsequent kill on the same handle.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn in_process_kill_completes_while_process_output_is_stalled() {
+        use codex_app_server_protocol::ProcessKillParams;
+        use codex_app_server_protocol::ProcessResizePtyParams;
+        use codex_app_server_protocol::ProcessTerminalSize;
+
+        let dir = TempDir::new().unwrap();
+        let client = spawn_streaming_test_process(
+            dir.path(),
+            "writer",
+            "head -c 524288 /dev/zero; head -c 524288 /dev/zero >&2; touch written; exec sleep 30",
+        )
+        .await;
+        timeout(Duration::from_secs(10), async {
+            while client.event_rx.capacity() != 0 || !dir.path().join("written").exists() {
+                tokio::task::yield_now().await;
+            }
+            // A resize on a pipe fails, but its error still has to release the handle for kill.
+            client
+                .request(ClientRequest::ProcessResizePty {
+                    request_id: RequestId::Integer(2),
+                    params: ProcessResizePtyParams {
+                        process_handle: "writer".into(),
+                        size: ProcessTerminalSize { rows: 24, cols: 80 },
+                    },
+                })
+                .await
+                .unwrap()
+                .unwrap_err();
+            client
+                .request(ClientRequest::ProcessKill {
+                    request_id: RequestId::Integer(3),
+                    params: ProcessKillParams {
+                        process_handle: "writer".into(),
+                    },
+                })
+                .await
+                .unwrap()
+                .unwrap();
+        })
+        .await
+        .expect("kill must finish before the client resumes reading output");
+        client.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn in_process_shutdown_completes_with_full_request_and_event_queues() {
+        let capacity = DEFAULT_IN_PROCESS_CHANNEL_CAPACITY;
+        let mut client = start_test_client(SessionSource::Cli).await;
+        let response = client
+            .request(ClientRequest::ThreadStart {
+                request_id: RequestId::Integer(1),
+                params: ThreadStartParams::default(),
+            })
+            .await
+            .expect("thread/start transport should work")
+            .expect("thread/start should succeed");
+        let thread: ThreadStartResponse =
+            serde_json::from_value(response).expect("thread/start response should parse");
+        let thread_id = thread.thread.id;
+        // Persist the thread metadata so attachment requests can find it.
+        client
+            .request(ClientRequest::ThreadSetName {
+                request_id: RequestId::Integer(2),
+                params: ThreadSetNameParams {
+                    thread_id: thread_id.clone(),
+                    name: "Shutdown backpressure".to_string(),
+                },
+            })
+            .await
+            .expect("thread/name/set transport should work")
+            .expect("thread/name/set should succeed");
+
+        // Observe both mutation replies at the point their updates become visible, then
+        // leave capacity + 1 updates unread to exercise shutdown with full queues.
+        let sender = client.sender();
+        for index in 0..(capacity + 3) {
+            let request_id = RequestId::Integer((index + 3) as i64);
+            let request = if index % 2 == 0 {
+                ClientRequest::ThreadAttachmentAdd {
+                    request_id,
+                    params: ThreadAttachmentAddParams {
+                        thread_id: thread_id.clone(),
+                        attachment_type: "pull_request".to_string(),
+                        identity_key: "one-attachment".to_string(),
+                        payload: serde_json::json!({}),
+                    },
+                }
+            } else {
+                ClientRequest::ThreadAttachmentRemove {
+                    request_id,
+                    params: ThreadAttachmentRemoveParams {
+                        thread_id: thread_id.clone(),
+                        attachment_type: "pull_request".to_string(),
+                        identity_key: "one-attachment".to_string(),
+                    },
+                }
+            };
+            let mut reply = std::pin::pin!(sender.request(request));
+            if index < 2 {
+                assert!(reply.as_mut().now_or_never().is_none());
+                loop {
+                    let event = client
+                        .next_event()
+                        .await
+                        .expect("event stream should remain open");
+                    if let InProcessServerEvent::ServerNotification(notification) = event
+                        && matches!(
+                            *notification,
+                            ServerNotification::ThreadAttachmentUpdated(_)
+                        )
+                    {
+                        reply
+                            .as_mut()
+                            .now_or_never()
+                            .expect("the attachment reply must be ready before its update")
+                            .expect("attachment request transport should work")
+                            .expect("attachment mutation should succeed");
+                        break;
+                    }
+                }
+            } else {
+                reply
+                    .await
+                    .expect("attachment request transport should work")
+                    .expect("attachment mutation should succeed");
+            }
+        }
+
+        assert_eq!(client.event_rx.capacity(), 0);
+        let mut queued_requests = Vec::with_capacity(capacity);
+        for index in 0..capacity {
+            let mut request = Box::pin(sender.request(ClientRequest::ConfigRequirementsRead {
+                request_id: RequestId::Integer((1000 + index) as i64),
+                params: None,
+            }));
+            // Fill the command queue on this single-thread runtime without giving the
+            // dispatcher a turn between submissions.
+            assert!(request.as_mut().now_or_never().is_none());
+            queued_requests.push(request);
+        }
+        assert_eq!(sender.client_tx.capacity(), 0);
+
+        // Only advance time after the real requests have filled both queues.
+        tokio::time::pause();
+        timeout(
+            SHUTDOWN_ACK_TIMEOUT + SHUTDOWN_TIMEOUT + Duration::from_secs(1),
+            client.shutdown(),
+        )
+        .await
+        .expect("shutdown must complete with full request and event queues")
+        .expect("shutdown should succeed");
     }
 }

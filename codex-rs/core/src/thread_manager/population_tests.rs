@@ -375,3 +375,245 @@ async fn constructor_admitted_before_close_cannot_publish_after_close() {
         "the refused publication still requires actual cleanup"
     );
 }
+
+/// Polls only the registry snapshot (no compaction, no manager API) until the
+/// exact runtime has left custody.
+async fn wait_until_released(manager: &ThreadManager, thread: &Weak<CodexThread>) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let retained = manager
+                .constructions
+                .state
+                .lock()
+                .unwrap()
+                .published
+                .iter()
+                .any(|owned| std::ptr::eq(Arc::as_ptr(owned), thread.as_ptr()));
+            if !retained {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("passive release after the observed loop join");
+}
+
+#[tokio::test]
+async fn remove_before_cleanup_releases_on_join_without_further_manager_calls() {
+    let (_home, manager, config) = manager().await;
+    let started = manager
+        .start_thread(StartThreadOptions::new(config, None))
+        .await
+        .unwrap();
+    let io = started.thread.io.retirement_io();
+    let weak = Arc::downgrade(&started.thread);
+    drop(manager.remove_thread(&started.thread_id).await);
+    drop(started);
+    assert!(weak.upgrade().is_some(), "cleanup is not yet proven");
+    assert_eq!(
+        manager.constructions.state.lock().unwrap().published.len(),
+        1
+    );
+    assert_eq!(manager.constructions.state.lock().unwrap().compacted, 0);
+
+    // Ordinary shutdown through the runtime's own IO; the manager is not called.
+    io.shutdown_and_wait().await.unwrap();
+    wait_until_released(&manager, &weak).await;
+    assert!(
+        weak.upgrade().is_none(),
+        "registry custody was the last owner of the session"
+    );
+    let state = manager.constructions.state.lock().unwrap();
+    assert!(state.published.is_empty());
+    assert_eq!(state.compacted, 1);
+}
+
+#[tokio::test]
+async fn removed_with_incomplete_cleanup_stays_retained_in_census() {
+    struct PanicOnStop;
+    impl codex_extension_api::ThreadLifecycleContributor<Config> for PanicOnStop {
+        fn on_thread_stop<'a>(
+            &'a self,
+            _input: codex_extension_api::ThreadStopInput<'a>,
+        ) -> codex_extension_api::ExtensionFuture<'a, ()> {
+            Box::pin(async { panic!("cleanup failure fixture") })
+        }
+    }
+    let (_home, mut manager, config) = manager().await;
+    let mut extensions = codex_extension_api::ExtensionRegistryBuilder::new();
+    extensions.thread_lifecycle_contributor(Arc::new(PanicOnStop));
+    Arc::get_mut(&mut manager.state).unwrap().extensions = Arc::new(extensions.build());
+    let started = manager
+        .start_thread(StartThreadOptions::new(config, None))
+        .await
+        .unwrap();
+    let io = started.thread.io.retirement_io();
+    let thread_id = started.thread_id;
+    let weak = Arc::downgrade(&started.thread);
+    // Removed before cleanup: the passive watcher is armed.
+    drop(manager.remove_thread(&thread_id).await);
+    drop(started);
+    assert!(io.shutdown_and_wait().await.is_err());
+    assert_eq!(
+        io.session_loop_termination.clone().await,
+        SessionLoopOutcome::Panicked
+    );
+    // Let the watcher observe the join; it must not release failed cleanup.
+    for _ in 0..16 {
+        tokio::task::yield_now().await;
+    }
+    assert!(weak.upgrade().is_some());
+    assert_eq!(manager.constructions.published().len(), 1);
+    assert_eq!(manager.constructions.state.lock().unwrap().compacted, 0);
+
+    // Reset still observes the exact retained runtime.
+    let report = manager
+        .shutdown_all_threads_bounded(Duration::from_secs(5))
+        .await;
+    assert_eq!(
+        report,
+        crate::ThreadShutdownReport {
+            completed: Vec::new(),
+            submit_failed: vec![thread_id],
+            timed_out: Vec::new(),
+        }
+    );
+    // The final drain counts it and refuses a complete report.
+    let report = manager
+        .begin_shutdown(Instant::now() + Duration::from_secs(5))
+        .unwrap()
+        .wait()
+        .await
+        .unwrap();
+    assert!(!report.is_complete());
+    assert!(weak.upgrade().is_some());
+    assert_eq!(manager.constructions.published().len(), 1);
+    assert_eq!(manager.constructions.state.lock().unwrap().compacted, 0);
+}
+
+#[tokio::test]
+async fn same_id_replacement_not_compacted_by_old_removal() {
+    let (_home, manager, config) = manager().await;
+    let id = codex_protocol::ThreadId::new();
+    let manager = manager.with_thread_id_generator(move || id);
+    let old = manager
+        .start_thread(StartThreadOptions::new(config.clone(), None))
+        .await
+        .unwrap();
+    let old_io = old.thread.io.retirement_io();
+    let old_weak = Arc::downgrade(&old.thread);
+    // The old runtime leaves lookup before its cleanup is proven.
+    drop(manager.remove_thread(&id).await);
+    let replacement = manager
+        .start_thread(StartThreadOptions::new(config, None))
+        .await
+        .unwrap();
+    assert_eq!(old.thread_id, replacement.thread_id);
+    // A stale exact removal is refused by identity; its compaction must not
+    // touch the live replacement.
+    assert!(
+        manager
+            .remove_thread_if_same(&id, &old.thread)
+            .await
+            .is_none()
+    );
+    drop(old);
+    assert_eq!(
+        manager.constructions.state.lock().unwrap().published.len(),
+        2
+    );
+
+    old_io.shutdown_and_wait().await.unwrap();
+    wait_until_released(&manager, &old_weak).await;
+    assert!(old_weak.upgrade().is_none());
+    {
+        let state = manager.constructions.state.lock().unwrap();
+        assert_eq!(state.compacted, 1);
+        assert_eq!(state.published.len(), 1);
+        assert!(Arc::ptr_eq(&state.published[0], &replacement.thread));
+    }
+    assert!(Arc::ptr_eq(
+        &manager.get_thread(id).await.unwrap(),
+        &replacement.thread
+    ));
+    assert!(replacement.thread.observed_terminal_cleanup().is_none());
+    replacement.thread.shutdown_and_wait().await.unwrap();
+}
+
+#[tokio::test]
+async fn compaction_never_runs_under_the_lookup_write_guard() {
+    let (_home, manager, config) = manager().await;
+    let observations = Arc::new(Mutex::new(Vec::<bool>::new()));
+    {
+        let threads = Arc::clone(&manager.state.threads);
+        let observations = Arc::clone(&observations);
+        manager.constructions.state.lock().unwrap().compaction_probe = Some(Arc::new(move || {
+            observations
+                .lock()
+                .unwrap()
+                .push(threads.try_write().is_ok());
+        }));
+    }
+    let mut ios = Vec::new();
+    let mut started = Vec::new();
+    for _ in 0..5 {
+        let thread = manager
+            .start_thread(StartThreadOptions::new(config.clone(), None))
+            .await
+            .unwrap();
+        ios.push(thread.thread.io.retirement_io());
+        started.push(thread);
+    }
+    observations.lock().unwrap().clear();
+    assert!(manager.remove_thread(&started[0].thread_id).await.is_some());
+    assert!(
+        manager
+            .remove_thread_for_client(&started[1].thread_id)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        manager
+            .remove_thread_if_matches(&started[2].thread_id, &started[2].thread)
+            .await
+            .is_some()
+    );
+    assert!(
+        manager
+            .remove_thread_if_same(&started[3].thread_id, &started[3].thread)
+            .await
+            .is_some()
+    );
+    assert!(
+        manager
+            .state
+            .remove_thread(&started[4].thread_id)
+            .await
+            .is_some()
+    );
+    drop(started);
+    // Watcher-driven compaction also runs outside the lookup guard.
+    for io in &ios {
+        io.shutdown_and_wait().await.unwrap();
+    }
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !manager
+            .constructions
+            .state
+            .lock()
+            .unwrap()
+            .published
+            .is_empty()
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("all removed runtimes released");
+    manager.constructions.state.lock().unwrap().compaction_probe = None;
+    let observations = observations.lock().unwrap();
+    assert!(observations.len() >= 10, "{observations:?}");
+    assert!(observations.iter().all(|free| *free), "{observations:?}");
+}

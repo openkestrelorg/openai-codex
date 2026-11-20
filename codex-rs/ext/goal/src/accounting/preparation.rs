@@ -112,6 +112,11 @@ impl GoalAccountingState {
             prepared.token_usage.clone(),
             !matches!(prepared.mode, ModeKind::Plan),
         );
+        // Preserve0.169's interrupted-turn handoff, but only on commitment.
+        if let Some(interrupted) = inner.interrupted_turn_id.take() {
+            inner.turns.remove(&interrupted);
+            inner.consecutive_empty_turns = 0;
+        }
         inner.current_turn_id = Some(turn_id.to_owned());
         if matches!(prepared.mode, ModeKind::Plan) {
             inner.wall_clock.active_goal_id = None;

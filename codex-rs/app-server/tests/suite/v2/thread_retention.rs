@@ -1,3 +1,5 @@
+//! Public exact-grant retention and experimental-handshake regressions.
+//! Adapted from 360b7705; private home lives through shutdown, plugin warmup is disabled.
 use anyhow::Result;
 use app_test_support::DEFAULT_CLIENT_NAME;
 use codex_app_server::in_process;
@@ -29,21 +31,26 @@ use uuid::Uuid;
 
 async fn start_in_process_client(
     experimental_api: bool,
-) -> Result<in_process::InProcessClientHandle> {
+) -> Result<(in_process::InProcessClientHandle, TempDir)> {
     let codex_home = TempDir::new()?;
     let loader_overrides = LoaderOverrides::without_managed_config_for_tests();
+    let cli_overrides = vec![("features.plugins".to_string(), toml::Value::Boolean(false))];
     let config = Arc::new(
         ConfigBuilder::default()
             .codex_home(codex_home.path().to_path_buf())
             .fallback_cwd(Some(codex_home.path().to_path_buf()))
             .loader_overrides(loader_overrides.clone())
+            .cli_overrides(cli_overrides.clone())
             .build()
             .await?,
     );
+    let environment_manager = Arc::new(EnvironmentManager::without_environments(
+        config.http_client_factory(),
+    ));
     let client = in_process::start(InProcessStartArgs {
         arg0_paths: Arg0DispatchPaths::default(),
         config,
-        cli_overrides: Vec::new(),
+        cli_overrides,
         loader_overrides,
         strict_config: false,
         cloud_config_bundle: CloudConfigBundleLoader::default(),
@@ -52,7 +59,7 @@ async fn start_in_process_client(
         feedback: CodexFeedback::new(),
         log_db: None,
         state_db: None,
-        environment_manager: Arc::new(EnvironmentManager::default_for_tests()),
+        environment_manager,
         config_warnings: Vec::new(),
         session_source: SessionSource::Cli.into(),
         enable_codex_api_key_env: false,
@@ -70,7 +77,7 @@ async fn start_in_process_client(
         channel_capacity: in_process::DEFAULT_IN_PROCESS_CHANNEL_CAPACITY,
     })
     .await?;
-    Ok(client)
+    Ok((client, codex_home))
 }
 
 async fn drain_pending_events(client: &mut in_process::InProcessClientHandle) -> Result<()> {
@@ -95,7 +102,7 @@ async fn assert_no_retention_event(client: &mut in_process::InProcessClientHandl
 
 #[tokio::test]
 async fn retention_carrier_is_exact_and_uses_opaque_idempotent_handles() -> Result<()> {
-    let mut client = start_in_process_client(true).await?;
+    let (mut client, _home) = start_in_process_client(true).await?;
 
     let started = client
         .request(ClientRequest::ThreadStart {
@@ -213,7 +220,7 @@ async fn retention_carrier_is_exact_and_uses_opaque_idempotent_handles() -> Resu
 
 #[tokio::test]
 async fn retention_requires_experimental_opt_in() -> Result<()> {
-    let client = start_in_process_client(false).await?;
+    let (client, _home) = start_in_process_client(false).await?;
     let error = client
         .request(ClientRequest::ThreadRetentionAcquire {
             request_id: RequestId::Integer(1),
@@ -225,6 +232,89 @@ async fn retention_requires_experimental_opt_in() -> Result<()> {
         .expect_err("experimental request must be rejected before handler dispatch");
     assert_eq!(error.code, -32600);
     assert!(error.message.contains("experimental"));
+    client.shutdown().await?;
+    Ok(())
+}
+
+/// Exercise the real idle-unload path with the connection kept live. Two
+/// unretained zero-delay controls establish that the scheduler actually ran;
+/// a subscriber alone must not be mistaken for an explicit retention grant.
+#[tokio::test]
+async fn idle_retention_survives_live_connection_until_exact_release() -> Result<()> {
+    let (client, _home) = start_in_process_client(true).await?;
+    async fn start(
+        client: &in_process::InProcessClientHandle,
+        retain: bool,
+    ) -> Result<ThreadStartResponse> {
+        let value = client
+            .request(ClientRequest::ThreadStart {
+                request_id: RequestId::String(Uuid::new_v4().to_string()),
+                params: ThreadStartParams {
+                    ephemeral: Some(true),
+                    retain_for_connection: retain,
+                    config: Some(
+                        [("thread_unload_delay_secs".into(), serde_json::json!(0))].into(),
+                    ),
+                    ..ThreadStartParams::default()
+                },
+            })
+            .await?
+            .map_err(|e| anyhow::anyhow!("start failed: {e:?}"))?;
+        Ok(serde_json::from_value(value)?)
+    }
+    async fn wait_unloaded(
+        client: &in_process::InProcessClientHandle,
+        target: &str,
+        held: Option<&str>,
+    ) -> Result<()> {
+        timeout(Duration::from_secs(10), async {
+            loop {
+                let value = client
+                    .request(ClientRequest::ThreadLoadedList {
+                        request_id: RequestId::String(Uuid::new_v4().to_string()),
+                        params: codex_app_server_protocol::ThreadLoadedListParams::default(),
+                    })
+                    .await?
+                    .map_err(|e| anyhow::anyhow!("loaded list failed: {e:?}"))?;
+                let loaded: codex_app_server_protocol::ThreadLoadedListResponse =
+                    serde_json::from_value(value)?;
+                if let Some(held) = held {
+                    assert!(
+                        loaded.data.iter().any(|id| id == held),
+                        "explicitly retained idle thread must remain loaded"
+                    );
+                }
+                if !loaded.data.iter().any(|id| id == target) {
+                    return Ok::<_, anyhow::Error>(());
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await??;
+        Ok(())
+    }
+    let retained = start(&client, true).await?;
+    let Some(ThreadRetentionAcquireResponse::Acquired { grant_id }) = retained.retention else {
+        anyhow::bail!("start must mint the requested grant atomically");
+    };
+    for _ in 0..2 {
+        let control = start(&client, false).await?;
+        assert!(control.retention.is_none());
+        wait_unloaded(&client, &control.thread.id, Some(&retained.thread.id)).await?;
+    }
+    let value = client
+        .request(ClientRequest::ThreadRetentionRelease {
+            request_id: RequestId::String(Uuid::new_v4().to_string()),
+            params: ThreadRetentionReleaseParams {
+                thread_id: retained.thread.id.clone(),
+                grant_id,
+            },
+        })
+        .await?
+        .map_err(|e| anyhow::anyhow!("release failed: {e:?}"))?;
+    let released: ThreadRetentionReleaseResponse = serde_json::from_value(value)?;
+    assert_eq!(released, ThreadRetentionReleaseResponse::Released {});
+    wait_unloaded(&client, &retained.thread.id, None).await?;
     client.shutdown().await?;
     Ok(())
 }

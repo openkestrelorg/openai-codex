@@ -4,7 +4,7 @@
 import type { Account } from "./Account";
 import type { AuthObservation } from "./AuthObservation";
 
-export type GetAccountResponse = {account: Account | null, requiresOpenaiAuth: boolean, /**
- * Present only for the explicit cache-only read.
+export type GetAccountResponse = {authObservation?: AuthObservation | null, account: Account | null, /**
+ * ChatGPT user ID belonging to this account response, when available.
  */
-authObservation?: AuthObservation | null};
+userId: string | null, requiresOpenaiAuth: boolean};

@@ -1,3 +1,44 @@
+use codex_app_server_protocol::JSONRPCErrorError;
+use codex_thread_store::ThreadStoreError;
+use pretty_assertions::assert_eq;
+
+#[test]
+fn storage_failure_classification_does_not_change_mutation_error_policy() {
+    for error in [
+        ThreadStoreError::Internal {
+            message: "retryable conflict; outcome unknown".to_owned(),
+        },
+        ThreadStoreError::Retryable {
+            message: "store temporarily unavailable".to_owned(),
+        },
+        ThreadStoreError::OutcomeUnknown {
+            message: "connection lost after write".to_owned(),
+        },
+    ] {
+        let mapped = super::thread_store_mutation_error("archive", error.clone());
+        let expected = JSONRPCErrorError {
+            code: -32603,
+            message: format!("failed to archive session: {error}"),
+            data: None,
+        };
+        assert_eq!(mapped, expected);
+    }
+
+    assert_eq!(
+        super::thread_store_mutation_error(
+            "archive",
+            ThreadStoreError::Conflict {
+                message: "writer already active".to_owned(),
+            },
+        ),
+        JSONRPCErrorError {
+            code: -32600,
+            message: "writer already active".to_owned(),
+            data: None,
+        },
+    );
+}
+
 mod thread_list_cwd_filter_tests {
     use super::super::normalize_thread_list_cwd_filters;
     use codex_app_server_protocol::ThreadListCwdFilter;
@@ -112,6 +153,7 @@ mod thread_processor_behavior_tests {
     use chrono::Utc;
     use codex_app_server_protocol::ServerRequestPayload;
     use codex_app_server_protocol::ThreadItem;
+    use codex_app_server_protocol::ThreadItemPayload;
     use codex_app_server_protocol::ToolRequestUserInputParams;
     use codex_config::CloudConfigBundleLoader;
     use codex_config::LoaderOverrides;
@@ -291,14 +333,15 @@ mod thread_processor_behavior_tests {
         ))];
         let active_turn = Turn {
             id: "live-turn".to_string(),
-            items: vec![ThreadItem::UserMessage {
+            root_turn_id: None,
+            items: vec![ThreadItem::untimed(ThreadItemPayload::UserMessage {
                 id: "live-user-message".to_string(),
                 client_id: None,
                 content: vec![V2UserInput::Text {
                     text: "live".to_string(),
                     text_elements: Vec::new(),
                 }],
-            }],
+            })],
             items_view: TurnItemsView::Full,
             error: None,
             status: TurnStatus::InProgress,
@@ -459,11 +502,14 @@ mod thread_processor_behavior_tests {
         let thread_id =
             ThreadId::from_string("00000000-0000-0000-0000-000000000123").expect("valid thread");
         let stored_thread = StoredThread {
+            creator_user_id: None,
+            creator_account_id: None,
             originator: None,
             thread_id,
             extra_config: None,
             rollout_path: Some(PathBuf::from("/tmp/thread.jsonl")),
             forked_from_id: None,
+            attached_to_thread_id: None,
             parent_thread_id: None,
             preview: "preview".to_string(),
             name: None,
@@ -612,6 +658,10 @@ mod thread_processor_behavior_tests {
             requires_openai_auth: false,
             supports_websockets: true,
             supports_standalone_web_search: false,
+            capabilities: None,
+            project_id: None,
+            location: None,
+            credential_file: None,
             include_internal_metadata: false,
         };
         let config_manager = ConfigManager::new(
@@ -680,8 +730,10 @@ mod thread_processor_behavior_tests {
             personality: None,
             exclude_turns: false,
             initial_turns_page: None,
+            retain_for_connection: false,
         };
         let config_snapshot = ThreadConfigSnapshot {
+            turn_extension_init: Default::default(),
             disabled_plugin_ids: Vec::new(),
             model: "gpt-5".to_string(),
             model_provider_id: "openai".to_string(),
@@ -715,7 +767,11 @@ mod thread_processor_behavior_tests {
         };
 
         assert_eq!(
-            collect_resume_override_mismatches(&request, &config_snapshot),
+            collect_resume_override_mismatches(
+                &request,
+                &config_snapshot,
+                /* selected_service_tier */ Some("flex"),
+            ),
             vec!["service_tier requested=Some(\"priority\") active=Some(\"flex\")".to_string()]
         );
     }
@@ -725,13 +781,13 @@ mod thread_processor_behavior_tests {
         reasoning_effort: Option<ReasoningEffort>,
     ) -> Result<ThreadMetadata> {
         let thread_id = ThreadId::from_string("3f941c35-29b3-493b-b0a4-e25800d9aeb0")?;
-        let mut builder = ThreadMetadataBuilder::new(
+        let builder = ThreadMetadataBuilder::new(
             thread_id,
             PathBuf::from("/tmp/rollout.jsonl"),
             Utc::now(),
             codex_protocol::protocol::SessionSource::default(),
-        );
-        builder.model_provider = Some("mock_provider".to_string());
+        )
+        .with_model_provider(Some("mock_provider".to_string()));
         let mut metadata = builder.build("mock_provider");
         metadata.model = model.map(ToString::to_string);
         metadata.reasoning_effort = reasoning_effort;
@@ -806,7 +862,10 @@ mod thread_processor_behavior_tests {
         );
 
         assert_eq!(typesafe_overrides.model, Some("gpt-5.2-codex".to_string()));
-        assert_eq!(typesafe_overrides.model_provider, None);
+        assert_eq!(
+            typesafe_overrides.model_provider,
+            Some("mock_provider".to_string())
+        );
         assert_eq!(
             request_overrides,
             Some(HashMap::from([(
@@ -818,8 +877,7 @@ mod thread_processor_behavior_tests {
     }
 
     #[test]
-    fn merge_persisted_resume_metadata_skips_persisted_values_when_model_overridden() -> Result<()>
-    {
+    fn merge_persisted_resume_metadata_preserves_provider_when_model_overridden() -> Result<()> {
         let mut request_overrides = Some(HashMap::from([(
             "model".to_string(),
             serde_json::Value::String("gpt-5.2-codex".to_string()),
@@ -835,7 +893,10 @@ mod thread_processor_behavior_tests {
         );
 
         assert_eq!(typesafe_overrides.model, None);
-        assert_eq!(typesafe_overrides.model_provider, None);
+        assert_eq!(
+            typesafe_overrides.model_provider,
+            Some("mock_provider".to_string())
+        );
         assert_eq!(
             request_overrides,
             Some(HashMap::from([(
@@ -870,7 +931,7 @@ mod thread_processor_behavior_tests {
     }
 
     #[test]
-    fn merge_persisted_resume_metadata_skips_persisted_values_when_reasoning_effort_overridden()
+    fn merge_persisted_resume_metadata_preserves_provider_when_reasoning_effort_overridden()
     -> Result<()> {
         let mut request_overrides = Some(HashMap::from([(
             "model_reasoning_effort".to_string(),
@@ -887,7 +948,10 @@ mod thread_processor_behavior_tests {
         );
 
         assert_eq!(typesafe_overrides.model, None);
-        assert_eq!(typesafe_overrides.model_provider, None);
+        assert_eq!(
+            typesafe_overrides.model_provider,
+            Some("mock_provider".to_string())
+        );
         assert_eq!(
             request_overrides,
             Some(HashMap::from([(
@@ -945,10 +1009,10 @@ mod thread_processor_behavior_tests {
         let line = RolloutLine {
             timestamp: timestamp.clone(),
             ordinal: None,
-            item: RolloutItem::SessionMeta(SessionMetaLine {
+            item: RolloutItem::SessionMeta(Box::new(SessionMetaLine {
                 meta: session_meta.clone(),
                 git: None,
-            }),
+            })),
         };
 
         fs::write(&path, format!("{}\n", serde_json::to_string(&line)?))?;
@@ -1013,10 +1077,10 @@ mod thread_processor_behavior_tests {
         let line = RolloutLine {
             timestamp,
             ordinal: None,
-            item: RolloutItem::SessionMeta(SessionMetaLine {
+            item: RolloutItem::SessionMeta(Box::new(SessionMetaLine {
                 meta: session_meta,
                 git: None,
-            }),
+            })),
         };
         fs::write(&path, format!("{}\n", serde_json::to_string(&line)?))?;
 
@@ -1056,10 +1120,10 @@ mod thread_processor_behavior_tests {
         let line = RolloutLine {
             timestamp,
             ordinal: None,
-            item: RolloutItem::SessionMeta(SessionMetaLine {
+            item: RolloutItem::SessionMeta(Box::new(SessionMetaLine {
                 meta: session_meta,
                 git: None,
-            }),
+            })),
         };
         fs::write(&path, format!("{}\n", serde_json::to_string(&line)?))?;
 
@@ -1184,12 +1248,13 @@ mod thread_processor_behavior_tests {
         manager
             .connection_initialized(connection, ConnectionCapabilities::default())
             .await;
-        manager
-            .try_ensure_connection_subscribed(
-                thread_id, connection, /*experimental_raw_events*/ false,
-            )
-            .await
-            .expect("connection should be live");
+        assert!(
+            manager
+                .try_add_connection_to_thread(thread_id, connection)
+                .await
+                .is_ok(),
+            "connection should be live"
+        );
         {
             let state = manager.thread_state(thread_id).await;
             let mut state = state.lock().await;
@@ -1197,6 +1262,7 @@ mod thread_processor_behavior_tests {
             state.track_current_turn_event(
                 "turn-1",
                 &EventMsg::TurnStarted(codex_protocol::protocol::TurnStartedEvent {
+                    turn_attribution: None,
                     turn_id: "turn-1".to_string(),
                     root_turn_id: None,
                     trace_id: None,
@@ -1234,22 +1300,20 @@ mod thread_processor_behavior_tests {
         manager
             .connection_initialized(connection_b, ConnectionCapabilities::default())
             .await;
-        manager
-            .try_ensure_connection_subscribed(
-                thread_id,
-                connection_a,
-                /*experimental_raw_events*/ false,
-            )
-            .await
-            .expect("connection_a should be live");
-        manager
-            .try_ensure_connection_subscribed(
-                thread_id,
-                connection_b,
-                /*experimental_raw_events*/ false,
-            )
-            .await
-            .expect("connection_b should be live");
+        assert!(
+            manager
+                .try_add_connection_to_thread(thread_id, connection_a)
+                .await
+                .is_ok(),
+            "connection_a should be live"
+        );
+        assert!(
+            manager
+                .try_add_connection_to_thread(thread_id, connection_b)
+                .await
+                .is_ok(),
+            "connection_b should be live"
+        );
         {
             let state = manager.thread_state(thread_id).await;
             state.lock().await.cancel_tx = Some(cancel_tx);
@@ -1283,14 +1347,13 @@ mod thread_processor_behavior_tests {
         manager
             .connection_initialized(connection_b, ConnectionCapabilities::default())
             .await;
-        manager
-            .try_ensure_connection_subscribed(
-                thread_id,
-                connection_a,
-                /*experimental_raw_events*/ false,
-            )
-            .await
-            .expect("connection_a should be live");
+        assert!(
+            manager
+                .try_add_connection_to_thread(thread_id, connection_a)
+                .await
+                .is_ok(),
+            "connection_a should be live"
+        );
         let mut has_connections = manager
             .subscribe_to_has_connections(thread_id)
             .await
@@ -1337,13 +1400,14 @@ mod thread_processor_behavior_tests {
             manager
                 .try_add_connection_to_thread(thread_id, connection)
                 .await
+                .is_ok()
         };
         let ((), attached) = tokio::time::timeout(Duration::from_secs(1), async {
             tokio::join!(wait_for_subscriber, attach_connection)
         })
         .await?;
 
-        assert!(attached.is_ok());
+        assert!(attached);
         Ok(())
     }
 
@@ -1360,12 +1424,10 @@ mod thread_processor_behavior_tests {
         assert_eq!(threads_to_unload, Vec::<ThreadId>::new());
 
         assert!(
-            manager
-                .try_ensure_connection_subscribed(
-                    thread_id, connection, /*experimental_raw_events*/ false
-                )
+            !manager
+                .try_add_connection_to_thread(thread_id, connection)
                 .await
-                .is_none()
+                .is_ok()
         );
         assert!(!manager.has_subscribers(thread_id).await);
         Ok(())
@@ -1387,8 +1449,7 @@ mod thread_processor_behavior_tests {
                 unrelated_supported_connection,
                 ConnectionCapabilities {
                     request_attestation: true,
-                    trusted_interactive: false,
-                    retention_principal: None,
+                    ..ConnectionCapabilities::default()
                 },
             )
             .await;
@@ -1397,8 +1458,7 @@ mod thread_processor_behavior_tests {
                 earlier_supported_connection,
                 ConnectionCapabilities {
                     request_attestation: true,
-                    trusted_interactive: false,
-                    retention_principal: None,
+                    ..ConnectionCapabilities::default()
                 },
             )
             .await;
@@ -1407,8 +1467,7 @@ mod thread_processor_behavior_tests {
                 later_supported_connection,
                 ConnectionCapabilities {
                     request_attestation: true,
-                    trusted_interactive: false,
-                    retention_principal: None,
+                    ..ConnectionCapabilities::default()
                 },
             )
             .await;

@@ -15,14 +15,15 @@ use std::sync::PoisonError;
 use std::time::Duration;
 use std::time::Instant;
 
+use crate::AuthProviderResolver;
 use bytes::Bytes;
-use codex_api::SharedAuthProvider;
 use codex_exec_server::ExecServerError;
 use codex_exec_server::HttpClient;
 use codex_exec_server::HttpHeader;
 use codex_exec_server::HttpRedirectPolicy;
 use codex_exec_server::HttpRequestParams;
 use codex_exec_server::HttpResponseBodyStream;
+use codex_protocol::protocol::W3cTraceContext;
 use futures::StreamExt;
 use futures::stream;
 use futures::stream::BoxStream;
@@ -54,7 +55,6 @@ use rmcp::transport::streamable_http_client::StreamableHttpPostResponse;
 use sse_stream::Sse;
 use sse_stream::SseStream;
 use tokio::sync::oneshot;
-use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
 use crate::bounded_stdio_transport::MAX_MCP_STDIO_LINE_BYTES;
@@ -80,12 +80,13 @@ pub enum StreamableHttpRedirectMode {
 pub(crate) struct StreamableHttpClientAdapter {
     http_client: Arc<dyn HttpClient>,
     default_headers: HeaderMap,
-    auth_provider: Option<SharedAuthProvider>,
+    auth_provider: Option<Arc<dyn AuthProviderResolver>>,
     event_stream_cancellations: Arc<Mutex<HashMap<RequestId, oneshot::Sender<()>>>>,
     has_configured_headers: bool,
     redirect_mode: StreamableHttpRedirectMode,
     initialize_deadline: Arc<Mutex<Option<Instant>>>,
-    retirement: CancellationToken,
+    // The SDK sends handshakes on its worker without request metadata.
+    handshake_trace: Option<W3cTraceContext>,
 }
 
 struct EventStreamCancellation {
@@ -104,6 +105,8 @@ impl Drop for EventStreamCancellation {
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum StreamableHttpClientAdapterError {
+    #[error(transparent)]
+    Auth(#[from] codex_api::AuthError),
     #[error("streamable HTTP session expired with 404 Not Found")]
     SessionExpired404,
     #[error(transparent)]
@@ -112,19 +115,16 @@ pub(crate) enum StreamableHttpClientAdapterError {
     Header(String),
     #[error("MCP response body exceeds {maximum_bytes} bytes")]
     ResponseTooLarge { maximum_bytes: usize },
-    #[error("MCP initialization cancelled by retirement")]
-    Retired,
 }
 
 impl StreamableHttpClientAdapter {
     pub(crate) fn new(
         http_client: Arc<dyn HttpClient>,
         default_headers: HeaderMap,
-        auth_provider: Option<SharedAuthProvider>,
+        auth_provider: Option<Arc<dyn AuthProviderResolver>>,
         has_configured_headers: bool,
         redirect_mode: StreamableHttpRedirectMode,
         initialize_deadline: Arc<Mutex<Option<Instant>>>,
-        retirement: CancellationToken,
     ) -> Self {
         Self {
             http_client: Arc::new(SameOriginRedirectHttpClient::new(http_client)),
@@ -134,7 +134,7 @@ impl StreamableHttpClientAdapter {
             has_configured_headers,
             redirect_mode,
             initialize_deadline,
-            retirement,
+            handshake_trace: crate::trace_context::current_w3c_trace_context(),
         }
     }
 
@@ -154,11 +154,24 @@ impl StreamableHttpClient for StreamableHttpClientAdapter {
         auth_token: Option<String>,
         custom_headers: HashMap<HeaderName, HeaderValue>,
     ) -> std::result::Result<StreamableHttpPostResponse, StreamableHttpError<Self::Error>> {
+        if let JsonRpcMessage::Notification(notification) = &message
+            && let ClientNotification::CancelledNotification(cancelled) = &notification.notification
+            && let Some(request_id) = cancelled.params.request_id.as_ref()
+            && let Some(cancellation) = self
+                .event_stream_cancellations
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(request_id)
+        {
+            let _ = cancellation.send(());
+            return Ok(StreamableHttpPostResponse::Accepted);
+        }
+
         let (mcp_method, mcp_request_id) = client_jsonrpc_message_fields(&message);
         let has_session_id = session_id.is_some();
         let mut headers = self.default_headers.clone();
         headers.extend(custom_headers);
-        self.add_auth_headers(&mut headers);
+        self.add_auth_headers(&mut headers).await?;
         insert_header(
             &mut headers,
             ACCEPT,
@@ -204,11 +217,11 @@ impl StreamableHttpClient for StreamableHttpClientAdapter {
         } else {
             self.redirect_policy(&headers)
         };
-        let is_startup_request = matches!(
+        let timeout_ms = if matches!(
             mcp_method.as_deref(),
             Some("initialize" | "notifications/initialized")
-        ) || mcp_method.as_deref() == Some(DiscoverRequestMethod::VALUE);
-        let timeout_ms = if is_startup_request {
+        ) || mcp_method.as_deref() == Some(DiscoverRequestMethod::VALUE)
+        {
             self.initialize_deadline
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -226,21 +239,19 @@ impl StreamableHttpClient for StreamableHttpClientAdapter {
         };
 
         let body = serde_json::to_value(&message).map_err(StreamableHttpError::Deserialize)?;
-        let request_span = crate::trace_context::request_span(&body);
+        let handshake_trace = if is_discovery_request || mcp_method.as_deref() == Some("initialize")
+        {
+            self.handshake_trace.as_ref()
+        } else {
+            None
+        };
+        let request_span = crate::trace_context::request_span_and_trace_headers(
+            &body,
+            &mut headers,
+            handshake_trace,
+        );
         let body = serde_json::to_vec(&body).map_err(StreamableHttpError::Deserialize)?;
         let has_authorization_header = headers.contains_key(AUTHORIZATION);
-        if let JsonRpcMessage::Notification(notification) = &message
-            && let ClientNotification::CancelledNotification(cancelled) = &notification.notification
-            && let Some(request_id) = cancelled.params.request_id.as_ref()
-            && let Some(cancellation) = self
-                .event_stream_cancellations
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .remove(request_id)
-        {
-            let _ = cancellation.send(());
-            return Ok(StreamableHttpPostResponse::Accepted);
-        }
 
         let request = self
             .http_client
@@ -264,15 +275,7 @@ impl StreamableHttpClient for StreamableHttpClientAdapter {
                     )
                 })?
         } else {
-            tokio::select! {
-                biased;
-                _ = self.retirement.cancelled(), if is_startup_request => {
-                    return Err(StreamableHttpError::Client(
-                        StreamableHttpClientAdapterError::Retired,
-                    ));
-                }
-                response = request => response,
-            }
+            request.await
         };
         let (response, mut body_stream) = match response {
             Ok(response) => response,
@@ -289,8 +292,6 @@ impl StreamableHttpClient for StreamableHttpClientAdapter {
                 ));
             }
         };
-
-        let startup_retirement = is_startup_request.then_some(&self.retirement);
 
         if response.status == StatusCode::NOT_FOUND.as_u16() && session_id.is_some() {
             return Err(StreamableHttpError::Client(
@@ -331,8 +332,7 @@ impl StreamableHttpClient for StreamableHttpClientAdapter {
         let content_type = response_header(&response.headers, CONTENT_TYPE);
         let session_id = response_header(&response.headers, HEADER_SESSION_ID);
         if !status_is_success(response.status) {
-            let body =
-                collect_body(&mut body_stream, maximum_response_bytes, startup_retirement).await?;
+            let body = collect_body(&mut body_stream, maximum_response_bytes).await?;
             if !retryable_post_response_status(mcp_method.as_deref(), response.status)
                 && (content_type
                     .as_deref()
@@ -384,13 +384,6 @@ impl StreamableHttpClient for StreamableHttpClientAdapter {
         match content_type.as_deref() {
             Some(content_type) if content_type.starts_with(EVENT_STREAM_MIME_TYPE) => {
                 let mut event_stream = sse_stream_from_body(body_stream, maximum_response_bytes);
-                if is_startup_request {
-                    // RMCP consumes SSE initialization outside this adapter and
-                    // does not poll its worker close token during that wait.
-                    event_stream = event_stream
-                        .take_until(self.retirement.clone().cancelled_owned())
-                        .boxed();
-                }
                 if mcp_method.as_deref() == Some(DiscoverRequestMethod::VALUE) {
                     while let Some(event) = event_stream.next().await {
                         let event = event.map_err(StreamableHttpError::Sse)?;
@@ -453,9 +446,7 @@ impl StreamableHttpClient for StreamableHttpClientAdapter {
                 Ok(StreamableHttpPostResponse::Sse(event_stream, session_id))
             }
             Some(content_type) if content_type.starts_with(JSON_MIME_TYPE) => {
-                let body =
-                    collect_body(&mut body_stream, maximum_response_bytes, startup_retirement)
-                        .await?;
+                let body = collect_body(&mut body_stream, maximum_response_bytes).await?;
                 let response_message =
                     serde_json::from_slice(&body).map_err(StreamableHttpError::Deserialize)?;
                 Ok(StreamableHttpPostResponse::Json(
@@ -468,9 +459,7 @@ impl StreamableHttpClient for StreamableHttpClientAdapter {
                 ))
             }
             _ => {
-                let body =
-                    collect_body(&mut body_stream, maximum_response_bytes, startup_retirement)
-                        .await?;
+                let body = collect_body(&mut body_stream, maximum_response_bytes).await?;
                 let content_type = content_type.unwrap_or_else(|| "missing-content-type".into());
                 Err(StreamableHttpError::UnexpectedContentType(Some(format!(
                     "{content_type}; body: {}",
@@ -489,7 +478,7 @@ impl StreamableHttpClient for StreamableHttpClientAdapter {
     ) -> std::result::Result<(), StreamableHttpError<Self::Error>> {
         let mut headers = self.default_headers.clone();
         headers.extend(custom_headers);
-        self.add_auth_headers(&mut headers);
+        self.add_auth_headers(&mut headers).await?;
         if let Some(auth_token) = auth_token {
             insert_header(
                 &mut headers,
@@ -522,15 +511,7 @@ impl StreamableHttpClient for StreamableHttpClientAdapter {
             .map_err(StreamableHttpClientAdapterError::from)
             .map_err(StreamableHttpError::Client)?;
 
-        if response.status == StatusCode::METHOD_NOT_ALLOWED.as_u16() {
-            return Ok(());
-        }
-        if !status_is_success(response.status) {
-            return Err(StreamableHttpError::UnexpectedServerResponse(
-                format!("DELETE returned HTTP {}", response.status).into(),
-            ));
-        }
-        Ok(())
+        delete_session_result(response.status)
     }
 
     async fn get_stream(
@@ -546,7 +527,7 @@ impl StreamableHttpClient for StreamableHttpClientAdapter {
     > {
         let mut headers = self.default_headers.clone();
         headers.extend(custom_headers);
-        self.add_auth_headers(&mut headers);
+        self.add_auth_headers(&mut headers).await?;
         insert_header(
             &mut headers,
             ACCEPT,
@@ -631,10 +612,23 @@ impl StreamableHttpClient for StreamableHttpClientAdapter {
 }
 
 impl StreamableHttpClientAdapter {
-    fn add_auth_headers(&self, headers: &mut HeaderMap) {
-        if let Some(auth_provider) = &self.auth_provider {
-            headers.extend(auth_provider.to_auth_headers());
+    async fn add_auth_headers(
+        &self,
+        headers: &mut HeaderMap,
+    ) -> Result<(), StreamableHttpError<StreamableHttpClientAdapterError>> {
+        if let Some(resolver) = &self.auth_provider {
+            let provider = resolver
+                .resolve(headers)
+                .await
+                .map_err(StreamableHttpClientAdapterError::from)
+                .map_err(StreamableHttpError::Client)?;
+            *headers = provider
+                .apply_auth_headers(std::mem::take(headers))
+                .await
+                .map_err(StreamableHttpClientAdapterError::from)
+                .map_err(StreamableHttpError::Client)?;
         }
+        Ok(())
     }
 }
 
@@ -764,6 +758,25 @@ fn response_header(headers: &[HttpHeader], name: impl AsRef<str>) -> Option<Stri
         .map(|header| header.value.clone())
 }
 
+/// Distinguish local release from established-session absence.
+/// The worker accepts 404 only when it has the initialized session identity.
+fn delete_session_result(
+    status: u16,
+) -> std::result::Result<(), StreamableHttpError<StreamableHttpClientAdapterError>> {
+    if status == StatusCode::METHOD_NOT_ALLOWED.as_u16() {
+        return Err(StreamableHttpError::ServerDoesNotSupportDeleteSession);
+    }
+    if status == StatusCode::NOT_FOUND.as_u16() {
+        return Err(StreamableHttpError::SessionExpired);
+    }
+    if !status_is_success(status) {
+        return Err(StreamableHttpError::UnexpectedServerResponse(
+            format!("DELETE returned HTTP {status}").into(),
+        ));
+    }
+    Ok(())
+}
+
 fn status_is_success(status: u16) -> bool {
     StatusCode::from_u16(status).is_ok_and(|status| status.is_success())
 }
@@ -808,10 +821,15 @@ fn mcp_redirect_policy(
     headers: &HeaderMap,
     has_configured_headers: bool,
 ) -> HttpRedirectPolicy {
-    if headers
-        .get(HEADER_MCP_PROTOCOL_VERSION)
-        .and_then(|value| value.to_str().ok())
-        == Some(ProtocolVersion::V_2026_07_28.as_str())
+    if headers.contains_key("x-openai-agent-assertion")
+        || headers
+            .get(AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with("AgentAssertion "))
+        || headers
+            .get(HEADER_MCP_PROTOCOL_VERSION)
+            .and_then(|value| value.to_str().ok())
+            == Some(ProtocolVersion::V_2026_07_28.as_str())
         || (mode == StreamableHttpRedirectMode::AgentPluginV1
             && (has_configured_headers || headers.contains_key(AUTHORIZATION)))
     {
@@ -824,7 +842,7 @@ fn mcp_redirect_policy(
 // rmcp's automatic lifecycle does not yet recognize deployed legacy discovery
 // rejection shapes. Remove this compatibility shim once the SDK does:
 // https://github.com/modelcontextprotocol/rust-sdk/issues/1040
-fn legacy_discovery_fallback_response(
+pub(super) fn legacy_discovery_fallback_response(
     request: &ClientJsonRpcMessage,
     response: ServerJsonRpcMessage,
     allow_uncorrelated_http_rejection: bool,
@@ -914,11 +932,11 @@ fn legacy_discovery_fallback_response(
 }
 
 fn only_known_legacy_protocol_versions(versions: &[ProtocolVersion]) -> bool {
-    !versions.is_empty()
-        && versions.iter().all(|version| {
-            ProtocolVersion::KNOWN_VERSIONS.contains(version)
-                && version < &ProtocolVersion::V_2026_07_28
-        })
+    !versions.is_empty() && versions.iter().all(is_known_legacy_protocol_version)
+}
+
+pub(super) fn is_known_legacy_protocol_version(version: &ProtocolVersion) -> bool {
+    ProtocolVersion::KNOWN_VERSIONS.contains(version) && version < &ProtocolVersion::V_2026_07_28
 }
 
 fn explicitly_rejects_modern_protocol_version(message: &str) -> bool {
@@ -969,21 +987,13 @@ fn has_legacy_fallback_evidence(message: &str) -> bool {
 async fn collect_body(
     body_stream: &mut HttpResponseBodyStream,
     maximum_bytes: Option<usize>,
-    retirement: Option<&CancellationToken>,
 ) -> std::result::Result<Vec<u8>, StreamableHttpError<StreamableHttpClientAdapterError>> {
     let mut body = Vec::new();
-    while let Some(chunk) = tokio::select! {
-        biased;
-        _ = async {
-            match retirement {
-                Some(retirement) => retirement.cancelled().await,
-                None => std::future::pending().await,
-            }
-        } => return Err(StreamableHttpError::Client(StreamableHttpClientAdapterError::Retired)),
-        chunk = body_stream.recv() => chunk,
-    }
-    .map_err(StreamableHttpClientAdapterError::from)
-    .map_err(StreamableHttpError::Client)?
+    while let Some(chunk) = body_stream
+        .recv()
+        .await
+        .map_err(StreamableHttpClientAdapterError::from)
+        .map_err(StreamableHttpError::Client)?
     {
         if let Some(maximum_bytes) = maximum_bytes
             && chunk.len() > maximum_bytes.saturating_sub(body.len())

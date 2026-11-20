@@ -268,6 +268,7 @@ async fn derived_delivery_uses_the_resolved_loop_after_lookup_removal() {
             },
             /*parent_turn_id*/ None,
             /*root_turn_id*/ None,
+            /*message_delivery*/ None,
         )
         .await
         .unwrap();
@@ -326,5 +327,39 @@ async fn queue_only_operation_drops_invalid_work_without_stopping_the_loop() {
     .unwrap();
     assert_eq!(*events.lock().unwrap(), vec!["drop"]);
     assert!(!child.session.input_queue.reserve_mailbox().has_turn_work());
+    child.shutdown_and_wait().await.unwrap();
+}
+
+#[derive(Debug)]
+struct MissingRequiredWork;
+impl TurnStartAdmission for MissingRequiredWork {
+    fn admit_turn_start(&self) -> Option<Box<dyn Send>> {
+        panic!("no fresh fallback")
+    }
+    fn requires_account_work(&self) -> bool {
+        true
+    }
+}
+
+#[tokio::test]
+async fn required_parent_missing_derived_work_refuses_without_fresh_fallback() {
+    let harness = AgentControlHarness::new().await;
+    let (id, child) = harness.start_thread().await;
+    let (mut session, _) = crate::session::tests::make_session_and_context().await;
+    let mut extensions = codex_extension_api::ExtensionRegistryBuilder::<Config>::new();
+    extensions.turn_start_admission(Arc::new(MissingRequiredWork));
+    session.services.extensions = Arc::new(extensions.build());
+    session.services.host_admission = session.services.extensions.host_admission();
+    let parent = Arc::new(session);
+    let authority = crate::ParentTurnAuthority::capture(&parent, "live-parent");
+    assert!(authority.derive(&child).is_err());
+    assert!(
+        harness
+            .control
+            .send_input(id, Vec::new(), Default::default(), Some(&authority))
+            .await
+            .is_err()
+    );
+    assert!(!child.session.input_queue.has_pending_mailbox_items().await);
     child.shutdown_and_wait().await.unwrap();
 }

@@ -27,6 +27,7 @@ use tokio::task::JoinHandle;
 
 use crate::process::ChildTerminator;
 use crate::process::ProcessHandle;
+use crate::process::ProcessPin;
 use crate::process::ProcessSignal;
 use crate::process::SpawnedProcess;
 use crate::process::exit_code_from_status;
@@ -180,6 +181,8 @@ async fn spawn_process_with_stdin_mode(
         };
     #[cfg(not(target_os = "linux"))]
     let mut child = command.spawn()?;
+    let child_pid = child.id();
+    let launcher_pin = ProcessPin::for_child(child_pid);
     #[cfg(windows)]
     let windows_terminator = {
         // Accept the small race: a descendant created between spawn and
@@ -242,21 +245,6 @@ async fn spawn_process_with_stdin_mode(
             read_output_stream(BufReader::new(stderr), stderr_tx).await;
         })
     });
-    let mut reader_abort_handles = Vec::new();
-    if let Some(handle) = stdout_handle.as_ref() {
-        reader_abort_handles.push(handle.abort_handle());
-    }
-    if let Some(handle) = stderr_handle.as_ref() {
-        reader_abort_handles.push(handle.abort_handle());
-    }
-    let reader_handle = tokio::spawn(async move {
-        if let Some(handle) = stdout_handle {
-            let _ = handle.await;
-        }
-        if let Some(handle) = stderr_handle {
-            let _ = handle.await;
-        }
-    });
 
     let (exit_tx, exit_rx) = oneshot::channel::<i32>();
     let exit_status = Arc::new(AtomicBool::new(false));
@@ -298,15 +286,16 @@ async fn spawn_process_with_stdin_mode(
             #[cfg(unix)]
             process_group_id,
         }),
-        reader_handle,
-        reader_abort_handles,
+        stdout_handle,
+        stderr_handle,
         writer_handle,
         wait_handle,
         exit_status,
         exit_code,
         /*pty_handles*/ None,
         /*resizer*/ None,
-    );
+    )
+    .with_child(child_pid, launcher_pin);
 
     Ok(SpawnedProcess {
         session: handle,

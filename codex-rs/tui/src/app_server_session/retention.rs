@@ -55,6 +55,15 @@ impl RetentionClient {
         )
     }
 
+    pub(super) fn warn_adoption(&self, thread_id: &str, error: &color_eyre::Report) {
+        let _ = self.warnings.send(WarningNotification {
+            thread_id: None,
+            message: format!(
+                "Session {thread_id} could not be retained: {error}. It may close while idle."
+            ),
+        });
+    }
+
     pub(super) fn warn_clear(&self, thread_id: &str, error: &color_eyre::Report) {
         let _ = self.warnings.send(WarningNotification {
             thread_id: None,
@@ -62,10 +71,51 @@ impl RetentionClient {
         });
     }
 
+    /// Temporary helpers own only a freshly minted start grant. They never
+    /// reacquire missing evidence or release somebody else's existing grant.
+    pub(crate) async fn temporary_start_grant(
+        request_handle: AppServerRequestHandle,
+        thread_id: String,
+        evidence: Option<ThreadRetentionAcquireResponse>,
+    ) -> Option<PendingRetention> {
+        let Some(evidence @ ThreadRetentionAcquireResponse::Acquired { .. }) = evidence else {
+            tracing::debug!("temporary structured thread started without a new retention grant");
+            return None;
+        };
+        let (client, _warnings) = Self::new();
+        match client
+            .adopt_thread(request_handle, thread_id, Some(evidence))
+            .await
+        {
+            Ok(pending) => Some(pending),
+            Err(error) => {
+                tracing::debug!(%error, "temporary structured retention could not be adopted");
+                None
+            }
+        }
+    }
+
+    /// Separate acquisition without evidence; production uses `adopt_thread`.
+    #[cfg(test)]
     pub(super) async fn retain_thread(
         &self,
         request_handle: AppServerRequestHandle,
         thread_id: String,
+    ) -> Result<PendingRetention> {
+        self.adopt_thread(request_handle, thread_id, /*evidence*/ None)
+            .await
+    }
+
+    /// Adopts a thread using the server's `retainForConnection` evidence when
+    /// present. Without evidence (an older server, or a flag the server did not
+    /// honour) this falls back to a separate `thread/retention/acquire`.
+    /// Evidence is processed exactly like an acquisition response, so an
+    /// abandoned adoption releases a newly granted handle and never an existing one.
+    pub(super) async fn adopt_thread(
+        &self,
+        request_handle: AppServerRequestHandle,
+        thread_id: String,
+        evidence: Option<ThreadRetentionAcquireResponse>,
     ) -> Result<PendingRetention> {
         let state = {
             let mut threads = self.threads.lock().map_err(|_| color_eyre::eyre::eyre!("retention coordinator is unavailable; restart the client to re-adopt this session"))?;
@@ -90,20 +140,51 @@ impl RetentionClient {
             let mut state = match timeout(SETTLEMENT_TIMEOUT, state.lock_owned()).await {
                 Ok(state) if *state == ReleaseState::Settled => state,
                 _ => {
+                    // A server-minted grant this adoption cannot own is not kept.
+                    if let Some(ThreadRetentionAcquireResponse::Acquired { grant_id }) = evidence {
+                        let _ = timeout(
+                            SETTLEMENT_TIMEOUT,
+                            request_handle.request_typed::<ThreadRetentionReleaseResponse>(
+                                ClientRequest::ThreadRetentionRelease {
+                                    request_id: RequestId::String(format!(
+                                        "tui-release-{}",
+                                        Uuid::new_v4()
+                                    )),
+                                    params: ThreadRetentionReleaseParams {
+                                        thread_id: thread_id.clone(),
+                                        grant_id,
+                                    },
+                                },
+                            ),
+                        )
+                        .await;
+                    }
                     let _ = ready_tx.send(Err(color_eyre::eyre::eyre!("prior retention cleanup has not settled for {thread_id}; restart the client to re-adopt this session")));
                     return;
                 }
             };
-            let response = request_handle
-                .request_typed::<ThreadRetentionAcquireResponse>(
-                    ClientRequest::ThreadRetentionAcquire {
-                        request_id: RequestId::String(format!("tui-retain-{}", Uuid::new_v4())),
-                        params: ThreadRetentionAcquireParams {
-                            thread_id: thread_id.clone(),
-                        },
-                    },
-                )
-                .await;
+            let response = match evidence {
+                // Atomic resume evidence may predate a queued release from
+                // an abandoned preparation. Revalidate AlreadyHeld only after
+                // that cleanup settles under this same per-thread lock. A new
+                // Acquired handle is exact-grant fenced against older releases.
+                Some(ThreadRetentionAcquireResponse::AlreadyHeld { .. }) | None => {
+                    request_handle
+                        .request_typed::<ThreadRetentionAcquireResponse>(
+                            ClientRequest::ThreadRetentionAcquire {
+                                request_id: RequestId::String(format!(
+                                    "tui-retain-{}",
+                                    Uuid::new_v4()
+                                )),
+                                params: ThreadRetentionAcquireParams {
+                                    thread_id: thread_id.clone(),
+                                },
+                            },
+                        )
+                        .await
+                }
+                Some(evidence) => Ok(evidence),
+            };
             let (result, acquired_grant) = match response {
                 Ok(ThreadRetentionAcquireResponse::Acquired { grant_id }) => {
                     (Ok(false), Some(grant_id))

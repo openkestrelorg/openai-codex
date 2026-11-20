@@ -1,12 +1,20 @@
 use super::CHANNEL_CAPACITY;
 use super::ConnectionOrigin;
 use super::ConnectionProvenance;
+use super::RefusalCustody;
+use super::RefusalRecipient;
 use super::TransportEvent;
 use super::forward_incoming_message;
 use super::next_connection_id;
 use super::serialize_outgoing_message;
 use crate::outgoing_message::ConnectionId;
 use crate::outgoing_message::QueuedOutgoingMessage;
+use crate::websocket_compression::WEBSOCKET_COMPRESSION_HEADER;
+use crate::websocket_compression::WebSocketCompression;
+use crate::websocket_compression::ZSTD_STREAM_PROTOCOL;
+use crate::websocket_compression::ZstdDecoder;
+use crate::websocket_compression::ZstdEncoder;
+use crate::websocket_compression::zstd_codec_pair;
 use axum::Router;
 use axum::body::Body;
 use axum::body::Bytes;
@@ -15,6 +23,7 @@ use axum::extract::State;
 use axum::extract::ws::Message as AxumWebSocketMessage;
 use axum::extract::ws::WebSocketUpgrade;
 use axum::http::HeaderMap;
+use axum::http::HeaderValue;
 use axum::http::Request;
 use axum::http::StatusCode;
 use axum::http::header::ORIGIN;
@@ -48,6 +57,8 @@ use tracing::warn;
 /// writer task is healthy, so give them more headroom than internal channels.
 const WEBSOCKET_OUTBOUND_CHANNEL_CAPACITY: usize = 32 * 1024;
 const _: () = assert!(WEBSOCKET_OUTBOUND_CHANNEL_CAPACITY > CHANNEL_CAPACITY);
+// Match the existing Axum and Tungstenite default WebSocket message limit.
+pub(super) const MAX_DECOMPRESSED_MESSAGE_SIZE: usize = 64 << 20;
 
 fn colorize(text: &str, style: Style) -> String {
     text.if_supports_color(Stream::Stderr, |value| value.style(style))
@@ -81,6 +92,8 @@ fn print_websocket_startup_banner(addr: SocketAddr) {
 struct WebSocketListenerState {
     transport_event_tx: mpsc::Sender<TransportEvent>,
     auth_policy: Arc<WebsocketAuthPolicy>,
+    compression: WebSocketCompression,
+    owner_expiry: crate::OwnerExpiry,
 }
 
 async fn health_check_handler() -> StatusCode {
@@ -118,18 +131,36 @@ async fn websocket_upgrade_handler(
         return (err.status_code(), err.message()).into_response();
     }
     info!(%peer_addr, "websocket client connected");
-    websocket
+    let compression = if state.compression == WebSocketCompression::Zstd
+        && headers
+            .get(WEBSOCKET_COMPRESSION_HEADER)
+            .is_some_and(|value| value == ZSTD_STREAM_PROTOCOL)
+    {
+        WebSocketCompression::Zstd
+    } else {
+        WebSocketCompression::Plain
+    };
+    let mut response = websocket
         .on_upgrade(move |stream| async move {
             let (websocket_writer, websocket_reader) = stream.split();
             run_websocket_connection(
                 websocket_writer,
                 websocket_reader,
                 state.transport_event_tx,
+                compression,
                 ConnectionProvenance::Unproven,
+                state.owner_expiry,
             )
             .await;
         })
-        .into_response()
+        .into_response();
+    if compression == WebSocketCompression::Zstd {
+        response.headers_mut().insert(
+            WEBSOCKET_COMPRESSION_HEADER,
+            HeaderValue::from_static(ZSTD_STREAM_PROTOCOL),
+        );
+    }
+    response
 }
 
 pub async fn start_websocket_acceptor(
@@ -137,6 +168,8 @@ pub async fn start_websocket_acceptor(
     transport_event_tx: mpsc::Sender<TransportEvent>,
     shutdown_token: CancellationToken,
     auth_policy: WebsocketAuthPolicy,
+    compression: WebSocketCompression,
+    owner_expiry: crate::OwnerExpiry,
 ) -> IoResult<JoinHandle<()>> {
     if is_unauthenticated_non_loopback_listener(bind_address, &auth_policy) {
         return Err(std::io::Error::new(
@@ -159,6 +192,8 @@ pub async fn start_websocket_acceptor(
         .with_state(WebSocketListenerState {
             transport_event_tx,
             auth_policy: Arc::new(auth_policy),
+            compression,
+            owner_expiry: owner_expiry.clone(),
         });
     let server = axum::serve(
         listener,
@@ -167,9 +202,17 @@ pub async fn start_websocket_acceptor(
     .with_graceful_shutdown(async move {
         shutdown_token.cancelled().await;
     });
+    // (b) axum's graceful drain can outlive the transport cancel; it stops at
+    // the host's owner expiry and hands the server future back, unpolled.
     Ok(tokio::spawn(async move {
-        if let Err(err) = server.await {
-            error!("websocket acceptor failed: {err}");
+        match owner_expiry
+            .run("websocket_acceptor", server.into_future())
+            .await
+        {
+            Ok(Some(Err(err))) => error!("websocket acceptor failed: {err}"),
+            Ok(Some(Ok(()))) => {}
+            Ok(None) => info!("websocket acceptor graceful drain stopped at owner expiry"),
+            Err(refused) => error!("websocket acceptor not driven: {refused}"),
         }
         info!("websocket acceptor shutting down");
     }))
@@ -179,13 +222,30 @@ pub(crate) async fn run_websocket_connection<M, SinkError, StreamError>(
     websocket_writer: impl futures::sink::Sink<M, Error = SinkError> + Send + 'static,
     websocket_reader: impl futures::stream::Stream<Item = Result<M, StreamError>> + Send + 'static,
     transport_event_tx: mpsc::Sender<TransportEvent>,
+    compression: WebSocketCompression,
     provenance: ConnectionProvenance,
+    owner_expiry: crate::OwnerExpiry,
 ) where
     M: AppServerWebSocketMessage + Send + 'static,
     SinkError: Send + 'static,
     StreamError: std::fmt::Display + Send + 'static,
 {
     let connection_id = next_connection_id();
+    let (encoder, decoder) = match compression {
+        WebSocketCompression::Plain => (None, None),
+        WebSocketCompression::Zstd => {
+            match zstd_codec_pair(
+                MAX_DECOMPRESSED_MESSAGE_SIZE,
+                crate::CompressionConnection::Listener(connection_id),
+            ) {
+                Ok((encoder, decoder)) => (Some(encoder), Some(decoder)),
+                Err(_) => {
+                    warn!("failed to initialize websocket compression");
+                    return;
+                }
+            }
+        }
+    };
     let (writer_tx, writer_rx) =
         mpsc::channel::<QueuedOutgoingMessage>(WEBSOCKET_OUTBOUND_CHANNEL_CAPACITY);
     let writer_tx_for_reader = writer_tx.clone();
@@ -194,8 +254,8 @@ pub(crate) async fn run_websocket_connection<M, SinkError, StreamError>(
         .send(TransportEvent::ConnectionOpened {
             connection_id,
             origin: ConnectionOrigin::WebSocket,
-            auth: None,
             provenance,
+            auth: None,
             writer: writer_tx,
             disconnect_sender: Some(disconnect_token.clone()),
         })
@@ -211,6 +271,7 @@ pub(crate) async fn run_websocket_connection<M, SinkError, StreamError>(
         writer_rx,
         writer_control_rx,
         disconnect_token.clone(),
+        encoder,
     ));
     let mut inbound_task = tokio::spawn(run_websocket_inbound_loop(
         websocket_reader,
@@ -219,6 +280,8 @@ pub(crate) async fn run_websocket_connection<M, SinkError, StreamError>(
         writer_control_tx,
         connection_id,
         disconnect_token.clone(),
+        decoder,
+        owner_expiry,
     ));
 
     tokio::select! {
@@ -239,7 +302,7 @@ pub(crate) async fn run_websocket_connection<M, SinkError, StreamError>(
 
 pub(crate) enum IncomingWebSocketMessage {
     Text(String),
-    Binary,
+    Binary(Bytes),
     Ping(Bytes),
     Pong,
     Close,
@@ -250,6 +313,7 @@ pub(crate) enum IncomingWebSocketMessage {
 /// sends directly.
 pub(crate) trait AppServerWebSocketMessage: Sized {
     fn text(text: String) -> Self;
+    fn binary(payload: Bytes) -> Self;
     fn pong(payload: Bytes) -> Self;
     fn into_incoming(self) -> Option<IncomingWebSocketMessage>;
 }
@@ -259,6 +323,10 @@ impl AppServerWebSocketMessage for AxumWebSocketMessage {
         Self::Text(text.into())
     }
 
+    fn binary(payload: Bytes) -> Self {
+        Self::Binary(payload)
+    }
+
     fn pong(payload: Bytes) -> Self {
         Self::Pong(payload)
     }
@@ -266,7 +334,7 @@ impl AppServerWebSocketMessage for AxumWebSocketMessage {
     fn into_incoming(self) -> Option<IncomingWebSocketMessage> {
         Some(match self {
             Self::Text(text) => IncomingWebSocketMessage::Text(text.to_string()),
-            Self::Binary(_) => IncomingWebSocketMessage::Binary,
+            Self::Binary(payload) => IncomingWebSocketMessage::Binary(payload),
             Self::Ping(payload) => IncomingWebSocketMessage::Ping(payload),
             Self::Pong(_) => IncomingWebSocketMessage::Pong,
             Self::Close(_) => IncomingWebSocketMessage::Close,
@@ -279,6 +347,10 @@ impl AppServerWebSocketMessage for TungsteniteWebSocketMessage {
         Self::Text(text.into())
     }
 
+    fn binary(payload: Bytes) -> Self {
+        Self::Binary(payload)
+    }
+
     fn pong(payload: Bytes) -> Self {
         Self::Pong(payload)
     }
@@ -286,7 +358,7 @@ impl AppServerWebSocketMessage for TungsteniteWebSocketMessage {
     fn into_incoming(self) -> Option<IncomingWebSocketMessage> {
         Some(match self {
             Self::Text(text) => IncomingWebSocketMessage::Text(text.to_string()),
-            Self::Binary(_) => IncomingWebSocketMessage::Binary,
+            Self::Binary(payload) => IncomingWebSocketMessage::Binary(payload),
             Self::Ping(payload) => IncomingWebSocketMessage::Ping(payload),
             Self::Pong(_) => IncomingWebSocketMessage::Pong,
             Self::Close(_) => IncomingWebSocketMessage::Close,
@@ -300,6 +372,7 @@ async fn run_websocket_outbound_loop<M, SinkError>(
     mut writer_rx: mpsc::Receiver<QueuedOutgoingMessage>,
     mut writer_control_rx: mpsc::Receiver<M>,
     disconnect_token: CancellationToken,
+    mut encoder: Option<ZstdEncoder>,
 ) where
     M: AppServerWebSocketMessage + Send + 'static,
     SinkError: Send + 'static,
@@ -325,7 +398,18 @@ async fn run_websocket_outbound_loop<M, SinkError>(
                 let Some(json) = serialize_outgoing_message(queued_message.message) else {
                     continue;
                 };
-                if websocket_writer.send(M::text(json)).await.is_err() {
+                let message = if let Some(encoder) = &mut encoder {
+                    match encoder.encode(&json) {
+                        Ok(payload) => M::binary(payload.into()),
+                        Err(err) => {
+                            warn!("websocket compression error: {err}");
+                            break;
+                        }
+                    }
+                } else {
+                    M::text(json)
+                };
+                if websocket_writer.send(message).await.is_err() {
                     break;
                 }
                 if let Some(write_complete_tx) = queued_message.write_complete_tx {
@@ -343,55 +427,88 @@ async fn run_websocket_inbound_loop<M, StreamError>(
     writer_control_tx: mpsc::Sender<M>,
     connection_id: ConnectionId,
     disconnect_token: CancellationToken,
+    mut decoder: Option<ZstdDecoder>,
+    owner_expiry: crate::OwnerExpiry,
 ) where
     M: AppServerWebSocketMessage + Send + 'static,
     StreamError: std::fmt::Display + Send + 'static,
 {
+    let refusal_custody = RefusalCustody {
+        owner: &owner_expiry,
+        recipient: RefusalRecipient::WebSocket,
+    };
     tokio::pin!(websocket_reader);
     loop {
-        tokio::select! {
-            _ = disconnect_token.cancelled() => {
+        let incoming_message = tokio::select! {
+            biased;
+            _ = disconnect_token.cancelled() => break,
+            () = owner_expiry.owner_released_wait() => break,
+            incoming_message = websocket_reader.next() => incoming_message,
+        };
+        let message = match incoming_message {
+            Some(Ok(message)) => message,
+            None => break,
+            Some(Err(err)) => {
+                warn!("websocket receive error: {err}");
                 break;
             }
-            incoming_message = websocket_reader.next() => {
-                match incoming_message {
-                    Some(Ok(message)) => match message.into_incoming() {
-                        Some(IncomingWebSocketMessage::Text(text))
-                            if !forward_incoming_message(
-                                &transport_event_tx,
-                                &writer_tx_for_reader,
-                                connection_id,
-                                &text,
-                            )
-                            .await
-                        => {
-                            break;
-                        }
-                        Some(IncomingWebSocketMessage::Text(_)) => {}
-                        Some(IncomingWebSocketMessage::Ping(payload)) => {
-                            match writer_control_tx.try_send(M::pong(payload)) {
-                                Ok(()) => {}
-                                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
-                                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                                    warn!("websocket control queue full while replying to ping; closing connection");
-                                    break;
-                                }
-                            }
-                        }
-                        Some(IncomingWebSocketMessage::Pong) => {}
-                        Some(IncomingWebSocketMessage::Close) => break,
-                        Some(IncomingWebSocketMessage::Binary) => {
-                            warn!("dropping unsupported binary websocket message");
-                        }
-                        None => {}
-                    },
-                    None => break,
-                    Some(Err(err)) => {
-                        warn!("websocket receive error: {err}");
+        };
+        let text = match message.into_incoming() {
+            Some(IncomingWebSocketMessage::Text(text)) => {
+                if decoder.is_some() {
+                    warn!("unexpected text on compressed websocket connection");
+                    break;
+                }
+                text
+            }
+            Some(IncomingWebSocketMessage::Binary(payload)) => {
+                let Some(decoder) = &mut decoder else {
+                    warn!("dropping unsupported binary websocket message");
+                    continue;
+                };
+                match decoder.decode(&payload) {
+                    Ok(text) => text,
+                    Err(err) => {
+                        warn!("websocket decompression error: {err}");
                         break;
                     }
                 }
             }
+            Some(IncomingWebSocketMessage::Ping(payload)) => {
+                match writer_control_tx.try_send(M::pong(payload)) {
+                    Ok(()) => {}
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        warn!(
+                            "websocket control queue full while replying to ping; closing connection"
+                        );
+                        break;
+                    }
+                }
+                continue;
+            }
+            Some(IncomingWebSocketMessage::Pong) => continue,
+            Some(IncomingWebSocketMessage::Close) => break,
+            None => continue,
+        };
+        if !forward_incoming_message(
+            &transport_event_tx,
+            &writer_tx_for_reader,
+            connection_id,
+            &text,
+            refusal_custody,
+        )
+        .await
+        {
+            break;
         }
     }
 }
+
+#[cfg(test)]
+#[path = "websocket_compression_tests.rs"]
+mod compression_tests;
+
+#[cfg(test)]
+#[path = "websocket_refusal_tests.rs"]
+mod refusal_tests;

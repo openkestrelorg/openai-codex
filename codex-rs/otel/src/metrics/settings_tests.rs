@@ -86,8 +86,8 @@ fn statsig_metadata_replaces_with_the_metrics_owner() {
 async fn coordinated_publication_preserves_failed_candidate_and_retires_exact_owner() {
     let slot = Mutex::new(GlobalMetrics::default());
     let mut candidate = Some(metrics());
-    let mut publication = GlobalMetricsPublication(slot.lock().unwrap());
-    publication
+    let mut publication = GlobalMetricsPublication::new(slot.lock().unwrap());
+    let first_receipt = publication
         .publish_with(&mut candidate, None, || assert!(slot.try_lock().is_err()))
         .unwrap();
     assert!(publication.0.retired.is_empty());
@@ -101,7 +101,7 @@ async fn coordinated_publication_preserves_failed_candidate_and_retires_exact_ow
     assert!(publication.0.retired.is_empty());
 
     let mut second = Some(metrics());
-    publication
+    let second_receipt = publication
         .publish_with(
             &mut second,
             Some(StatsigMetricsSettings {
@@ -117,7 +117,10 @@ async fn coordinated_publication_preserves_failed_candidate_and_retires_exact_ow
     };
     let retired = Arc::clone(&publication.0.retired[0]);
     assert!(retired.belongs_to(first_owner));
+    assert!(second_receipt.generation() > first_receipt.generation());
     drop(publication);
+    // Receipts are inert values; this slot is private, so release them unapplied.
+    drop((first_receipt, second_receipt));
     assert_eq!(
         retired
             .wait_until(tokio::time::Instant::now() + std::time::Duration::from_secs(2))

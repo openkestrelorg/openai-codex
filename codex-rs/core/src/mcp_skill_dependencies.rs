@@ -59,6 +59,14 @@ pub(crate) async fn maybe_prompt_and_install_mcp_dependencies(
         return;
     }
 
+    let work = match sess.turn_mcp_work(turn_context) {
+        Ok(work) => work,
+        Err(error) => {
+            warn!("skill MCP dependency work was not admitted: {error}");
+            return;
+        }
+    };
+    let access = codex_mcp::McpAttemptAccess::from_work(work.as_deref());
     let installed = sess.runtime_mcp_servers(config.as_ref()).await;
     let missing = collect_missing_mcp_dependencies(mentioned_skills, &installed);
     if missing.is_empty() {
@@ -78,7 +86,8 @@ pub(crate) async fn maybe_prompt_and_install_mcp_dependencies(
     {
         // Policy may have changed while waiting for the installation prompt.
         let missing = admit_mcp_dependencies(sess, config.as_ref(), unprompted_missing).await;
-        maybe_install_mcp_dependencies(sess, turn_context, missing, elicitation_reviewer).await;
+        maybe_install_mcp_dependencies(sess, turn_context, missing, elicitation_reviewer, access)
+            .await;
     }
 }
 
@@ -117,11 +126,21 @@ async fn maybe_install_mcp_dependencies(
     turn_context: &TurnContext,
     missing: HashMap<String, McpServerConfig>,
     elicitation_reviewer: Option<ElicitationReviewerHandle>,
+    access: codex_mcp::McpAttemptAccess<'_>,
 ) {
     if missing.is_empty() {
         return;
     }
 
+    // Hold finite invocation work across persistence, OAuth and publication.
+    let work = match sess.derive_mcp_attempt_work(access) {
+        Ok(work) => work,
+        Err(error) => {
+            warn!("skill MCP dependency installation was not admitted: {error}");
+            return;
+        }
+    };
+    let access = codex_mcp::McpAttemptAccess::from_work(work.as_deref());
     let config = turn_context.config.as_ref();
     let codex_home = config.codex_home.clone();
     let mut servers = match load_global_mcp_servers(&codex_home).await {
@@ -155,8 +174,8 @@ async fn maybe_install_mcp_dependencies(
     }
 
     let (_, runtime_context) = sess.runtime_mcp_config_and_context(config).await;
-    for (name, server_config) in added {
-        let http_client = match runtime_context.resolve_http_client(&name, &server_config) {
+    for (name, server_config) in &added {
+        let http_client = match runtime_context.resolve_http_client(name, server_config) {
             Ok(http_client) => http_client,
             Err(err) => {
                 warn!("failed to resolve MCP dependency runtime for {name}: {err}");
@@ -190,7 +209,7 @@ async fn maybe_install_mcp_dependencies(
             oauth_config.discovered_scopes.clone(),
         );
         let oauth_client_config = server_config.oauth.as_ref();
-        let oauth_credential_name = server_config.oauth_credential_name(&name);
+        let oauth_credential_name = server_config.oauth_credential_name(name);
         let callback_port = server_config.oauth_callback_port(config.mcp_oauth_callback_port);
         let first_attempt = perform_oauth_login(
             oauth_credential_name.as_ref(),
@@ -238,19 +257,12 @@ async fn maybe_install_mcp_dependencies(
         }
     }
 
-    let mut refresh_config = config.clone();
-    let mut configured_servers = config.mcp_servers.get().clone();
-    for (name, server_config) in &servers {
-        configured_servers
-            .entry(name.clone())
-            .or_insert_with(|| server_config.clone());
+    if let Err(error) = sess
+        .refresh_mcp_servers_now(added.into_iter().collect(), elicitation_reviewer, access)
+        .await
+    {
+        warn!("failed to publish MCP dependencies for mentioned skills: {error}");
     }
-    if let Err(err) = refresh_config.mcp_servers.set(configured_servers) {
-        warn!("failed to refresh MCP dependencies for mentioned skills: {err}");
-        return;
-    }
-    sess.refresh_mcp_servers_now(turn_context, &refresh_config, elicitation_reviewer)
-        .await;
 }
 
 async fn should_install_mcp_dependencies(
@@ -418,9 +430,9 @@ fn mcp_dependency_to_server_config(
             required: false,
             startup_readiness: Default::default(),
             supports_parallel_tool_calls: false,
-            tool_input_schema_max_bytes: None,
             thread_identity_eligible: false,
             control_endpoint_eligible: false,
+            tool_input_schema_max_bytes: None,
             omit_tools_from: None,
             disabled_reason: None,
             startup_timeout_sec: None,
@@ -461,9 +473,9 @@ fn mcp_dependency_to_server_config(
             required: false,
             startup_readiness: Default::default(),
             supports_parallel_tool_calls: false,
-            tool_input_schema_max_bytes: None,
             thread_identity_eligible: false,
             control_endpoint_eligible: false,
+            tool_input_schema_max_bytes: None,
             omit_tools_from: None,
             disabled_reason: None,
             startup_timeout_sec: None,
@@ -537,3 +549,7 @@ fn collect_missing_mcp_dependencies(
 
     missing
 }
+
+#[cfg(test)]
+#[path = "mcp_skill_dependency_authority_tests.rs"]
+mod authority_tests;

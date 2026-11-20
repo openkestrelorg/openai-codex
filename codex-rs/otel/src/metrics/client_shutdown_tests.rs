@@ -406,6 +406,7 @@ fn metrics_owner_failure_reobservation_preserves_sole_sdk_attempt() {
         histograms: Mutex::new(HashMap::new()),
         duration_histograms: Mutex::new(HashMap::new()),
         runtime_reader: None,
+        requires_analytics_consent: false,
         statsig_disabled_metrics: &[],
         default_tags: BTreeMap::new(),
     });
@@ -467,6 +468,7 @@ fn callback_owner(
         histograms: Mutex::new(HashMap::new()),
         duration_histograms: Mutex::new(HashMap::new()),
         runtime_reader: None,
+        requires_analytics_consent: false,
         statsig_disabled_metrics: &[],
         default_tags: BTreeMap::new(),
     }))
@@ -761,6 +763,7 @@ fn failed_flush_still_stops_reader_and_remains_failure() {
         histograms: Mutex::new(HashMap::new()),
         duration_histograms: Mutex::new(HashMap::new()),
         runtime_reader: None,
+        requires_analytics_consent: false,
         statsig_disabled_metrics: &[],
         default_tags: BTreeMap::new(),
     };

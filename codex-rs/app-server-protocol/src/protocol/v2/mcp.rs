@@ -87,6 +87,8 @@ pub struct McpServerStatus {
     pub server_info: Option<McpServerInfo>,
     /// Capabilities advertised by the initialized MCP server; null when unavailable.
     pub server_capabilities: Option<serde_json::Value>,
+    /// Opaque `_meta` from the first page of the corresponding MCP tool catalog. Null when unavailable.
+    pub tool_list_meta: Option<serde_json::Value>,
     pub tools: std::collections::HashMap<String, McpTool>,
     /// Tool discovery failed and no catalog was returned.
     /// Null when a catalog is returned, including cached or empty catalogs.
@@ -110,6 +112,10 @@ pub struct ListMcpServerStatusResponse {
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct McpResourceReadParams {
+    /// Additional MCP request metadata. Account and turn routing keys are reserved.
+    #[serde(rename = "_meta")]
+    #[ts(rename = "_meta", optional = nullable)]
+    pub meta: Option<serde_json::Map<String, JsonValue>>,
     #[ts(optional = nullable)]
     pub thread_id: Option<String>,
     /// Originating MCP tool call used to select the resource's app.
@@ -288,6 +294,184 @@ pub struct McpServerRefreshParams {}
 #[ts(export_to = "v2/")]
 pub struct McpServerRefreshResponse {}
 
+/// Parameters for `kcf/mcpServer/hostedEndpoint/declare`.
+///
+/// `url` must be a literal, canonical loopback endpoint that this same
+/// connection already named in its own thread start/resume/fork overrides.
+/// `authorization` is the endpoint's configured `Authorization` value and only
+/// identifies its connections. `retirementCapability` is the authority: minted
+/// by the hosting client, never placed in any configuration, and sent only on
+/// the declaring connection. The server keeps only digests of both.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct McpHostedEndpointDeclareParams {
+    pub url: String,
+    pub authorization: String,
+    pub retirement_capability: String,
+    /// Remaining budget of the caller's deadline. The ownership challenge is
+    /// bounded by the smaller of this and the server's fixed challenge bound.
+    pub timeout_ms: u64,
+}
+
+impl std::fmt::Debug for McpHostedEndpointDeclareParams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("McpHostedEndpointDeclareParams")
+            .field("url", &self.url)
+            .field("authorization", &"<redacted>")
+            .field("retirement_capability", &"<redacted>")
+            .field("timeout_ms", &self.timeout_ms)
+            .finish()
+    }
+}
+
+/// Fixed custody bound and its use. Tombstones are permanent.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct McpHostedEndpointCustodyCensus {
+    pub declared: u32,
+    pub provisional: u32,
+    pub tombstones: u32,
+    /// Bound on declared plus tombstoned endpoints.
+    pub capacity: u32,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    tag = "status"
+)]
+#[ts(rename_all = "camelCase", export_to = "v2/")]
+pub enum McpHostedEndpointDeclareResponse {
+    Declared {
+        custody: McpHostedEndpointCustodyCensus,
+    },
+    Refused {
+        reason: McpHostedEndpointRefusalReason,
+    },
+}
+
+/// Parameters for `kcf/mcpServer/hostedEndpoint/retire`.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct McpHostedEndpointRetireParams {
+    pub url: String,
+    pub authorization: String,
+    pub retirement_capability: String,
+    /// Remaining budget of the caller's original deadline. The server turns it
+    /// into a server-local deadline on arrival (never later than the caller's
+    /// deadline plus one-way delivery delay), clamps it to any earlier owner
+    /// deadline in force, and never extends or polls past it.
+    pub timeout_ms: u64,
+}
+
+impl std::fmt::Debug for McpHostedEndpointRetireParams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("McpHostedEndpointRetireParams")
+            .field("url", &self.url)
+            .field("authorization", &"<redacted>")
+            .field("retirement_capability", &"<redacted>")
+            .field("timeout_ms", &self.timeout_ms)
+            .finish()
+    }
+}
+
+/// Typed, mutation-free refusal.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase", export_to = "v2/")]
+pub enum McpHostedEndpointRefusalReason {
+    /// Unknown endpoint, wrong capability, or not declared on this connection
+    /// (including a connection that has closed).
+    NotOwner,
+    /// Only literal, canonical loopback HTTP endpoints can be declared.
+    NotLoopback,
+    /// This connection has not named the endpoint in its own thread overrides.
+    NotUsed,
+    /// Too many ownership challenges on this connection or overall.
+    RateLimited,
+    /// The runtime owner's network policy refuses the challenge destination.
+    NetworkDenied,
+    /// The requesting connection closed before any challenge was sent.
+    ConnectionClosed,
+    /// The endpoint did not prove possession of the retirement capability.
+    ProofFailed,
+    /// The owner retired this endpoint; the tombstone is permanent.
+    Retired,
+    /// The fixed custody capacity is in use; nothing is evicted.
+    CapacityExhausted,
+    /// The caller's budget had already expired on arrival.
+    Expired,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase", export_to = "v2/")]
+pub enum McpHostedEndpointRetirementOutcome {
+    /// Every physical attempt of every owner for this thread has positive terminal evidence.
+    Retired,
+    /// Ownership or close was not observed, or an owner vanished without
+    /// proof. Custody is retained.
+    Incomplete,
+    /// The deadline expired first. Custody is retained.
+    TimedOut,
+    /// A logical or process close failed. Custody is retained.
+    Failed,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct McpHostedEndpointThreadReceipt {
+    /// `None` for a runtime that belongs to no thread.
+    pub thread_id: Option<String>,
+    pub connections: u32,
+    pub outcome: McpHostedEndpointRetirementOutcome,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct McpHostedEndpointRetireCensus {
+    pub retired: u32,
+    pub incomplete: u32,
+    pub timed_out: u32,
+    pub failed: u32,
+    /// Owners that left earlier with a cached complete retirement proof.
+    pub proven_before_retirement: u32,
+    /// Owners that vanished without terminal proof. Any makes the result incomplete.
+    pub unknown: u32,
+    /// Owners may have been admitted before the declaration. Makes the result incomplete.
+    pub possibly_untracked: bool,
+    pub custody: McpHostedEndpointCustodyCensus,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    tag = "status"
+)]
+#[ts(rename_all = "camelCase", export_to = "v2/")]
+pub enum McpHostedEndpointRetireResponse {
+    /// Every connection has a positive receipt and no evidence is unknown.
+    Retired {
+        receipts: Vec<McpHostedEndpointThreadReceipt>,
+        census: McpHostedEndpointRetireCensus,
+    },
+    /// Some evidence is negative or unknown. Admission stays closed.
+    Incomplete {
+        receipts: Vec<McpHostedEndpointThreadReceipt>,
+        census: McpHostedEndpointRetireCensus,
+    },
+    Refused {
+        reason: McpHostedEndpointRefusalReason,
+    },
+}
+
 /// One selected user configuration layer that contributes to effective MCP
 /// configuration.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -312,10 +496,12 @@ pub struct McpServerConfigIdentity {
 
 /// Paired MCP configuration identities for diagnostic comparison.
 ///
-/// `applied` is every selected user configuration layer accepted by the
-/// running server's most recent successful startup or strict MCP reload.
-/// `current` is freshly read from every selected user configuration layer when
-/// this method runs.
+/// `applied` identifies the selected user layers accepted at startup or by the
+/// most recent complete host-owned runtime publication, only while every live
+/// runtime (including delegates) agrees. The method returns an error when that
+/// process-wide identity is unavailable or runtime publication is incomplete.
+/// `current` is freshly loaded through the server's configuration manager when
+/// this method runs; disk edits alone never advance `applied`.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
@@ -357,6 +543,11 @@ pub enum McpServerOauthClientRegistration {
 #[ts(export_to = "v2/")]
 pub struct McpServerOauthLoginResponse {
     pub authorization_url: String,
+    /// Identifies this login attempt across the response and completion notification.
+    /// Older servers omit this field; current servers always return it.
+    #[serde(default)]
+    #[ts(optional)]
+    pub login_id: Option<String>,
 }
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
@@ -374,6 +565,9 @@ pub struct McpToolCallProgressNotification {
 pub struct McpServerOauthLoginCompletedNotification {
     pub name: String,
     pub thread_id: Option<String>,
+    /// Identifies the explicit login attempt. Older servers omit this field.
+    #[ts(optional, as = "Option<Option<String>>")]
+    pub login_id: Option<String>,
     pub success: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
@@ -955,3 +1149,7 @@ impl From<rmcp::model::ElicitResult> for McpServerElicitationRequestResponse {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "mcp_hosted_endpoint_tests.rs"]
+mod hosted_endpoint_tests;

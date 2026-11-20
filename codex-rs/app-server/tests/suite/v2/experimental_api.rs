@@ -12,13 +12,13 @@ use codex_app_server_protocol::JSONRPCMessage;
 use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::MockExperimentalMethodParams;
 use codex_app_server_protocol::RequestId;
+use codex_app_server_protocol::ThreadItemsReadParams;
 use codex_app_server_protocol::ThreadMemoryMode;
 use codex_app_server_protocol::ThreadMemoryModeSetParams;
 use codex_app_server_protocol::ThreadRealtimeStartParams;
 use codex_app_server_protocol::ThreadRealtimeStartTransport;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
-use codex_app_server_protocol::ThreadStartSource;
 use codex_protocol::protocol::RealtimeOutputModality;
 use pretty_assertions::assert_eq;
 use std::time::Duration;
@@ -41,10 +41,11 @@ async fn mock_experimental_method_requires_experimental_api_capability() -> Resu
         .initialize_with_capabilities(
             default_client_info(),
             Some(InitializeCapabilities {
+                interactive_client: false,
+                required_human_approval: false,
                 explicit_gateway_oauth: false,
                 experimental_api: false,
                 request_attestation: false,
-                interactive_client: false,
                 opt_out_notification_methods: None,
                 mcp_server_openai_form_elicitation: false,
                 extensions: None,
@@ -68,6 +69,44 @@ async fn mock_experimental_method_requires_experimental_api_capability() -> Resu
 }
 
 #[tokio::test]
+async fn thread_items_read_requires_experimental_api_capability() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build()
+        .await?;
+
+    let init = mcp
+        .initialize_with_capabilities(
+            default_client_info(),
+            Some(InitializeCapabilities {
+                experimental_api: false,
+                ..Default::default()
+            }),
+        )
+        .await?;
+    let JSONRPCMessage::Response(_) = init else {
+        anyhow::bail!("expected initialize response, got {init:?}");
+    };
+
+    let request_id = mcp
+        .send_thread_items_read_request(ThreadItemsReadParams {
+            thread_id: "thr_123".to_string(),
+            turn_id: "turn_456".to_string(),
+            item_ids: vec!["item_789".to_string()],
+        })
+        .await?;
+    let error = timeout(
+        DEFAULT_TIMEOUT,
+        mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
+    )
+    .await??;
+    assert_experimental_capability_error(error, "thread/items/read");
+    Ok(())
+}
+
+#[tokio::test]
 async fn realtime_conversation_start_requires_experimental_api_capability() -> Result<()> {
     let codex_home = TempDir::new()?;
     let mut mcp = TestAppServer::builder()
@@ -80,10 +119,11 @@ async fn realtime_conversation_start_requires_experimental_api_capability() -> R
         .initialize_with_capabilities(
             default_client_info(),
             Some(InitializeCapabilities {
+                interactive_client: false,
+                required_human_approval: false,
                 explicit_gateway_oauth: false,
                 experimental_api: false,
                 request_attestation: false,
-                interactive_client: false,
                 opt_out_notification_methods: None,
                 mcp_server_openai_form_elicitation: false,
                 extensions: None,
@@ -113,6 +153,7 @@ async fn realtime_conversation_start_requires_experimental_api_capability() -> R
             realtime_end_instructions: None,
             prompt: Some(Some("hello".to_string())),
             realtime_session_id: None,
+            voice_session_id: None,
             transport: None,
             version: None,
             voice: None,
@@ -140,10 +181,11 @@ async fn thread_memory_mode_set_requires_experimental_api_capability() -> Result
         .initialize_with_capabilities(
             default_client_info(),
             Some(InitializeCapabilities {
+                interactive_client: false,
+                required_human_approval: false,
                 explicit_gateway_oauth: false,
                 experimental_api: false,
                 request_attestation: false,
-                interactive_client: false,
                 opt_out_notification_methods: None,
                 mcp_server_openai_form_elicitation: false,
                 extensions: None,
@@ -184,10 +226,11 @@ async fn settings_update_requires_experimental_api_capability(method: &str) -> R
         .initialize_with_capabilities(
             default_client_info(),
             Some(InitializeCapabilities {
+                interactive_client: false,
+                required_human_approval: false,
                 explicit_gateway_oauth: false,
                 experimental_api: false,
                 request_attestation: false,
-                interactive_client: false,
                 opt_out_notification_methods: None,
                 mcp_server_openai_form_elicitation: false,
                 extensions: None,
@@ -225,10 +268,11 @@ async fn realtime_webrtc_start_requires_experimental_api_capability() -> Result<
         .initialize_with_capabilities(
             default_client_info(),
             Some(InitializeCapabilities {
+                interactive_client: false,
+                required_human_approval: false,
                 explicit_gateway_oauth: false,
                 experimental_api: false,
                 request_attestation: false,
-                interactive_client: false,
                 opt_out_notification_methods: None,
                 mcp_server_openai_form_elicitation: false,
                 extensions: None,
@@ -258,6 +302,7 @@ async fn realtime_webrtc_start_requires_experimental_api_capability() -> Result<
             realtime_end_instructions: None,
             prompt: Some(Some("hello".to_string())),
             realtime_session_id: None,
+            voice_session_id: None,
             transport: Some(ThreadRealtimeStartTransport::Webrtc {
                 sdp: "v=offer\r\n".to_string(),
             }),
@@ -288,10 +333,11 @@ async fn thread_start_mock_field_requires_experimental_api_capability() -> Resul
         .initialize_with_capabilities(
             default_client_info(),
             Some(InitializeCapabilities {
+                interactive_client: false,
+                required_human_approval: false,
                 explicit_gateway_oauth: false,
                 experimental_api: false,
                 request_attestation: false,
-                interactive_client: false,
                 opt_out_notification_methods: None,
                 mcp_server_openai_form_elicitation: false,
                 extensions: None,
@@ -319,51 +365,6 @@ async fn thread_start_mock_field_requires_experimental_api_capability() -> Resul
 }
 
 #[tokio::test]
-async fn thread_start_clear_predecessor_requires_experimental_api_capability() -> Result<()> {
-    let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
-    let codex_home = TempDir::new()?;
-    MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
-
-    let mut mcp = TestAppServer::builder()
-        .with_codex_home(codex_home.path())
-        .build()
-        .await?;
-    let init = mcp
-        .initialize_with_capabilities(
-            default_client_info(),
-            Some(InitializeCapabilities {
-                experimental_api: false,
-                request_attestation: false,
-                interactive_client: false,
-                opt_out_notification_methods: None,
-                mcp_server_openai_form_elicitation: false,
-                explicit_gateway_oauth: false,
-                extensions: None,
-            }),
-        )
-        .await?;
-    let JSONRPCMessage::Response(_) = init else {
-        anyhow::bail!("expected initialize response, got {init:?}");
-    };
-
-    let request_id = mcp
-        .send_thread_start_request(ThreadStartParams {
-            session_start_source: Some(ThreadStartSource::Clear),
-            clear_predecessor_thread_id: Some("019fe0ce-0000-4000-8000-000000000000".to_string()),
-            ..Default::default()
-        })
-        .await?;
-
-    let error = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    assert_experimental_capability_error(error, "thread/start.clearPredecessor");
-    Ok(())
-}
-
-#[tokio::test]
 async fn thread_start_without_dynamic_tools_allows_without_experimental_api_capability()
 -> Result<()> {
     let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
@@ -378,10 +379,11 @@ async fn thread_start_without_dynamic_tools_allows_without_experimental_api_capa
         .initialize_with_capabilities(
             default_client_info(),
             Some(InitializeCapabilities {
+                interactive_client: false,
+                required_human_approval: false,
                 explicit_gateway_oauth: false,
                 experimental_api: false,
                 request_attestation: false,
-                interactive_client: false,
                 opt_out_notification_methods: None,
                 mcp_server_openai_form_elicitation: false,
                 extensions: None,
@@ -422,10 +424,11 @@ async fn thread_start_granular_approval_policy_requires_experimental_api_capabil
         .initialize_with_capabilities(
             default_client_info(),
             Some(InitializeCapabilities {
+                interactive_client: false,
+                required_human_approval: false,
                 explicit_gateway_oauth: false,
                 experimental_api: false,
                 request_attestation: false,
-                interactive_client: false,
                 opt_out_notification_methods: None,
                 mcp_server_openai_form_elicitation: false,
                 extensions: None,

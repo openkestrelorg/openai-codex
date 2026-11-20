@@ -245,14 +245,14 @@ impl ResourceOrigin {
             + self.uri.len()
     }
 
-    pub(crate) async fn read(
+    pub(crate) async fn read_with_authority(
         &self,
         binding: &McpBinding,
         thread_id: ThreadId,
-        uri: &str,
+        mut params: ReadResourceRequestParams,
         access: crate::McpAttemptAccess<'_>,
     ) -> anyhow::Result<ReadResourceResult> {
-        if self.uri != uri {
+        if self.uri != params.uri {
             anyhow::bail!("originating MCP tool call does not match the requested resource");
         }
         if self.ambiguous_account {
@@ -298,21 +298,19 @@ impl ResourceOrigin {
             anyhow::bail!("originating MCP tool is disabled by app configuration");
         }
 
-        let meta = serde_json::from_value(serde_json::json!({
-            "threadId": thread_id,
-            "x-codex-turn-metadata": {
+        let meta = params.meta.get_or_insert_default();
+        meta.insert("threadId".into(), serde_json::json!(thread_id));
+        meta.insert(
+            "x-codex-turn-metadata".into(),
+            serde_json::json!({
                 "mcp_request_meta": {
                     "selected_connector_ids": [&self.connector_id],
                     "link_id": &self.link_id,
                 }
-            },
-        }))?;
+            }),
+        );
         binding
-            .read_resource_with_authority(
-                CODEX_APPS_MCP_SERVER_NAME,
-                ReadResourceRequestParams::new(uri).with_meta(meta),
-                access,
-            )
+            .read_resource_with_authority(CODEX_APPS_MCP_SERVER_NAME, params, access)
             .await
     }
 }

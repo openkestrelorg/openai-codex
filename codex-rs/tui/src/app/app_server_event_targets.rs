@@ -77,6 +77,9 @@ pub(super) fn server_notification_thread_target(
         ServerNotification::ThreadGoalUpdated(notification) => {
             Some(notification.thread_id.as_str())
         }
+        ServerNotification::ThreadPredictionUpdated(notification) => {
+            Some(notification.thread_id.as_str())
+        }
         ServerNotification::ThreadGoalCleared(notification) => {
             Some(notification.thread_id.as_str())
         }
@@ -188,8 +191,17 @@ pub(super) fn server_notification_thread_target(
         | ServerNotification::AuthRecoveryCompleted(notification) => {
             Some(notification.thread_id.as_str())
         }
+        ServerNotification::ThreadReadStateChanged(notification) => {
+            Some(notification.thread_id.as_str())
+        }
         ServerNotification::Warning(notification) => notification.thread_id.as_deref(),
         ServerNotification::GuardianWarning(notification) => Some(notification.thread_id.as_str()),
+        ServerNotification::McpServerOauthLoginCompleted(notification) => {
+            match notification.thread_id.as_deref() {
+                Some(thread_id) => Some(thread_id),
+                None => return ServerNotificationThreadTarget::AppScoped,
+            }
+        }
         ServerNotification::McpServerStatusUpdated(notification) => {
             match notification.thread_id.as_deref() {
                 Some(thread_id) => Some(thread_id),
@@ -197,12 +209,10 @@ pub(super) fn server_notification_thread_target(
             }
         }
         ServerNotification::ProjectChanged(_)
-        | ServerNotification::ThreadInteractiveSubscriptionChanged(_)
         | ServerNotification::SkillsChanged(_)
-        | ServerNotification::McpServerOauthLoginCompleted(_)
         | ServerNotification::AccountUpdated(_)
+        | ServerNotification::ThreadSectionChanged(_)
         | ServerNotification::GatewayOAuthChanged(_)
-        | ServerNotification::ManagedTransitionStatusUpdated(_)
         | ServerNotification::AccountRateLimitsUpdated(_)
         | ServerNotification::AppListUpdated(_)
         | ServerNotification::EnvironmentConnected(_)
@@ -221,6 +231,8 @@ pub(super) fn server_notification_thread_target(
         | ServerNotification::FsChanged(_)
         | ServerNotification::WindowsWorldWritableWarning(_)
         | ServerNotification::WindowsSandboxSetupCompleted(_)
+        | ServerNotification::ThreadInteractiveSubscriptionChanged(_)
+        | ServerNotification::ManagedTransitionStatusUpdated(_)
         | ServerNotification::AccountLoginCompleted(_) => None,
     };
 
@@ -258,6 +270,7 @@ mod tests {
     fn test_thread_settings() -> ThreadSettings {
         ThreadSettings {
             disabled_plugin_ids: Vec::new(),
+            environments: None,
             cwd: test_path_buf("/tmp/thread-settings").abs(),
             approval_policy: codex_app_server_protocol::AskForApproval::Never,
             approvals_reviewer: codex_app_server_protocol::ApprovalsReviewer::User,

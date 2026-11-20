@@ -24,6 +24,7 @@ use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;
+use test_case::test_case;
 use tokio::time::timeout;
 use wiremock::Mock;
 use wiremock::MockServer;
@@ -47,8 +48,10 @@ async fn send_request(
         .await;
 }
 
+#[test_case(false; "default provider")]
+#[test_case(true; "explicit non-default provider")]
 #[tokio::test]
-async fn gateway_oauth_login_updates_existing_requests() -> Result<()> {
+async fn gateway_oauth_login_updates_existing_requests(selected: bool) -> Result<()> {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/token"))
@@ -73,6 +76,7 @@ base_url = "{url}/v1"
 wire_api = "responses"
 [model_providers.gateway.gateway_oauth]
 authorization_url = "{url}/authorize"
+device_authorization_url = "{url}/devicecode"
 token_url = "{url}/token"
 client_id = "app-server-login-success"
 delivery = {{ kind = "header", name = "X-Gateway-Authorization" }}
@@ -103,7 +107,7 @@ delivery = {{ kind = "header", name = "X-Gateway-Authorization" }}
         Some(Arc::clone(&auth_manager)),
     );
     assert_eq!(
-        provider.api_auth().await?.to_auth_headers()["x-gateway-authorization"],
+        provider.api_auth().await?.to_auth_headers().unwrap()["x-gateway-authorization"],
         "Bearer old-access"
     );
     let (processor, mut outgoing) = build_test_processor(config, auth_manager).await;
@@ -121,10 +125,23 @@ delivery = {{ kind = "header", name = "X-Gateway-Authorization" }}
     )
     .await;
     let _: InitializeResponse = read_response(&mut outgoing, /*request_id*/ 1).await;
+    // Existing request consumers retain the gateway when the default changes.
+    if selected {
+        let path = home.path().join("config.toml");
+        let text = std::fs::read_to_string(&path)?;
+        std::fs::write(
+            path,
+            text.replace(
+                "model_provider = \"gateway\"",
+                "model_provider = \"openai\"",
+            ),
+        )?;
+    }
+    let params = selected.then(|| json!({"modelProvider": "gateway"}));
     send_request(
         &processor,
         &session,
-        json!({"id": 2, "method": "account/gatewayOAuth/login"}),
+        json!({"id": 2, "method": "account/gatewayOAuth/login", "params": params}),
     )
     .await;
     let authorization_url = timeout(Duration::from_secs(/*secs*/ 10), async {
@@ -162,11 +179,11 @@ delivery = {{ kind = "header", name = "X-Gateway-Authorization" }}
         .await?
         .error_for_status()?;
     let response: GatewayOAuthLoginResponse = read_response(&mut outgoing, /*request_id*/ 2).await;
-    assert_eq!(response, GatewayOAuthLoginResponse {});
+    assert_eq!(response, GatewayOAuthLoginResponse { prompt: None });
     send_request(
         &processor,
         &session,
-        json!({"id": 3, "method": "account/gatewayOAuth/read"}),
+        json!({"id": 3, "method": "account/gatewayOAuth/read", "params": params}),
     )
     .await;
     let response: GatewayOAuthReadResponse = read_response(&mut outgoing, /*request_id*/ 3).await;
@@ -176,13 +193,14 @@ delivery = {{ kind = "header", name = "X-Gateway-Authorization" }}
             provider_id: "gateway".to_string(),
             provider_name: "OpenAI".to_string(),
             required: true,
+            supports_device_auth: true,
             status: Some(GatewayOAuthStatus::Succeeded),
             error: None,
         }
     );
     assert_eq!(observer.resolve_access_token().await?, "new-access");
     assert_eq!(
-        provider.api_auth().await?.to_auth_headers()["x-gateway-authorization"],
+        provider.api_auth().await?.to_auth_headers().unwrap()["x-gateway-authorization"],
         "Bearer new-access"
     );
     processor.shutdown_threads().await;
@@ -266,13 +284,175 @@ delivery = {{ kind = "header", name = "X-Gateway-Authorization" }}
         }
     })
     .await?;
-    assert_eq!(error, JSONRPCErrorError {
-        code: -32600,
-        message: "failed to load configuration: Your organization's required model provider settings changed. Restart Codex to apply them; this request was not sent".to_string(),
-        data: None,
-    });
+    assert_eq!(
+        error,
+        JSONRPCErrorError {
+            code: -32600,
+            message: codex_app_server_protocol::ModelProviderError::ModelProviderPolicyConflict {
+                model_provider: "gateway".into(),
+                required_model_provider: "openai".into(),
+            }
+            .to_string(),
+            data: Some(serde_json::to_value(
+                codex_app_server_protocol::ModelProviderError::ModelProviderPolicyConflict {
+                    model_provider: "gateway".into(),
+                    required_model_provider: "openai".into(),
+                }
+            )?),
+        }
+    );
     assert!(server.received_requests().await.unwrap().is_empty());
     processor.shutdown_threads().await;
     processor.drain_background_tasks().await;
+    Ok(())
+}
+
+/// Checking another provider must not recreate the first provider's readiness state.
+#[tokio::test]
+async fn gateway_oauth_read_retains_each_provider_status() -> Result<()> {
+    let home = TempDir::new()?;
+    let mut text = String::from("[features]\nsecret_auth_storage = true\n");
+    for id in ["first", "second"] {
+        text.push_str(&format!(
+            r#"
+[model_providers.{id}]
+name = "{id}"
+base_url = "https://{id}.example/v1"
+wire_api = "responses"
+[model_providers.{id}.gateway_oauth]
+authorization_url = "https://{id}.example/authorize"
+token_url = "https://{id}.example/token"
+client_id = "{id}"
+delivery = {{ kind = "header", name = "X-Gateway-Authorization" }}
+"#
+        ));
+    }
+    std::fs::write(home.path().join("config.toml"), text)?;
+    let config = Arc::new(
+        ConfigBuilder::default()
+            .codex_home(home.path().to_path_buf())
+            .build()
+            .await?,
+    );
+    let auth = AuthManager::from_auth_for_testing_with_home(
+        CodexAuth::from_api_key("primary"),
+        home.path().to_path_buf(),
+    );
+    let mut changes = codex_login::subscribe_gateway_auth_status(&auth.runtime_config());
+    let (processor, _outgoing) = build_test_processor(config, auth).await;
+    for (id, changed) in [("first", true), ("second", true), ("first", false)] {
+        let state = processor
+            .account_processor
+            .gateway_oauth_read(codex_app_server_protocol::GatewayOAuthReadParams {
+                model_provider: Some(id.into()),
+            })
+            .await
+            .map_err(|err| anyhow::anyhow!("{}", err.message))?;
+        assert_eq!(state.provider_id, id);
+        assert_eq!(state.status, Some(GatewayOAuthStatus::NotReady));
+        if changed {
+            assert_eq!(
+                changes.try_recv()?.status,
+                codex_login::GatewayAuthStatus::NotReady
+            );
+        } else {
+            assert!(matches!(
+                changes.try_recv(),
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// A returned device prompt must not release the actual account-login original.
+#[tokio::test]
+async fn device_gateway_prompt_retains_original_until_login_shutdown_joins_it() -> Result<()> {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/devicecode"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "device_code": "synthetic-device-code", "user_code": "ABCD-EFGH",
+            "verification_uri": "https://login.example/device", "expires_in": 60, "interval": 60
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(
+            ResponseTemplate::new(400).set_body_json(json!({"error": "authorization_pending"})),
+        )
+        .mount(&server)
+        .await;
+    let home = TempDir::new()?;
+    std::fs::write(
+        home.path().join("config.toml"),
+        format!(
+            r#"
+model_provider = "gateway"
+[model_providers.gateway]
+name = "Gateway"
+requires_openai_auth = true
+base_url = "{url}/v1"
+wire_api = "responses"
+[model_providers.gateway.gateway_oauth]
+authorization_url = "{url}/authorize"
+device_authorization_url = "{url}/devicecode"
+token_url = "{url}/token"
+client_id = "retained-device-login"
+credentials_store = "file"
+delivery = {{ kind = "header", name = "X-Gateway-Authorization" }}
+"#,
+            url = server.uri()
+        ),
+    )?;
+    let config = Arc::new(
+        ConfigBuilder::default()
+            .codex_home(home.path().to_path_buf())
+            .build()
+            .await?,
+    );
+    let auth = AuthManager::from_auth_for_testing_with_home(
+        CodexAuth::from_api_key("synthetic-primary"),
+        home.path().to_path_buf(),
+    );
+    let _session = seed_gateway_auth(
+        &config.model_provider,
+        &auth,
+        json!({"access_token":"expired", "refresh_token":null, "expires_at":0}),
+    );
+    let (processor, _outgoing) = build_test_processor(config, auth).await;
+    let session = ConnectionSessionState::new(crate::transport::ConnectionOrigin::Stdio);
+    // The real host requires admitted account custody. A direct handler test
+    // must enter the same permit scope as the dispatcher, rather than bypass it.
+    let work = processor
+        .managed_transition_coordinator
+        .try_acquire_account_work_permit()
+        .expect("account work admitted");
+    let response = timeout(
+        Duration::from_secs(5),
+        crate::account_turn_admission::within_request(
+            Some(work),
+            processor.account_processor.gateway_oauth_login(
+                codex_app_server_protocol::GatewayOAuthLoginParams {
+                    model_provider: None,
+                    device_auth: true,
+                },
+                TEST_CONNECTION_ID,
+                &session.rpc_gate,
+            ),
+        ),
+    )
+    .await?
+    .map_err(|error| anyhow::anyhow!("{}", error.message))?;
+    assert!(response.prompt.is_some());
+    assert!(processor.login_tasks.len() > 0);
+    let shutdown =
+        processor.begin_login_shutdown(tokio::time::Instant::now() + Duration::from_secs(5))?;
+    let report = timeout(Duration::from_secs(6), shutdown.wait()).await?;
+    assert!(report.is_clean(), "{report:?}");
+    assert_eq!(processor.login_tasks.len(), 0);
+    processor.clear_runtime_references();
     Ok(())
 }

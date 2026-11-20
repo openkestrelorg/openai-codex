@@ -1,5 +1,5 @@
-use codex_mcp::McpRuntimeRetirement;
-use codex_mcp::RuntimeTerminationReport;
+use codex_core::connectors::AppDiscoveryRetirement;
+use codex_core::connectors::AppDiscoveryTerminationReport;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::Weak;
@@ -9,7 +9,7 @@ use tokio::time::Instant;
 struct State {
     closed: bool,
     deadline: Option<Instant>,
-    runtimes: Vec<McpRuntimeRetirement>,
+    runtimes: Vec<AppDiscoveryRetirement>,
     terminal: Option<AppsRuntimeDrain>,
 }
 
@@ -24,18 +24,18 @@ pub(super) struct AppsRuntimeTicket(Weak<Mutex<State>>);
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct AppsRuntimeDrain {
     pub unavailable: bool,
-    pub reports: Vec<RuntimeTerminationReport>,
+    pub reports: Vec<AppDiscoveryTerminationReport>,
 }
 
 impl AppsRuntimeTicket {
-    pub(super) fn reserve(&self) -> Result<McpRuntimeRetirement, ()> {
+    pub(super) fn reserve(&self) -> Result<AppDiscoveryRetirement, ()> {
         let state = self.0.upgrade().ok_or(())?;
         let mut state = state.lock().map_err(|_| ())?;
         if state.closed {
             return Err(());
         }
         state.runtimes.retain(|runtime| !runtime.is_retired());
-        let runtime = McpRuntimeRetirement::default();
+        let runtime = AppDiscoveryRetirement::default();
         state.runtimes.push(runtime.clone());
         Ok(runtime)
     }
@@ -88,7 +88,7 @@ impl AppsRuntimeOwners {
             && report
                 .reports
                 .iter()
-                .all(RuntimeTerminationReport::is_complete)
+                .all(AppDiscoveryTerminationReport::is_complete)
         {
             state.runtimes.clear();
             state.terminal = Some(report.clone());

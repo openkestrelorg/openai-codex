@@ -3,6 +3,8 @@ use crate::plugin_bundle_archive::PluginBundleUnpackError;
 use crate::plugin_bundle_archive::unpack_plugin_bundle_tar_gz;
 use crate::remote::REMOTE_GLOBAL_MARKETPLACE_NAME;
 use crate::remote::RemotePluginServiceConfig;
+use crate::remote::reset_authority::RemotePluginBundleCommitLease;
+use crate::remote::reset_authority::RemotePluginBundleSyncGeneration;
 use crate::store::PluginInstallResult;
 use crate::store::PluginStore;
 use crate::store::PluginStoreError;
@@ -37,13 +39,24 @@ const REMOTE_PLUGIN_INSTALL_STAGING_DIR: &str = "plugins/.remote-plugin-install-
 const TEST_ALLOW_LOOPBACK_HTTP_REMOTE_PLUGIN_BUNDLES_ENV: &str =
     "CODEX_TEST_ALLOW_HTTP_REMOTE_PLUGIN_BUNDLE_DOWNLOADS";
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ValidatedRemotePluginBundle {
     pub plugin_id: PluginId,
     pub plugin_version: String,
     remote_plugin_id: String,
     app_manifest: Option<JsonValue>,
     bundle_download_url: String,
+}
+
+impl std::fmt::Debug for ValidatedRemotePluginBundle {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ValidatedRemotePluginBundle")
+            .field("plugin_id", &self.plugin_id)
+            .field("plugin_version", &self.plugin_version)
+            .field("remote_plugin_id", &self.remote_plugin_id)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -63,11 +76,10 @@ pub enum RemotePluginBundleInstallError {
     MissingBundleDownloadUrl { remote_plugin_id: String },
 
     #[error(
-        "backend returned an invalid download URL for remote plugin `{remote_plugin_id}`: {url}"
+        "backend returned an invalid download URL for remote plugin `{remote_plugin_id}`: {source}"
     )]
     InvalidBundleDownloadUrl {
         remote_plugin_id: String,
-        url: String,
         #[source]
         source: url::ParseError,
     },
@@ -89,32 +101,34 @@ pub enum RemotePluginBundleInstallError {
         source: PluginIdError,
     },
 
-    #[error("failed to send remote plugin bundle download request to {url}: {source}")]
+    #[error("failed to send remote plugin bundle download request to {host}: {source}")]
     DownloadRequest {
-        url: String,
+        host: String,
         #[source]
         source: RouteAwareRequestError,
     },
 
-    #[error("remote plugin bundle download from {url} failed with status {status}: {body}")]
+    #[error("remote plugin bundle download from {host} failed with status {status}: {body}")]
     DownloadStatus {
-        url: String,
+        host: String,
         status: StatusCode,
         body: String,
     },
 
-    #[error("failed to read remote plugin bundle download response from {url}: {source}")]
+    #[error("failed to read remote plugin bundle download response from {host}: {source}")]
     DownloadBody {
-        url: String,
+        host: String,
         #[source]
         source: codex_http_client::HttpError,
     },
 
-    #[error("remote plugin bundle download from {url} exceeded maximum size of {max_bytes} bytes")]
-    DownloadTooLarge { url: String, max_bytes: u64 },
+    #[error("remote plugin bundle download from {host} exceeded maximum size of {max_bytes} bytes")]
+    DownloadTooLarge { host: String, max_bytes: u64 },
 
-    #[error("remote plugin bundle download from {url} redirected to unsupported URL {final_url}")]
-    UnsupportedBundleDownloadFinalUrl { url: String, final_url: String },
+    #[error(
+        "remote plugin bundle download from {host} resolved to unsupported URL scheme {scheme}"
+    )]
+    UnsupportedBundleDownloadFinalUrl { host: String, scheme: String },
 
     #[error(
         "remote plugin bundle extracted size would be {bytes} bytes, exceeding the maximum total size of {max_bytes} bytes"
@@ -201,7 +215,6 @@ pub fn validate_remote_plugin_bundle(
     let parsed_bundle_url = Url::parse(&bundle_download_url).map_err(|source| {
         RemotePluginBundleInstallError::InvalidBundleDownloadUrl {
             remote_plugin_id: remote_plugin_id.to_string(),
-            url: bundle_download_url.clone(),
             source,
         }
     })?;
@@ -254,38 +267,79 @@ fn is_loopback_url(url: &Url) -> bool {
     }
 }
 
+fn publication_error(source: io::Error) -> RemotePluginBundleInstallError {
+    RemotePluginBundleInstallError::Io {
+        context: "remote plugin publication authority unavailable",
+        source,
+    }
+}
+
 pub async fn download_and_install_remote_plugin_bundle(
     config: &RemotePluginServiceConfig,
     codex_home: PathBuf,
     bundle: ValidatedRemotePluginBundle,
 ) -> Result<PluginInstallResult, RemotePluginBundleInstallError> {
-    let bundle_bytes = download_remote_plugin_bundle(config, &bundle).await?;
-    tokio::task::spawn_blocking(move || {
-        install_remote_plugin_bundle(codex_home, bundle, bundle_bytes)
-    })
+    let generation =
+        RemotePluginBundleSyncGeneration::capture(&codex_home).map_err(publication_error)?;
+    download_and_install_remote_plugin_bundle_with_generation(
+        config,
+        codex_home,
+        bundle,
+        &generation,
+    )
     .await
-    .map_err(|err| {
-        RemotePluginBundleInstallError::InvalidBundle(format!(
-            "failed to join remote plugin bundle install task: {err}"
-        ))
-    })?
+}
+
+pub(crate) async fn download_and_install_remote_plugin_bundle_with_generation(
+    config: &RemotePluginServiceConfig,
+    codex_home: PathBuf,
+    bundle: ValidatedRemotePluginBundle,
+    generation: &RemotePluginBundleSyncGeneration,
+) -> Result<PluginInstallResult, RemotePluginBundleInstallError> {
+    let bundle_bytes = download_remote_plugin_bundle(config, &bundle).await?;
+    install_downloaded_remote_plugin_bundle(codex_home, bundle, bundle_bytes, generation).await
+}
+
+async fn install_downloaded_remote_plugin_bundle(
+    codex_home: PathBuf,
+    bundle: ValidatedRemotePluginBundle,
+    bundle_bytes: Vec<u8>,
+    generation: &RemotePluginBundleSyncGeneration,
+) -> Result<PluginInstallResult, RemotePluginBundleInstallError> {
+    let lease = generation.begin_commit().map_err(publication_error)?;
+    let (result, _physical_lease) = lease
+        .run_blocking(move || install_remote_plugin_bundle(codex_home, bundle, bundle_bytes))
+        .await
+        .map_err(publication_error)?;
+    result
 }
 
 pub(crate) async fn download_and_extract_remote_plugin_bundle_to_path(
     config: &RemotePluginServiceConfig,
     bundle: ValidatedRemotePluginBundle,
     destination: AbsolutePathBuf,
-) -> Result<AbsolutePathBuf, RemotePluginBundleInstallError> {
+    generation: &RemotePluginBundleSyncGeneration,
+) -> Result<(AbsolutePathBuf, RemotePluginBundleCommitLease), RemotePluginBundleInstallError> {
     let bundle_bytes = download_remote_plugin_bundle(config, &bundle).await?;
-    tokio::task::spawn_blocking(move || {
-        extract_remote_plugin_bundle_to_path(bundle, bundle_bytes, destination)
-    })
-    .await
-    .map_err(|err| {
-        RemotePluginBundleInstallError::InvalidBundle(format!(
-            "failed to join remote plugin bundle extraction task: {err}"
-        ))
-    })?
+    extract_downloaded_remote_plugin_bundle(bundle, bundle_bytes, destination, generation).await
+}
+
+async fn extract_downloaded_remote_plugin_bundle(
+    bundle: ValidatedRemotePluginBundle,
+    bundle_bytes: Vec<u8>,
+    destination: AbsolutePathBuf,
+    generation: &RemotePluginBundleSyncGeneration,
+) -> Result<(AbsolutePathBuf, RemotePluginBundleCommitLease), RemotePluginBundleInstallError> {
+    let lease = generation.begin_commit().map_err(publication_error)?;
+    let (result, physical_lease) = lease
+        .run_blocking(move || {
+            extract_remote_plugin_bundle_to_path(bundle, bundle_bytes, destination)
+        })
+        .await
+        .map_err(publication_error)?;
+    // Transfer the original physical lease with the extracted path. The share
+    // caller retains it through synchronous marketplace publication/rollback.
+    Ok((result?, physical_lease))
 }
 
 pub(crate) async fn download_remote_plugin_bundle(
@@ -300,37 +354,6 @@ pub(crate) async fn download_remote_plugin_bundle(
     .await
 }
 
-/// Downloads outside the commit lease; retired downloads cannot publish files.
-pub(crate) async fn download_and_install_remote_plugin_bundle_for_generation(
-    config: &RemotePluginServiceConfig,
-    codex_home: PathBuf,
-    bundle: ValidatedRemotePluginBundle,
-    generation: crate::remote::RemotePluginBundleSyncGeneration,
-) -> Result<Option<PluginInstallResult>, RemotePluginBundleInstallError> {
-    let bundle_bytes = download_remote_plugin_bundle(config, &bundle).await?;
-    tokio::task::spawn_blocking(move || {
-        install_remote_plugin_bundle_for_generation(codex_home, bundle, bundle_bytes, &generation)
-    })
-    .await
-    .map_err(|err| {
-        RemotePluginBundleInstallError::InvalidBundle(format!(
-            "failed to join remote plugin bundle install task: {err}"
-        ))
-    })?
-}
-
-fn install_remote_plugin_bundle_for_generation(
-    codex_home: PathBuf,
-    bundle: ValidatedRemotePluginBundle,
-    bundle_bytes: Vec<u8>,
-    generation: &crate::remote::RemotePluginBundleSyncGeneration,
-) -> Result<Option<PluginInstallResult>, RemotePluginBundleInstallError> {
-    let Some(_lease) = generation.begin_commit() else {
-        return Ok(None);
-    };
-    install_remote_plugin_bundle(codex_home, bundle, bundle_bytes).map(Some)
-}
-
 async fn download_remote_plugin_bundle_with_limit(
     config: &RemotePluginServiceConfig,
     bundle_download_url: &str,
@@ -342,23 +365,27 @@ async fn download_remote_plugin_bundle_with_limit(
         .send()
         .await
         .map_err(|source| RemotePluginBundleInstallError::DownloadRequest {
-            url: bundle_download_url.to_string(),
-            source,
+            host: Url::parse(bundle_download_url)
+                .ok()
+                .and_then(|url| url.host_str().map(str::to_owned))
+                .unwrap_or_else(|| "unknown-host".to_string()),
+            source: source.without_url(),
         })?;
 
     let final_url = response.url().clone();
+    // Keep only the host in URL error fields.
+    let host = final_url.host_str().unwrap_or("unknown-host").to_string();
     // The shared client has already followed redirects here. Reject an unsupported final scheme
     // before caching a backend-issued bundle.
     if !is_allowed_bundle_download_url(&final_url, allow_test_loopback_http_bundle_downloads()) {
         return Err(
             RemotePluginBundleInstallError::UnsupportedBundleDownloadFinalUrl {
-                url: bundle_download_url.to_string(),
-                final_url: final_url.to_string(),
+                host,
+                scheme: final_url.scheme().to_string(),
             },
         );
     }
 
-    let url = final_url.to_string();
     let status = response.status();
     if !status.is_success() {
         let mut response = response;
@@ -370,7 +397,7 @@ async fn download_remote_plugin_bundle_with_limit(
                 Ok(Some(chunk)) => chunk,
                 Ok(None) => break,
                 Err(source) => {
-                    body_read_error = Some(source);
+                    body_read_error = Some(source.without_url());
                     break;
                 }
             };
@@ -392,19 +419,19 @@ async fn download_remote_plugin_bundle_with_limit(
         if let Some(source) = body_read_error {
             body.push_str(&format!("\n[failed to read response body: {source}]"));
         }
-        return Err(RemotePluginBundleInstallError::DownloadStatus { url, status, body });
+        return Err(RemotePluginBundleInstallError::DownloadStatus { host, status, body });
     }
 
-    read_response_body_with_limit(response, &url, max_bytes).await
+    read_response_body_with_limit(response, &host, max_bytes).await
 }
 
 async fn read_response_body_with_limit(
     mut response: HttpResponse,
-    url: &str,
+    host: &str,
     max_bytes: u64,
 ) -> Result<Vec<u8>, RemotePluginBundleInstallError> {
     if let Some(content_length) = response.content_length() {
-        enforce_download_size_limit(url, content_length, max_bytes)?;
+        enforce_download_size_limit(host, content_length, max_bytes)?;
     }
 
     let mut body = Vec::new();
@@ -413,12 +440,12 @@ async fn read_response_body_with_limit(
             .chunk()
             .await
             .map_err(|source| RemotePluginBundleInstallError::DownloadBody {
-                url: url.to_string(),
-                source,
+                host: host.to_string(),
+                source: source.without_url(),
             })?
     {
         let next_len = body.len() as u64 + chunk.len() as u64;
-        enforce_download_size_limit(url, next_len, max_bytes)?;
+        enforce_download_size_limit(host, next_len, max_bytes)?;
         body.extend_from_slice(&chunk);
     }
 
@@ -426,13 +453,13 @@ async fn read_response_body_with_limit(
 }
 
 fn enforce_download_size_limit(
-    url: &str,
+    host: &str,
     bytes: u64,
     max_bytes: u64,
 ) -> Result<(), RemotePluginBundleInstallError> {
     if bytes > max_bytes {
         return Err(RemotePluginBundleInstallError::DownloadTooLarge {
-            url: url.to_string(),
+            host: host.to_string(),
             max_bytes,
         });
     }
@@ -685,6 +712,7 @@ mod tests {
     use wiremock::ResponseTemplate;
     use wiremock::matchers::method;
     use wiremock::matchers::path;
+    use wiremock::matchers::query_param;
 
     const REMOTE_PLUGIN_ID: &str = "plugins~Plugin_00000000000000000000000000000000";
 
@@ -711,7 +739,7 @@ mod tests {
             "openai-curated-remote",
             "linear",
             Some("1.2.3"),
-            Some("https://example.com/linear.tar.gz"),
+            Some("https://example.com/linear.tar.gz?sig=signed-token"),
             /*app_manifest*/ None,
         )
         .expect("valid install plan");
@@ -721,8 +749,9 @@ mod tests {
         assert_eq!(bundle.plugin_version, "1.2.3");
         assert_eq!(
             bundle.bundle_download_url.as_str(),
-            "https://example.com/linear.tar.gz"
+            "https://example.com/linear.tar.gz?sig=signed-token"
         );
+        assert!(!format!("{bundle:?}").contains("signed-token"));
     }
 
     #[test]
@@ -799,12 +828,9 @@ mod tests {
 
     #[test]
     fn download_size_limit_rejects_oversized_bundle() {
-        let err = enforce_download_size_limit(
-            "https://example.com/linear.tar.gz",
-            /*bytes*/ 5,
-            /*max_bytes*/ 4,
-        )
-        .expect_err("oversized bundle download should fail");
+        let err =
+            enforce_download_size_limit("example.com", /*bytes*/ 5, /*max_bytes*/ 4)
+                .expect_err("oversized bundle download should fail");
 
         assert!(matches!(
             err,
@@ -817,6 +843,7 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/signed/plugin-bundle"))
+            .and(query_param("sig", "signed-token"))
             .respond_with(ResponseTemplate::new(200).set_body_bytes(b"bundle"))
             .expect(1)
             .mount(&server)
@@ -834,62 +861,11 @@ mod tests {
             err,
             RemotePluginBundleInstallError::UnsupportedBundleDownloadFinalUrl { .. }
         ));
+        assert!(!err.to_string().contains("signed-token"));
+        assert!(!format!("{err:?}").contains("signed-token"));
         assert_eq!(
             recorded_http_client_urls(&selected_urls),
             vec![download_url]
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn account_reset_fences_paused_bundle_install_before_filesystem_publication() {
-        let codex_home = tempdir().unwrap();
-        let generation =
-            crate::remote::RemotePluginBundleSyncGeneration::capture(codex_home.path());
-        let old_home = codex_home.path().to_path_buf();
-        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
-        let old_install = tokio::spawn(async move {
-            let bytes = tar_gz_bytes(&[(
-                ".codex-plugin/plugin.json",
-                br#"{"name":"linear","version":"1.2.3"}"#,
-                /*mode*/ 0o644,
-            )]);
-            ready_tx.send(()).unwrap();
-            resume_rx.await.unwrap();
-            tokio::task::spawn_blocking(move || {
-                install_remote_plugin_bundle_for_generation(
-                    old_home,
-                    valid_remote_plugin_bundle(),
-                    bytes,
-                    &generation,
-                )
-            })
-            .await
-            .unwrap()
-        });
-        ready_rx.await.unwrap();
-        crate::remote::retire_remote_plugin_bundle_sync(codex_home.path());
-        let b_generation =
-            crate::remote::RemotePluginBundleSyncGeneration::capture(codex_home.path());
-        let mut b_bundle = valid_remote_plugin_bundle();
-        b_bundle.plugin_version = "2.0.0".to_string();
-        let b = install_remote_plugin_bundle_for_generation(
-            codex_home.path().to_path_buf(),
-            b_bundle,
-            tar_gz_bytes(&[(
-                ".codex-plugin/plugin.json",
-                br#"{"name":"linear","version":"2.0.0"}"#,
-                /*mode*/ 0o644,
-            )]),
-            &b_generation,
-        )
-        .unwrap()
-        .unwrap();
-        resume_tx.send(()).unwrap();
-        assert!(old_install.await.unwrap().unwrap().is_none());
-        assert_eq!(
-            PluginStore::new(codex_home.path().to_path_buf()).active_plugin_version(&b.plugin_id),
-            Some("2.0.0".to_string())
         );
     }
 
@@ -1145,6 +1121,93 @@ mod tests {
         assert_eq!(mode, 0o755);
     }
 
+    #[tokio::test]
+    async fn retired_download_cannot_install_valid_bundle_bytes() {
+        let home = tempdir().unwrap();
+        let generation = RemotePluginBundleSyncGeneration::capture(home.path()).unwrap();
+        crate::remote::reset_authority::retire_remote_plugin_bundle_sync(home.path())
+            .unwrap()
+            .wait_until(tokio::time::Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap();
+        let bytes = tar_gz_bytes(&[(
+            ".codex-plugin/plugin.json",
+            br#"{"name":"linear","version":"1.2.3"}"#,
+            0o644,
+        )]);
+        let Err(error) = install_downloaded_remote_plugin_bundle(
+            home.path().to_path_buf(),
+            valid_remote_plugin_bundle(),
+            bytes,
+            &generation,
+        )
+        .await
+        else {
+            panic!("retired download installed a bundle")
+        };
+        assert!(matches!(error, RemotePluginBundleInstallError::Io { .. }));
+        assert!(!home.path().join(crate::store::PLUGINS_CACHE_DIR).exists());
+    }
+
+    #[tokio::test]
+    async fn retired_download_cannot_create_editable_checkout() {
+        let home = tempdir().unwrap();
+        let generation = RemotePluginBundleSyncGeneration::capture(home.path()).unwrap();
+        crate::remote::reset_authority::retire_remote_plugin_bundle_sync(home.path())
+            .unwrap()
+            .wait_until(tokio::time::Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap();
+        let destination = home.path().join("checkout");
+        let bytes = tar_gz_bytes(&[(
+            ".codex-plugin/plugin.json",
+            br#"{"name":"linear","version":"1.2.3"}"#,
+            0o644,
+        )]);
+        let Err(error) = extract_downloaded_remote_plugin_bundle(
+            valid_remote_plugin_bundle(),
+            bytes,
+            AbsolutePathBuf::try_from(destination.clone()).unwrap(),
+            &generation,
+        )
+        .await
+        else {
+            panic!("retired download created a checkout")
+        };
+        assert!(matches!(error, RemotePluginBundleInstallError::Io { .. }));
+        assert!(!destination.exists());
+    }
+
+    #[tokio::test]
+    async fn actual_checkout_extraction_retains_lease_for_metadata_handoff() {
+        let home = tempdir().unwrap();
+        let generation = RemotePluginBundleSyncGeneration::capture(home.path()).unwrap();
+        let destination = home.path().join("checkout");
+        let bytes = tar_gz_bytes(&[(
+            ".codex-plugin/plugin.json",
+            br#"{"name":"linear","version":"1.2.3"}"#,
+            0o644,
+        )]);
+        let (path, publication_lease) = extract_downloaded_remote_plugin_bundle(
+            valid_remote_plugin_bundle(),
+            bytes,
+            AbsolutePathBuf::try_from(destination.clone()).unwrap(),
+            &generation,
+        )
+        .await
+        .unwrap();
+        assert_eq!(path.as_path(), destination.as_path());
+        assert!(destination.join(".codex-plugin/plugin.json").is_file());
+        let mut retirement = Box::pin(
+            crate::remote::reset_authority::retire_remote_plugin_bundle_sync(home.path())
+                .unwrap()
+                .wait_until(tokio::time::Instant::now() + Duration::from_secs(1)),
+        );
+        assert!(futures::poll!(retirement.as_mut()).is_pending());
+        drop(publication_lease);
+        retirement.await.unwrap();
+    }
+
     fn valid_remote_plugin_bundle() -> ValidatedRemotePluginBundle {
         validate_remote_plugin_bundle(
             REMOTE_PLUGIN_ID,
@@ -1215,3 +1278,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "remote_bundle_runtime_auth_tests.rs"]
+mod runtime_auth_tests;

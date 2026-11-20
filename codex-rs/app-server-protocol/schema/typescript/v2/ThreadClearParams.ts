@@ -6,14 +6,12 @@ import type { ThreadClearModelSettings } from "./ThreadClearModelSettings";
 /**
  * Parameters for the server-owned clear-and-replace operation.
  */
-export type ThreadClearParams = {
-/**
+export type ThreadClearParams = {/**
  * The predecessor currently displayed by the requesting connection.
  */
-threadId: string,
-/**
+threadId: string, /**
  * Required for successful clear: model settings resolved for a fresh session.
  * Missing or null input is decoded so the server can preserve authority checks,
  * then refused before creating a durable clear transition.
  */
-modelSettings: ThreadClearModelSettings, };
+modelSettings: ThreadClearModelSettings};

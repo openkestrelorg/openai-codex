@@ -44,6 +44,12 @@ macro_rules! skip_if_mxc_unavailable {
 
 #[ctor]
 pub static TEST_BINARY_DISPATCH_GUARD: Option<TestBinaryDispatchGuard> = {
+    // Helpers run inside this constructor, before Rust's runtime ignores SIGPIPE.
+    // Match normal main startup so closed cleanup pipes report BrokenPipe.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+    }
     let guard = configure_test_binary_dispatch("codex-exec-server-tests", |exe_name, argv1| {
         if argv1 == Some(CODEX_ARG0_EXEC_HELPER_ARG1) {
             return TestBinaryDispatchMode::DispatchArg0Only;
@@ -214,7 +220,7 @@ fn maybe_run_exec_server_from_test_binary(guard: Option<&TestBinaryDispatchGuard
             std::process::exit(1);
         }
     };
-    let runtime_paths = match ExecServerRuntimeOptions::new(
+    let mut runtime_paths = match ExecServerRuntimeOptions::new(
         current_exe.clone(),
         linux_sandbox_exe(guard, &current_exe),
     ) {
@@ -224,6 +230,14 @@ fn maybe_run_exec_server_from_test_binary(guard: Option<&TestBinaryDispatchGuard
             std::process::exit(1);
         }
     };
+    runtime_paths.prefer_mxc = env::var("CODEX_EXEC_SERVER_TEST_PREFER_MXC")
+        .ok()
+        .map(|value| {
+            value.parse().unwrap_or_else(|error| {
+                eprintln!("invalid test MXC preference: {error}");
+                std::process::exit(1);
+            })
+        });
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

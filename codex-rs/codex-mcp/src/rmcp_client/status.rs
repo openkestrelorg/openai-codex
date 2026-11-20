@@ -15,7 +15,7 @@ impl AsyncManagedClient {
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if state.reconnect_in_flight {
+            if state.reconnect_in_flight.is_some() {
                 return Status::Starting;
             }
             state
@@ -38,9 +38,11 @@ impl AsyncManagedClient {
             Some(Err(error)) if error.is_authentication_required() => {
                 Status::AuthenticationRequired
             }
-            Some(Err(StartupOutcomeError::Failed { .. })) => Status::Failed,
+            Some(Err(StartupOutcomeError::Failed { .. } | StartupOutcomeError::Refused(_))) => {
+                Status::Failed
+            }
             Some(Err(StartupOutcomeError::Cancelled)) => Status::Cancelled,
-            Some(Err(StartupOutcomeError::Refused(_))) | None => Status::Starting,
+            None => Status::Starting,
         }
     }
 }

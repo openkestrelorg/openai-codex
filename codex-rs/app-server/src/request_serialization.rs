@@ -15,6 +15,7 @@ use tokio::sync::Notify;
 use tracing::Instrument;
 
 use crate::connection_rpc_gate::ConnectionRpcGate;
+use crate::connection_rpc_gate::RpcTicket;
 use crate::outgoing_message::ConnectionId;
 
 type BoxFutureUnit = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
@@ -110,7 +111,7 @@ impl RequestSerializationQueueKey {
 }
 
 pub(crate) struct QueuedInitializedRequest {
-    gate: Option<Arc<ConnectionRpcGate>>,
+    gate: Option<(Arc<ConnectionRpcGate>, RpcTicket)>,
     future: BoxFutureUnit,
 }
 
@@ -119,9 +120,28 @@ impl QueuedInitializedRequest {
         gate: Arc<ConnectionRpcGate>,
         future: impl Future<Output = ()> + Send + 'static,
     ) -> Self {
+        let ticket = ConnectionRpcGate::ticket(&gate);
         Self {
-            gate: Some(gate),
+            gate: Some((gate, ticket)),
             future: Box::pin(future),
+        }
+    }
+
+    /// The explicit error reply sent if this request is never admitted.
+    pub(crate) fn with_refusal(
+        mut self,
+        refusal: impl Future<Output = bool> + Send + 'static,
+    ) -> Self {
+        if let Some((_, ticket)) = self.gate.as_mut() {
+            ticket.with_refusal(refusal);
+        }
+        self
+    }
+
+    /// Settle a request that will never start: refuse it explicitly.
+    async fn refuse(self) {
+        if let Some((_, ticket)) = self.gate {
+            ticket.refuse().await;
         }
     }
 
@@ -135,7 +155,7 @@ impl QueuedInitializedRequest {
     pub(crate) async fn run(self) {
         let Self { gate, future } = self;
         match gate {
-            Some(gate) => gate.run(future).await,
+            Some((gate, ticket)) => gate.run_admitted(ticket, future).await,
             None => future.await,
         }
     }
@@ -171,20 +191,29 @@ impl RequestSerializationQueues {
     }
 
     /// Release requests whose connection closed while they waited in a queue.
+    /// Each released request is refused explicitly, never dropped silently.
     pub(crate) async fn discard_closed(&self) {
-        let mut queues = self.inner.lock().await;
-        for queue in queues.values_mut() {
-            let previous_len = queue.requests.len();
-            queue.requests.retain(|request| {
-                !request
-                    .request
-                    .gate
-                    .as_ref()
-                    .is_some_and(|gate| gate.is_closed())
-            });
-            if queue.requests.len() != previous_len {
-                queue.changed.notify_one();
+        let mut released = Vec::new();
+        {
+            let mut queues = self.inner.lock().await;
+            for queue in queues.values_mut() {
+                let (closed, open): (VecDeque<_>, VecDeque<_>) =
+                    queue.requests.drain(..).partition(|request| {
+                        request
+                            .request
+                            .gate
+                            .as_ref()
+                            .is_some_and(|(gate, _)| gate.is_closed())
+                    });
+                queue.requests = open;
+                if !closed.is_empty() {
+                    queue.changed.notify_one();
+                    released.extend(closed);
+                }
             }
+        }
+        for request in released {
+            request.request.refuse().await;
         }
     }
 
@@ -201,6 +230,23 @@ impl RequestSerializationQueues {
             QueuedInitializedRequest::new_background(future),
         )
         .await;
+    }
+
+    /// Observe actual completion, not merely admission to the background queue.
+    /// A discarded or panicked original closes the receipt and is not success.
+    pub(crate) async fn enqueue_background_and_wait(
+        &self,
+        key: RequestSerializationQueueKey,
+        access: RequestSerializationAccess,
+        future: impl Future<Output = ()> + Send + 'static,
+    ) -> Result<(), tokio::sync::oneshot::error::RecvError> {
+        let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
+        self.enqueue_background(key, access, async move {
+            future.await;
+            let _ = completed_tx.send(());
+        })
+        .await;
+        completed_rx.await
     }
 
     pub(crate) async fn enqueue(
@@ -333,6 +379,57 @@ mod tests {
     use tokio::sync::oneshot;
     use tokio::time::Duration;
     use tokio::time::timeout;
+
+    #[tokio::test]
+    async fn background_completion_receipt_waits_for_the_actual_queued_body() {
+        let queues = RequestSerializationQueues::default();
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let waiter = tokio::spawn(async move {
+            queues
+                .enqueue_background_and_wait(
+                    RequestSerializationQueueKey::Global("completion-receipt"),
+                    RequestSerializationAccess::Exclusive,
+                    async move {
+                        entered_tx.send(()).unwrap();
+                        release_rx.await.unwrap();
+                    },
+                )
+                .await
+        });
+        timeout(queue_drain_timeout(), entered_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!waiter.is_finished(), "enqueue is not execution completion");
+        release_tx.send(()).unwrap();
+        timeout(queue_drain_timeout(), waiter)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn background_completion_receipt_refuses_a_panicked_original() {
+        let queues = RequestSerializationQueues::default();
+        let result = timeout(
+            queue_drain_timeout(),
+            queues.enqueue_background_and_wait(
+                RequestSerializationQueueKey::Global("panicked-completion-receipt"),
+                RequestSerializationAccess::Exclusive,
+                async {
+                    panic!("deliberate queued body failure");
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(
+            result.is_err(),
+            "a dropped completion sender is not a clean join"
+        );
+    }
 
     const FIRST_REQUEST_VALUE: i32 = 1;
     const SECOND_REQUEST_VALUE: i32 = 2;
@@ -788,7 +885,7 @@ mod tests {
                 FIRST_REQUEST_VALUE,
                 ClientRequest::HooksList {
                     request_id: RequestId::Integer(i64::from(FIRST_REQUEST_VALUE)),
-                    params: HooksListParams { cwds: Vec::new() },
+                    params: HooksListParams::default(),
                 },
             ),
             (

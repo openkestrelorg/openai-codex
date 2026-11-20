@@ -76,6 +76,29 @@ impl CommandExecRequestProcessor {
             .map(|response| Some(response.into()))
     }
 
+    /// Server retirement: tightens the sandbox cleanup deadline of every
+    /// command/exec launch (see `CommandExecManager::retire_sandbox_cleanup`).
+    pub(crate) fn retire_sandbox_cleanup(&self, deadline: Option<std::time::Instant>) {
+        self.command_exec_manager.retire_sandbox_cleanup(deadline);
+    }
+
+    /// The retirement scope's latched cleanup deadline.
+    #[cfg(test)]
+    pub(crate) fn sandbox_cleanup_deadline(&self) -> Option<std::time::Instant> {
+        self.command_exec_manager.sandbox_cleanup_deadline()
+    }
+
+    /// Server-shutdown census of command/exec sandbox cleanup (see
+    /// `CommandExecManager::sandbox_cleanup_shutdown_until`).
+    pub(crate) async fn sandbox_cleanup_shutdown_until(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> crate::command_exec::CommandExecSandboxShutdown {
+        self.command_exec_manager
+            .sandbox_cleanup_shutdown_until(deadline)
+            .await
+    }
+
     pub(crate) async fn connection_closed(&self, connection_id: ConnectionId) {
         self.command_exec_manager
             .connection_closed(connection_id)
@@ -168,7 +191,7 @@ impl CommandExecRequestProcessor {
             }
         }
         env.retain(|name, _| !is_non_inheritable_env_var(name));
-        inject_apply_patch_env(&mut env, &self.config.features);
+        inject_apply_patch_env(&mut env);
         let timeout_ms = match timeout_ms {
             Some(timeout_ms) => match u64::try_from(timeout_ms) {
                 Ok(timeout_ms) => Some(timeout_ms),
@@ -324,6 +347,7 @@ impl CommandExecRequestProcessor {
             self.config.effective_local_windows_sandbox_type(),
             use_legacy_landlock,
         )
+        .await
         .map_err(|err| internal_error(format!("exec failed: {err}")))?;
         self.command_exec_manager
             .start(StartCommandExecParams {

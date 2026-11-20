@@ -20,8 +20,9 @@ impl ThreadRequestProcessor {
     pub(crate) async fn thread_clear(
         &self,
         request_id: ConnectionRequestId,
-        params: ThreadClearParams,
+        request: crate::thread_state::RetainingParams<ThreadClearParams>,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+        let crate::thread_state::RetainingParams { params, retention } = request;
         if !matches!(
             self.config.experimental_thread_store,
             ThreadStoreConfig::Local
@@ -81,10 +82,25 @@ impl ThreadRequestProcessor {
             ));
         }
 
-        self.thread_state_manager
-            .reserve_clear_transition_authority(predecessor_thread_id, request_id.connection_id)
+        // Custody of the exact reservation, armed with it atomically. Release
+        // happens only below, after `thread_clear_authorized` has returned:
+        // every awaited step (hook children, DB writes) has then returned, so
+        // that join is the proof. `begin_work` is the stage marker: a future
+        // dropped after it retains the reservation as unproven; before it no
+        // clear work exists (see `ClearTransitionAuthorityGuard`). While held,
+        // predecessor idle retirement is disarmed and refused Busy; release
+        // re-arms it.
+        let mut authority = self
+            .thread_state_manager
+            .reserve_clear_transition_authority_guarded(
+                predecessor_thread_id,
+                request_id.connection_id,
+            )
             .await
             .map_err(clear_authority_error)?;
+        // The first clear work (the durable transition reservation) starts in
+        // `thread_clear_authorized`; record the stage before it can begin.
+        authority.begin_work();
         let result = self
             .thread_clear_authorized(
                 request_id.connection_id,
@@ -92,11 +108,10 @@ impl ThreadRequestProcessor {
                 predecessor,
                 params.model_settings,
                 state_db,
+                retention,
             )
             .await;
-        self.thread_state_manager
-            .release_clear_transition_authority(predecessor_thread_id)
-            .await;
+        authority.release().await;
         result.map(|response| Some(response.into()))
     }
 
@@ -273,6 +288,7 @@ impl ThreadRequestProcessor {
         predecessor: Arc<CodexThread>,
         model_settings: Option<ThreadClearModelSettings>,
         state_db: StateDbHandle,
+        retention: crate::thread_state::ConnectionRetention,
     ) -> Result<ThreadClearResponse, JSONRPCErrorError> {
         let model_settings = model_settings
             .ok_or_else(|| invalid_request("thread/clear requires resolved modelSettings"))?;
@@ -323,7 +339,14 @@ impl ThreadRequestProcessor {
                 StartThreadOptions {
                     initial_history: InitialHistory::Cleared,
                     thread_source: predecessor_snapshot.thread_source.clone(),
-                    environments: Some(predecessor_snapshot.environment_selections().to_vec()),
+                    environments: Some(
+                        predecessor_snapshot
+                            .environment_selections()
+                            .iter()
+                            .cloned()
+                            .map(codex_protocol::protocol::TurnEnvironmentSelection::into_request)
+                            .collect(),
+                    ),
                     ..StartThreadOptions::new(config, self.control_endpoint.clone())
                 },
                 predecessor_thread_id,
@@ -472,22 +495,45 @@ impl ThreadRequestProcessor {
             .thread_state_manager
             .thread_state(successor_thread_id)
             .await;
-        self.ensure_listener_task_running(
-            successor_thread_id,
-            successor.thread.clone(),
-            successor_thread_state,
-        )
-        .await?;
-        advance_phase(
-            state_db.as_ref(),
-            transition_id,
-            ClearTransitionPhase::EvidenceClaimed,
-            ClearTransitionPhase::Completed,
-        )
-        .await?;
+        // Requested retention for B is installed before B's listener exists,
+        // so no idle-retirement claim on B can precede it.
+        let retained = self
+            .thread_state_manager
+            .grant_connection_retention(successor_thread_id, connection_id, retention)
+            .await;
+        let started = self
+            .ensure_clear_successor_listener_running(
+                predecessor_thread_id,
+                successor_thread_id,
+                successor.thread.clone(),
+                successor_thread_state,
+            )
+            .await;
+        let completed = match started {
+            Ok(()) => {
+                advance_phase(
+                    state_db.as_ref(),
+                    transition_id,
+                    ClearTransitionPhase::EvidenceClaimed,
+                    ClearTransitionPhase::Completed,
+                )
+                .await
+            }
+            Err(error) => Err(error),
+        };
+        if let Err(error) = completed {
+            // The requester never learns of this grant; do not keep it.
+            self.release_minted_retention(successor_thread_id, &retained)
+                .await;
+            return Err(error);
+        }
         let moved = self
             .thread_state_manager
-            .move_connection_for_clear(predecessor_thread_id, successor_thread_id, connection_id)
+            .try_move_connection_for_clear(
+                predecessor_thread_id,
+                successor_thread_id,
+                connection_id,
+            )
             .await;
         // Completed is the explicit durable terminal disposition that owns
         // release of B's reservation. Do not couple it to the request scope:
@@ -498,16 +544,36 @@ impl ThreadRequestProcessor {
                 successor_thread_id,
             )
             .await;
-        if !moved {
-            // Completion is durable already. A connection close may win the
-            // race after commit; it must not turn a completed transition into
-            // a contradictory client error or manufacture a subscription for a
-            // client that is no longer present.
-            warn!(
-                transition_id = %transition_id,
-                "clear requester disconnected after durable completion; no subscription move was published"
-            );
+        // Completion is durable already. A refused move must not turn a
+        // completed transition into a contradictory client error or
+        // manufacture a subscription. Report the actual refusal: only a
+        // connection absent from the live table is evidence of disconnect.
+        match moved {
+            Ok(()) => {}
+            Err(crate::thread_state::ClearSubscriptionMoveRefusal::ConnectionClosed) => {
+                warn!(
+                    transition_id = %transition_id,
+                    "clear requester disconnected after durable completion; no subscription move was published"
+                );
+            }
+            Err(refusal) => {
+                warn!(
+                    transition_id = %transition_id,
+                    ?refusal,
+                    "clear subscription move failed after durable completion (requester still connected); no subscription move was published"
+                );
+            }
         }
+        let moved = moved.is_ok();
+        // Without the move the requester cannot unsubscribe from B, so it
+        // must not hold B's grant either. A closed connection already lost it.
+        let retained = if moved {
+            retained
+        } else {
+            self.release_minted_retention(successor_thread_id, &retained)
+                .await;
+            retention.unavailable()
+        };
 
         self.outgoing
             .send_server_notification(ServerNotification::ThreadStarted(
@@ -523,6 +589,7 @@ impl ThreadRequestProcessor {
             transition_id: transition_id.to_string(),
             predecessor_thread_id: predecessor_thread_id.to_string(),
             successor_thread: successor_api,
+            retention: retained.evidence(),
         })
     }
 }

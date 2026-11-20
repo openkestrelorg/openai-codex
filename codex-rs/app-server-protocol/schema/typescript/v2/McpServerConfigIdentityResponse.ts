@@ -6,9 +6,11 @@ import type { McpServerConfigIdentity } from "./McpServerConfigIdentity";
 /**
  * Paired MCP configuration identities for diagnostic comparison.
  *
- * `applied` is every selected user configuration layer accepted by the
- * running server's most recent successful startup or strict MCP reload.
- * `current` is freshly read from every selected user configuration layer when
- * this method runs.
+ * `applied` identifies the selected user layers accepted at startup or by the
+ * most recent complete host-owned runtime publication, only while every live
+ * runtime (including delegates) agrees. The method returns an error when that
+ * process-wide identity is unavailable or runtime publication is incomplete.
+ * `current` is freshly loaded through the server's configuration manager when
+ * this method runs; disk edits alone never advance `applied`.
  */
 export type McpServerConfigIdentityResponse = { applied: McpServerConfigIdentity, current: McpServerConfigIdentity, };

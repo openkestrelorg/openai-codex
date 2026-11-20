@@ -1,3 +1,5 @@
+pub(crate) mod cleanup_census;
+
 /*
 Module: sandboxing
 
@@ -7,6 +9,7 @@ the exec-only metadata and translates transformed sandbox commands back into
 ExecRequest for execution.
 */
 
+use self::cleanup_census::SandboxCleanupCensus;
 use crate::exec::ExecCapturePolicy;
 use crate::exec::ExecExpiration;
 use crate::exec::StdoutStream;
@@ -23,16 +26,15 @@ use codex_protocol::error::CodexErr;
 use codex_protocol::exec_output::ExecToolCallOutput;
 use codex_protocol::models::PermissionProfile;
 pub use codex_protocol::models::SandboxPermissions;
+use codex_sandboxing::CleanupDeadlineScope;
 use codex_sandboxing::SandboxExecRequest;
 use codex_sandboxing::SandboxType;
 use codex_sandboxing::WindowsSandboxFilesystemOverrides;
-use codex_sandboxing::resolve_windows_elevated_filesystem_overrides;
-use codex_sandboxing::resolve_windows_restricted_token_filesystem_overrides;
-use codex_sandboxing::windows_sandbox_uses_elevated_backend;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
 use codex_utils_string::truncate_middle_with_token_budget;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 #[derive(Debug)]
 pub(crate) struct ExecOptions {
@@ -58,6 +60,8 @@ pub struct ExecRequest {
     pub expiration: ExecExpiration,
     pub capture_policy: ExecCapturePolicy,
     pub sandbox: SandboxType,
+    pub(crate) sandbox_cleanup_scope: Option<CleanupDeadlineScope>,
+    pub(crate) sandbox_cleanup_census: Option<Arc<SandboxCleanupCensus>>,
     pub windows_sandbox_policy_cwd: PathUri,
     pub windows_sandbox_workspace_roots: Vec<AbsolutePathBuf>,
     // TODO(anp): Reconcile these backend copies with TurnEnvironment::sandbox_context
@@ -96,6 +100,8 @@ impl ExecRequest {
             env,
             exec_server_env_config: None,
             exec_server_shell_snapshot: None,
+            sandbox_cleanup_scope: None,
+            sandbox_cleanup_census: None,
             network,
             network_environment_id,
             expiration,
@@ -114,11 +120,12 @@ impl ExecRequest {
         }
     }
 
-    pub(crate) fn from_sandbox_exec_request(
+    pub(crate) async fn from_sandbox_exec_request(
         request: SandboxExecRequest,
         options: ExecOptions,
         windows_sandbox_workspace_roots: Vec<AbsolutePathBuf>,
     ) -> Result<Self, CodexErr> {
+        codex_exec_server::run_integrity_checks(&request).await;
         let SandboxExecRequest {
             command,
             cwd,
@@ -141,23 +148,13 @@ impl ExecRequest {
             let sandbox_policy_cwd = windows_sandbox_policy_cwd
                 .to_abs_path()
                 .map_err(|err| CodexErr::InvalidRequest(format!("invalid sandbox cwd: {err}")))?;
-            let use_windows_elevated_backend =
-                windows_sandbox_uses_elevated_backend(windows_sandbox_level);
-            if use_windows_elevated_backend {
-                resolve_windows_elevated_filesystem_overrides(
-                    sandbox,
-                    &permission_profile,
-                    &sandbox_policy_cwd,
-                    use_windows_elevated_backend,
-                )
-            } else {
-                resolve_windows_restricted_token_filesystem_overrides(
-                    sandbox,
-                    &permission_profile,
-                    &sandbox_policy_cwd,
-                    windows_sandbox_level,
-                )
-            }
+            WindowsSandboxFilesystemOverrides::resolve(
+                sandbox,
+                &permission_profile,
+                &sandbox_policy_cwd,
+                windows_sandbox_level,
+                &env,
+            )
             .map_err(|error| {
                 CodexErr::UnsupportedOperation(
                     truncate_middle_with_token_budget(&error, /*max_tokens*/ 900).0,
@@ -183,6 +180,8 @@ impl ExecRequest {
             env,
             exec_server_env_config: None,
             exec_server_shell_snapshot: None,
+            sandbox_cleanup_scope: None,
+            sandbox_cleanup_census: None,
             network,
             network_environment_id,
             expiration,

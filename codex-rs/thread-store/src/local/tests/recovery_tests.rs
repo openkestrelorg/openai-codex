@@ -22,6 +22,7 @@ async fn sealed_writer_clones_cannot_mutate_or_discard_a_same_id_successor() {
                 }),
                 started_at_ms: Some(0),
                 completed_at_ms: 1,
+                content_token_count: None,
             }))
         };
         let mut params = create_thread_params(id);
@@ -41,16 +42,18 @@ async fn sealed_writer_clones_cannot_mutate_or_discard_a_same_id_successor() {
         } else {
             None
         };
-        let successor = LiveThread::resume(
+        let (successor, _history) = LiveThread::resume(
             store.clone(),
             mode,
             ResumeThreadParams {
+                history_revision: None,
                 thread_id: id,
                 rollout_path: path,
                 history: supplied_history,
                 include_archived: false,
                 metadata: thread_metadata(),
             },
+            None,
         )
         .await
         .unwrap();
@@ -125,16 +128,18 @@ async fn sealed_writer_applies_to_non_local_storage_without_backend_calls() {
         .await
         .unwrap();
     old.shutdown().await.unwrap();
-    let successor = LiveThread::resume(
+    let (successor, _history) = LiveThread::resume(
         store.clone(),
         ThreadHistoryMode::Legacy,
         ResumeThreadParams {
+            history_revision: None,
             thread_id: id,
             rollout_path: None,
             history: None,
             include_archived: false,
             metadata: thread_metadata(),
         },
+        None,
     )
     .await
     .unwrap();

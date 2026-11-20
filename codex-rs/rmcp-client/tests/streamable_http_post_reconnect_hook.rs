@@ -1,4 +1,4 @@
-//! Real-artifact proof for distribution Issue 17 Slice 3 (R003-R005):
+//! Source-level HTTP recovery regressions for Issue 17 (R003-R005):
 //! `RmcpClient`'s post-reconnect hook actually runs during a genuine
 //! Streamable HTTP session-expiry recovery (not a simulated call to
 //! `reinitialize_after_session_expiry`), gates the recovered connection's
@@ -12,6 +12,7 @@
 //! generic hook mechanism itself against a real spawned streamable-HTTP
 //! test server, reusing the same harness as the existing session-expiry
 //! coverage in `streamable_http_recovery.rs`.
+//! These fixtures do not establish immutable production-pair qualification.
 
 mod streamable_http_test_support;
 
