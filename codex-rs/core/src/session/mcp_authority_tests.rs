@@ -1116,3 +1116,106 @@ async fn standalone_mcp_prepare_owns_work_during_refresh_wait_and_releases_on_ca
     assert_eq!(counts.live.load(Ordering::SeqCst), 0);
     assert!(session.mcp_refresh.is_pending());
 }
+
+#[tokio::test]
+async fn turn_plugin_projection_uses_exact_turn_work_before_refresh_waits() {
+    let (session, mut turn, counts) = fixture().await;
+    let _permit = session.mcp_refresh.acquire().await.unwrap();
+    turn.sub_id = "wrong-turn".into();
+    let mut refused = Box::pin(super::turn::required_mcp_servers_for_input(
+        &session,
+        &turn,
+        &[],
+    ));
+    assert!(matches!(
+        futures::poll!(refused.as_mut()),
+        std::task::Poll::Ready(Err(_))
+    ));
+    drop(refused);
+    assert_eq!(counts.turns.load(Ordering::SeqCst), 1);
+    assert_eq!(counts.live.load(Ordering::SeqCst), 0);
+    // The fixture's host freezes the original id; use a fresh fixture for the positive cell.
+    let (session, turn, counts) = fixture().await;
+    let _permit = session.mcp_refresh.acquire().await.unwrap();
+    let mut admitted = Box::pin(super::turn::required_mcp_servers_for_input(
+        &session,
+        &turn,
+        &[],
+    ));
+    assert!(futures::poll!(admitted.as_mut()).is_pending());
+    assert_eq!(counts.turns.load(Ordering::SeqCst), 1);
+    assert!(counts.live.load(Ordering::SeqCst) > 0);
+    drop(admitted);
+    assert_eq!(counts.live.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn mcp_refresh_worker_retries_admission_without_retaining_session_or_work() {
+    #[derive(Debug)]
+    struct WorkerHost {
+        counts: Arc<Counts>,
+        calls: Arc<AtomicUsize>,
+        waiting: Arc<tokio::sync::Notify>,
+        reopen: Arc<tokio::sync::Notify>,
+    }
+    impl TurnStartAdmission for WorkerHost {
+        fn requires_account_work(&self) -> bool {
+            true
+        }
+        fn admit_turn_start(&self) -> Option<Box<dyn Send>> {
+            panic!("prewarm must not admit a turn")
+        }
+        fn admit_operation_work(
+            &self,
+        ) -> Result<Option<Box<dyn HostOperationWork>>, TurnWorkRefused> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.waiting.notify_one();
+                let reopen = Arc::clone(&self.reopen);
+                Err(TurnWorkRefused::RetryAfter(Box::pin(async move {
+                    reopen.notified().await
+                })))
+            } else {
+                Ok(Some(Box::new(Work::new(&self.counts))))
+            }
+        }
+    }
+    let (mut session, _) = crate::session::tests::make_session_and_context().await;
+    assert!(session.mcp_prewarm_task.lock().unwrap().is_none());
+    let counts = Arc::new(Counts::default());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let waiting = Arc::new(tokio::sync::Notify::new());
+    let reopen = Arc::new(tokio::sync::Notify::new());
+    session.services.host_admission = Some(Arc::new(WorkerHost {
+        counts: Arc::clone(&counts),
+        calls: Arc::clone(&calls),
+        waiting: Arc::clone(&waiting),
+        reopen: Arc::clone(&reopen),
+    }));
+    let session = Arc::new(session);
+    session.mark_mcp_runtime_dirty(McpRefreshReason::ExplicitInvalidation);
+    let permit = session.mcp_refresh.acquire().await.unwrap();
+    let (requests, receiver) = async_channel::bounded(1);
+    let (_auth_sender, auth_receiver) = tokio::sync::watch::channel(0);
+    session.start_mcp_prewarm_worker(receiver, auth_receiver);
+    requests.send(()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(1), waiting.notified())
+        .await
+        .unwrap();
+    assert_eq!(counts.live.load(Ordering::SeqCst), 0);
+    assert_eq!(Arc::strong_count(&session), 1);
+    reopen.notify_one();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while counts.live.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        session.stop_mcp_prewarm_worker().await,
+        SessionLoopOutcome::Normal
+    );
+    assert_eq!(counts.live.load(Ordering::SeqCst), 0);
+    drop(permit);
+}

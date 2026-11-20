@@ -1160,7 +1160,7 @@ pub(crate) fn turn_user_input(input: &[TurnInput]) -> Vec<UserInput> {
         .collect()
 }
 
-async fn required_mcp_servers_for_input(
+pub(super) async fn required_mcp_servers_for_input(
     sess: &Arc<Session>,
     turn_context: &TurnContext,
     user_input: &[UserInput],
