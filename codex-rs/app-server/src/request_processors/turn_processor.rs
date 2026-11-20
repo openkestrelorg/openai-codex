@@ -839,14 +839,18 @@ impl TurnRequestProcessor {
         if turn_has_input && started {
             let config_snapshot = thread.config_snapshot().await;
             if config_snapshot.is_primary_environment_configured() {
-                codex_memories_write::start_memories_startup_task(
-                    Arc::clone(&self.thread_manager),
-                    thread_id,
-                    Arc::clone(&thread),
-                    thread.config().await,
-                    config_snapshot.permission_profile,
-                    &config_snapshot.session_source,
-                );
+                match self.thread_manager.capture_request_operation_work() {
+                    Ok(work) => codex_memories_write::start_memories_startup_task(
+                        Arc::clone(&self.thread_manager),
+                        thread_id,
+                        Arc::clone(&thread),
+                        thread.config().await,
+                        config_snapshot.permission_profile,
+                        &config_snapshot.session_source,
+                        work,
+                    ),
+                    Err(_) => tracing::warn!("memory startup account work unavailable; skipping"),
+                }
             }
         }
 

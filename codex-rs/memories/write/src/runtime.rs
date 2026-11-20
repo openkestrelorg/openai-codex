@@ -14,6 +14,7 @@ use codex_core::config::Config;
 use codex_core::content_items_to_text;
 use codex_core::detached_memory_responses_metadata;
 use codex_core::resolve_installation_id;
+use codex_extension_api::HostOperationWork;
 use codex_features::Feature;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
@@ -84,6 +85,7 @@ pub(crate) struct MemoryStartupContext {
     thread_manager: Arc<ThreadManager>,
     auth_manager: Arc<AuthManager>,
     provider: SharedModelProvider,
+    account_work: Option<Arc<dyn HostOperationWork>>,
     session_telemetry: SessionTelemetry,
 }
 
@@ -150,9 +152,10 @@ impl MemoryStartupContext {
         thread: Arc<CodexThread>,
         config: &Config,
         source: SessionSource,
+        account_work: Option<Arc<dyn HostOperationWork>>,
     ) -> Self {
         let provider = auth.model_provider(config.model_provider.clone());
-        Self::new_with_provider(
+        let mut context = Self::new_with_provider(
             thread_manager,
             Arc::clone(&auth.credentials),
             thread_id,
@@ -160,7 +163,9 @@ impl MemoryStartupContext {
             config,
             source,
             provider,
-        )
+        );
+        context.account_work = account_work;
+        context
     }
 
     #[cfg(test)]
@@ -210,6 +215,7 @@ impl MemoryStartupContext {
             thread_manager,
             auth_manager,
             provider,
+            account_work: None,
             session_telemetry,
         }
     }
@@ -412,6 +418,14 @@ impl MemoryStartupContext {
         } = self
             .thread_manager
             .start_thread(StartThreadOptions {
+                account_work: self
+                    .account_work
+                    .as_ref()
+                    .map(|work| work.derive_operation())
+                    .transpose()
+                    .map_err(|_| {
+                        anyhow::anyhow!("memory child construction account work unavailable")
+                    })?,
                 session_source: Some(SessionSource::Internal(
                     InternalSessionSource::MemoryConsolidation,
                 )),
@@ -430,16 +444,20 @@ impl MemoryStartupContext {
         });
 
         let agent = SpawnedConsolidationAgent { thread_id, thread };
-        let submit_result = match agent
-            .thread
-            .start_turn_if_idle(
-                TurnInputRequest::user_input(prompt).on_start(TurnStartOptions {
-                    turn_trigger: Some("memory_consolidation".to_owned()),
-                    ..Default::default()
-                }),
-            )
-            .await
-        {
+        let request = TurnInputRequest::user_input(prompt).on_start(TurnStartOptions {
+            turn_trigger: Some("memory_consolidation".to_owned()),
+            ..Default::default()
+        });
+        let submission = match self.account_work.as_deref() {
+            Some(work) => {
+                agent
+                    .thread
+                    .start_turn_if_idle_from_operation(request, work)
+                    .await
+            }
+            None => agent.thread.start_turn_if_idle(request).await,
+        };
+        let submit_result = match submission {
             Ok(StartIfIdleSubmission::Started { .. }) => Ok(()),
             Ok(submission) => Err(anyhow::anyhow!(
                 "memory consolidation input was not started: {submission:?}"
@@ -463,14 +481,28 @@ impl MemoryStartupContext {
         agent: SpawnedConsolidationAgent,
     ) -> anyhow::Result<()> {
         let SpawnedConsolidationAgent { thread_id, thread } = agent;
-        tokio::time::timeout(Duration::from_secs(10), thread.shutdown_and_wait())
-            .await
-            .map_err(|_| {
-                anyhow::anyhow!("memory consolidation agent {thread_id} shutdown timed out")
-            })??;
-
-        self.thread_manager.remove_thread(&thread_id).await;
-
+        let shutdown = thread.shutdown_and_wait_with_cleanup();
+        tokio::pin!(shutdown);
+        let (report, timed_out) =
+            match tokio::time::timeout(Duration::from_secs(10), &mut shutdown).await {
+                Ok(report) => (report, false),
+                // Retain this operation and the exact cleanup observation after its
+                // budget expires; timeout is not proof that the writer stopped.
+                Err(_) => (shutdown.await, true),
+            };
+        if report.is_complete() {
+            self.thread_manager
+                .remove_thread_if_same(&thread_id, &thread)
+                .await;
+        }
+        anyhow::ensure!(
+            !timed_out,
+            "memory consolidation agent {thread_id} shutdown timed out"
+        );
+        anyhow::ensure!(
+            report.is_complete(),
+            "memory consolidation agent {thread_id} retirement incomplete: {report:?}"
+        );
         Ok(())
     }
 }

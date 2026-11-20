@@ -66,6 +66,60 @@ use tokio::time::Instant;
 mod dual_write;
 
 #[tokio::test]
+async fn refused_operation_work_skips_each_memory_version_before_spawning() -> anyhow::Result<()> {
+    use codex_extension_api::HostOperationWork;
+    use codex_extension_api::TurnWorkRefused;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+
+    #[derive(Debug)]
+    struct RefusedWork(Arc<AtomicUsize>);
+    impl HostOperationWork for RefusedWork {
+        fn derive_operation(&self) -> Result<Box<dyn HostOperationWork>, TurnWorkRefused> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Err(TurnWorkRefused::Unavailable)
+        }
+        fn derive_turn_work(
+            &self,
+            _store: &codex_extension_api::ExtensionData,
+            _termination: codex_extension_api::ExtensionFuture<'static, ()>,
+        ) -> Result<Box<dyn codex_protocol::host_turn_work::HostTurnWork>, TurnWorkRefused>
+        {
+            panic!("refused pipeline must not start a child turn")
+        }
+    }
+
+    let server = start_mock_server().await;
+    let home = Arc::new(TempDir::new()?);
+    let mut memories = startup_test_memories_config();
+    memories.dual_write = true;
+    memories.version = codex_protocol::MemoryVersion::V1;
+    let test = memory_test_codex(Arc::clone(&home), memories)
+        .build(&server)
+        .await?;
+    let config_snapshot = test.codex.config_snapshot().await;
+    let mut config = test.config.clone();
+    config.features.enable(Feature::MemoryTool)?;
+    let profile = config.permissions.effective_permission_profile();
+    let derivations = Arc::new(AtomicUsize::new(0));
+    start_memories_startup_task(
+        Arc::clone(&test.thread_manager),
+        test.session_configured.thread_id,
+        Arc::clone(&test.codex),
+        Arc::new(config),
+        profile,
+        &config_snapshot.session_source,
+        Some(Box::new(RefusedWork(Arc::clone(&derivations)))),
+    );
+    assert_eq!(derivations.load(Ordering::SeqCst), 2);
+    tokio::task::yield_now().await;
+    assert!(!home.path().join("memories").exists());
+    assert!(!home.path().join("memories_v2").exists());
+    shutdown_test_codex(&test).await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn memories_startup_creates_memory_root() -> anyhow::Result<()> {
     let server = start_mock_server().await;
     let home = Arc::new(TempDir::new()?);
@@ -700,6 +754,7 @@ async fn memories_startup_phase1_uses_live_thread_service_tier_and_detached_meta
         Arc::clone(&test.codex),
         &test.config,
         config_snapshot.session_source.clone(),
+        /*account_work*/ None,
     );
     let request_context = context
         .stage_one_request_context(
@@ -1236,6 +1291,7 @@ async fn trigger_memories_startup(test: &TestCodex) {
         Arc::new(config),
         parent_permission_profile,
         &config_snapshot.session_source,
+        /*account_work*/ None,
     );
 }
 
