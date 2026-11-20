@@ -406,6 +406,16 @@ enum ShutdownSignal {
     GracefulOnly,
 }
 
+/// Startup has not handed transport custody to the normal shutdown owner yet.
+/// Observe every aborted acceptor before retracting its published rendezvous.
+async fn abort_startup_transports(shutdown: &CancellationToken, handles: &mut Vec<JoinHandle<()>>) {
+    shutdown.cancel();
+    for handle in handles.drain(..) {
+        handle.abort();
+        let _ = handle.await;
+    }
+}
+
 async fn shutdown_signal() -> IoResult<ShutdownSignal> {
     #[cfg(unix)]
     {
@@ -1161,7 +1171,8 @@ pub async fn run_main_with_transport_options(
     let (remote_control_accept_handle, remote_control_handle) = match remote_control_start {
         Ok(started) => started,
         Err(error) => {
-            transport_shutdown_token.cancel();
+            abort_startup_transports(&transport_shutdown_token, &mut transport_accept_handles)
+                .await;
             if let Err(rollback_error) = managed_target_record.remove_after_startup_failure() {
                 error!(kind = ?rollback_error.kind(), "failed to remove managed target record after startup failure");
             }

@@ -157,3 +157,29 @@ fn router_classifies_dropped_replies_by_positive_close() {
     account_reply_drop(&expiry, &mut refused, ReplyDrop::Unregistered(stdio));
     assert_eq!(expiry.abandoned_output().messages, 2);
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn startup_failure_joins_transport_drop_before_return() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind startup listener");
+    let address = listener.local_addr().expect("listener address");
+    let mut handles = vec![tokio::spawn(async move {
+        let _listener = listener;
+        std::future::pending::<()>().await;
+    })];
+    assert_eq!(
+        tokio::net::TcpListener::bind(address)
+            .await
+            .expect_err("original transport still owns the port")
+            .kind(),
+        std::io::ErrorKind::AddrInUse
+    );
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    super::abort_startup_transports(&shutdown, &mut handles).await;
+    assert!(shutdown.is_cancelled());
+    assert!(handles.is_empty());
+    let _rebound = tokio::net::TcpListener::bind(address)
+        .await
+        .expect("transport is physically dropped before cleanup returns");
+}
