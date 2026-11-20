@@ -4680,6 +4680,15 @@ impl AuthManager {
         self.workload_identity_selected
     }
 
+    /// Configured host ownership remains authoritative when its credential cache is empty.
+    pub fn is_host_owned_auth(&self) -> bool {
+        self.workload_identity_selected || self.command_source.is_some()
+    }
+
+    pub fn is_command_auth_selected(&self) -> bool {
+        self.command_source.is_some()
+    }
+
     pub fn is_external_chatgpt_auth_active(&self) -> bool {
         self.auth_cached()
             .as_ref()

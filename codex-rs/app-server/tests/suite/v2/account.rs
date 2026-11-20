@@ -104,6 +104,10 @@ fn expected_workspace_routing(
 #[path = "account_enterprise_tests.rs"]
 mod enterprise_tests;
 
+#[cfg(target_os = "macos")]
+#[path = "account_command_auth_tests.rs"]
+mod command_auth_tests;
+
 // Helper to create a minimal config.toml for the app server
 #[derive(Default)]
 struct CreateConfigTomlParams {
