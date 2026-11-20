@@ -906,7 +906,7 @@ impl MessageProcessor {
             )
             .is_err()
             {
-                warn!("plugin startup account work could not be admitted");
+                tracing::warn!("plugin startup account work could not be admitted");
             }
         }
         let initialize_processor = InitializeRequestProcessor::new(
