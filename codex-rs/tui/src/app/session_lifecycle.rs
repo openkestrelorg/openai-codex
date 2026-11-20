@@ -1334,7 +1334,7 @@ impl App {
                 let (started, retention) = app_server
                     .start_clear_recovery(&local_settings, &config, predecessor)
                     .await?;
-                (started, Some(retention))
+                (started, retention)
             }
             FreshSessionIntent::Start(session_start_source) => {
                 let clear_predecessor_thread_id =

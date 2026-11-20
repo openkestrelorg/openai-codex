@@ -1241,6 +1241,7 @@ pub(super) enum HistoryCapabilities {
     RecoveryUnsupported,
     RecoveryRevisionMismatch,
     RecoveryWithoutStateDb,
+    RecoveryRetentionRefused,
     ThreadStartWhileShuttingDown,
     ThreadStartDuringLegacyShutdown,
     ConfigReadUnsupported(i64),
@@ -1575,6 +1576,17 @@ pub(super) async fn start_recording_app_server_with_realtime_speech(
                                 message: "method not found".to_string(),
                             },
                         })
+                    } else if history_capabilities == HistoryCapabilities::RecoveryRetentionRefused
+                        && request.method == "thread/retention/acquire"
+                    {
+                        JSONRPCMessage::Response(JSONRPCResponse {
+                            id: request_id,
+                            result: serde_json::to_value(
+                                codex_app_server_protocol::ThreadRetentionAcquireResponse::Refused {
+                                    reason: codex_app_server_protocol::ThreadRetentionRefusalReason::AuthorityUnavailable,
+                                },
+                            )?,
+                        })
                     } else if history_capabilities == HistoryCapabilities::RecoveryUnsupported
                         && request.method == "thread/clear/recovery/read"
                     {
@@ -1693,9 +1705,20 @@ pub(super) async fn start_recording_app_server_with_realtime_speech(
                             matches!(inventories, 2 | 4)
                         };
                         let detach = request.method == "thread/unsubscribe";
-                        let request = serde_json::from_value::<ClientRequest>(
+                        let mut request = serde_json::from_value::<ClientRequest>(
                             serde_json::to_value(request)?,
                         )?;
+                        let refuse_recovery_retention = history_capabilities
+                            == HistoryCapabilities::RecoveryRetentionRefused
+                            && matches!(&request, ClientRequest::ThreadStart { params, .. }
+                                if params.clear_recovery.is_some());
+                        if refuse_recovery_retention
+                            && let ClientRequest::ThreadStart { params, .. } = &mut request
+                        {
+                            // Emulate refusal without minting a hidden real grant.
+                            // The recorder above retains the client's original request.
+                            params.retain_for_connection = false;
+                        }
                         if let ClientRequest::ThreadList { params, .. } = &request
                             && let Some((root, started, release)) = blocked_thread_list.take()
                         {
@@ -1734,6 +1757,13 @@ pub(super) async fn start_recording_app_server_with_realtime_speech(
                                     ClientRequest::ThreadRealtimeListVoices { .. }
                                 );
                             let mut result = embedded.request(request).await?;
+                            if refuse_recovery_retention && let Ok(value) = &mut result {
+                                value["retention"] = serde_json::to_value(
+                                    codex_app_server_protocol::ThreadRetentionAcquireResponse::Refused {
+                                        reason: codex_app_server_protocol::ThreadRetentionRefusalReason::AuthorityUnavailable,
+                                    },
+                                )?;
+                            }
                             if unknown_voice && let Ok(value) = &mut result {
                                 value["config"]["realtime"]["voice"] =
                                     serde_json::json!("future_voice");

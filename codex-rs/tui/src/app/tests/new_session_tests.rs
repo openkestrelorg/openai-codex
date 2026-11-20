@@ -1605,7 +1605,7 @@ async fn recovery_selects_supported_history_on_a_fresh_connection_without_retry(
         let (started, retention) = server
             .start_clear_recovery(&app.local_settings, &app.config, Some(a))
             .await?;
-        retention.commit(); // This direct facade fixture explicitly adopts the returned thread.
+        retention.expect("adopted").commit(); // This direct facade fixture explicitly adopts the returned thread.
         assert_ne!(started.session.thread_id, a);
         let starts = recorded_params(&requests, "thread/start");
         assert_eq!(starts.len(), 1);
@@ -1737,5 +1737,145 @@ async fn recovery_checks_support_before_creation_and_never_retries_a_failed_star
         server.shutdown().await?;
         proxy.await??;
     }
+    Ok(())
+}
+
+// The warning is observed through the same event facade used by the UI. Its
+// queue is populated before recovery returns; draining ready events is enough
+// to count this synchronous warning without adding a quiet-period timer.
+fn take_ready_retention_warnings(server: &mut AppServerSession) -> Vec<String> {
+    use futures::FutureExt;
+    let mut warnings = Vec::new();
+    while let Some(Some(event)) = server.next_event().now_or_never() {
+        if let codex_app_server_client::AppServerEvent::ServerNotification(notification) =
+            event.event
+            && let codex_app_server_protocol::ServerNotification::Warning(warning) = *notification
+        {
+            warnings.push(warning.message);
+        }
+    }
+    warnings
+}
+
+#[tokio::test]
+async fn clear_recovery_facade_continues_without_retention_when_refused() -> Result<()> {
+    crate::boxed_future!(clear_recovery_facade_refusal_scenario()).await
+}
+
+async fn clear_recovery_facade_refusal_scenario() -> Result<()> {
+    let (mut app, _, _) = make_test_app_with_channels().await;
+    app.config
+        .features
+        .set_enabled(codex_features::Feature::Plugins, false)?;
+    app.cli_kv_overrides
+        .push(("features.plugins".into(), toml::Value::Boolean(false)));
+    let home = tempdir()?;
+    app.config.codex_home = home.path().to_path_buf().abs();
+    app.config.sqlite = SqliteConfig::new_for_testing(home.path().abs());
+    let (mut server, requests, proxy) = start_recording_app_server_with_history(
+        &app.config,
+        HistoryCapabilities::RecoveryRetentionRefused,
+        None,
+        None,
+        crate::app_server_session::ThreadParamsMode::Embedded,
+        LoaderOverrides::default(),
+    )
+    .await?;
+    let predecessor = ThreadId::new();
+    let (started, retention) = server
+        .start_clear_recovery(&app.local_settings, &app.config, Some(predecessor))
+        .await?;
+    assert!(retention.is_none());
+    assert_ne!(started.session.thread_id, predecessor);
+    let starts = recorded_params(&requests, "thread/start");
+    assert_eq!(starts.len(), 1);
+    assert_eq!(
+        starts[0]["clearRecovery"]["predecessorThreadId"],
+        predecessor.to_string()
+    );
+    assert_eq!(starts[0]["retainForConnection"], true);
+    assert!(recorded_params(&requests, "thread/retention/acquire").is_empty());
+    let warnings = take_ready_retention_warnings(&mut server);
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(warnings[0].contains("could not be retained"));
+    server.shutdown().await?;
+    proxy.await??;
+    assert!(recorded_params(&requests, "thread/retention/release").is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn recovery_installs_successor_with_one_warning_when_retention_is_refused() -> Result<()> {
+    crate::boxed_future!(recovery_retention_install_scenario(
+        HistoryCapabilities::RecoveryRetentionRefused,
+    ))
+    .await
+}
+
+#[tokio::test]
+async fn recovery_installs_successor_with_retention_without_warning() -> Result<()> {
+    crate::boxed_future!(recovery_retention_install_scenario(
+        HistoryCapabilities::Current
+    ))
+    .await
+}
+
+async fn recovery_retention_install_scenario(capabilities: HistoryCapabilities) -> Result<()> {
+    let (mut app, mut events, _) = make_test_app_with_channels().await;
+    app.config
+        .features
+        .set_enabled(codex_features::Feature::Plugins, false)?;
+    app.cli_kv_overrides
+        .push(("features.plugins".into(), toml::Value::Boolean(false)));
+    let home = tempdir()?;
+    app.config.codex_home = home.path().to_path_buf().abs();
+    app.config.sqlite = SqliteConfig::new_for_testing(home.path().abs());
+    let current = ThreadId::new();
+    app.enqueue_primary_thread_session(
+        test_thread_session(current, app.config.cwd.to_path_buf()),
+        Vec::new(),
+    )
+    .await?;
+    app.app_server_target = AppServerTarget::Remote {
+        endpoint: crate::resolve_remote_addr("ws://127.0.0.1:1")?,
+    };
+    app.ensure_thread_channel(current).mark_replay_only();
+    while events.try_recv().is_ok() {}
+    let (mut server, requests, proxy) = start_recording_app_server_with_history(
+        &app.config,
+        capabilities,
+        None,
+        None,
+        crate::app_server_session::ThreadParamsMode::Embedded,
+        LoaderOverrides::default(),
+    )
+    .await?;
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+    app.clear_displayed_session_boxed(&mut tui, &mut server, None, None)
+        .await;
+    let successor = app.chat_widget.thread_id().expect("successor installed");
+    assert_ne!(successor, current);
+    let starts = recorded_params(&requests, "thread/start");
+    assert_eq!(starts.len(), 1);
+    assert_eq!(
+        starts[0]["clearRecovery"],
+        serde_json::json!({
+            "contractVersion": 1, "predecessorThreadId": current.to_string(),
+        })
+    );
+    assert!(starts[0]["clearPredecessorThreadId"].is_null());
+    assert_eq!(starts[0]["retainForConnection"], true);
+    assert!(recorded_params(&requests, "thread/clear").is_empty());
+    assert!(recorded_params(&requests, "thread/retention/acquire").is_empty());
+    let warnings = take_ready_retention_warnings(&mut server);
+    if capabilities == HistoryCapabilities::RecoveryRetentionRefused {
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("could not be retained"));
+    } else {
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+    server.shutdown().await?;
+    proxy.await??;
+    assert!(recorded_params(&requests, "thread/retention/release").is_empty());
     Ok(())
 }

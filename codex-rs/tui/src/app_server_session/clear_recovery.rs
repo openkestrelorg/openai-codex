@@ -10,7 +10,7 @@ impl AppServerSession {
         local_settings: &LocalSettings,
         config: &Config,
         predecessor: Option<ThreadId>,
-    ) -> Result<(AppServerStartedThread, retention::PendingRetention)> {
+    ) -> Result<(AppServerStartedThread, Option<retention::PendingRetention>)> {
         // Use one connection-bound handle, never a cached capability across reconnect.
         let handle = self.request_handle();
         let support: ThreadClearRecoveryReadResponse = handle.request_typed(
@@ -66,14 +66,21 @@ impl AppServerSession {
                 "Clear recovery outcome is unknown: server omitted or changed accepted context; do not automatically retry"
             );
         }
-        let retention = self
+        let retention = match self
             .retention
             .adopt_thread(
                 handle,
                 response.thread.id.clone(),
                 response.retention.clone(),
             )
-            .await?;
+            .await
+        {
+            Ok(retention) => Some(retention),
+            Err(error) => {
+                self.retention.warn_adoption(&response.thread.id, &error);
+                None
+            }
+        };
         let mut started = started_thread_from_start_response(
             response,
             local_settings,
