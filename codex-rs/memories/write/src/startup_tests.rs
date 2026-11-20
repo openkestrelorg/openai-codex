@@ -1870,3 +1870,93 @@ async fn memories_startup_uses_thread_runtime_and_keeps_custom_destinations_inde
     server.verify().await;
     Ok(())
 }
+
+#[tokio::test]
+async fn refused_memory_child_turn_retires_the_exact_constructed_thread() -> anyhow::Result<()> {
+    use codex_extension_api::HostOperationWork;
+    use codex_extension_api::TurnWorkRefused;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+
+    #[derive(Debug)]
+    struct Work {
+        constructions: Arc<AtomicUsize>,
+        turns: Arc<AtomicUsize>,
+    }
+    impl HostOperationWork for Work {
+        fn derive_operation(&self) -> Result<Box<dyn HostOperationWork>, TurnWorkRefused> {
+            self.constructions.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(Self {
+                constructions: Arc::clone(&self.constructions),
+                turns: Arc::clone(&self.turns),
+            }))
+        }
+        fn derive_turn_work(
+            &self,
+            _store: &codex_extension_api::ExtensionData,
+            _termination: codex_extension_api::ExtensionFuture<'static, ()>,
+        ) -> Result<Box<dyn codex_protocol::host_turn_work::HostTurnWork>, TurnWorkRefused>
+        {
+            self.turns.fetch_add(1, Ordering::SeqCst);
+            Err(TurnWorkRefused::Unavailable)
+        }
+    }
+    let server = start_mock_server().await;
+    let home = Arc::new(TempDir::new()?);
+    let test = build_test_codex(&server, Arc::clone(&home)).await?;
+    let before = test
+        .thread_manager
+        .list_thread_ids()
+        .await
+        .into_iter()
+        .collect::<std::collections::HashSet<_>>();
+    let constructions = Arc::new(AtomicUsize::new(0));
+    let turns = Arc::new(AtomicUsize::new(0));
+    let context = MemoryStartupContext::new(
+        Arc::clone(&test.thread_manager),
+        test.codex
+            .thread_extension_data()
+            .get::<codex_model_provider::ProviderAuthContext>()
+            .unwrap(),
+        test.session_configured.thread_id,
+        Arc::clone(&test.codex),
+        &test.config,
+        test.codex.config_snapshot().await.session_source,
+        Some(Arc::new(Work {
+            constructions: Arc::clone(&constructions),
+            turns: Arc::clone(&turns),
+        })),
+    );
+    let root = home.path().join("memory-refusal-workspace");
+    std::fs::create_dir(&root)?;
+    let workspace = Arc::new(crate::MemoryWorkspaceLock::try_acquire(&root)?);
+    let result = context
+        .spawn_consolidation_agent(test.config.clone(), vec![], workspace)
+        .await;
+    assert!(
+        result.is_err(),
+        "refused turn must not become ordinary fresh submission"
+    );
+    assert_eq!(constructions.load(Ordering::SeqCst), 1);
+    assert_eq!(turns.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        test.thread_manager
+            .list_thread_ids()
+            .await
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>(),
+        before
+    );
+    // The separate writer-lock owner must also observe termination before release.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if crate::MemoryWorkspaceLock::try_acquire(&root).is_ok() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    shutdown_test_codex(&test).await?;
+    Ok(())
+}
