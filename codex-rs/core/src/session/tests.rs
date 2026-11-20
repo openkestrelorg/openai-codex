@@ -14060,3 +14060,44 @@ async fn task_replacement_reports_refusal_when_closure_wins_during_abort() {
         crate::tasks::TaskJoinOutcome::Complete { panicked: false }
     );
 }
+
+#[tokio::test]
+async fn mcp_runtime_preserves_host_account_work_requirement() {
+    #[derive(Debug)]
+    struct Host(bool);
+    impl codex_extension_api::TurnStartAdmission for Host {
+        fn admit_turn_start(&self) -> Option<Box<dyn Send>> {
+            panic!("runtime projection must not acquire fresh turn work")
+        }
+        fn requires_account_work(&self) -> bool {
+            self.0
+        }
+    }
+    let (mut session, turn) = make_session_and_context().await;
+    let desired = session
+        .latest_mcp_desired_state(None, turn.initial_environments.clone())
+        .await;
+    for requires in [None, Some(false), Some(true)] {
+        session.services.host_admission = requires.map(|required| {
+            Arc::new(Host(required)) as Arc<dyn codex_extension_api::TurnStartAdmission>
+        });
+        let runtime = session.build_mcp_runtime_input(
+            &desired,
+            crate::mcp::McpRuntimeProjection {
+                config: (*mcp_config_for_test(&desired.config)).clone(),
+                plugins_available: false,
+                selected_plugins: Default::default(),
+            },
+            &[],
+            None,
+        );
+        assert_eq!(
+            runtime.attempt_requirement,
+            if requires == Some(true) {
+                codex_mcp::McpAttemptRequirement::Required
+            } else {
+                codex_mcp::McpAttemptRequirement::Ungated
+            },
+        );
+    }
+}

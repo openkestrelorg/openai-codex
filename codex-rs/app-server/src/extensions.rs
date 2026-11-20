@@ -631,3 +631,111 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod account_turn_lifecycle_tests {
+    use super::*;
+    use codex_extension_api::ExtensionData;
+    use codex_extension_api::TurnAbortInput;
+    use codex_extension_api::TurnStartInput;
+    use codex_extension_api::TurnStopInput;
+    use codex_protocol::host_turn_work::HostTurnWork;
+
+    #[tokio::test]
+    async fn production_registry_releases_turn_work_after_stop_and_abort() -> anyhow::Result<()> {
+        let home = tempfile::tempdir()?;
+        let config = crate::config_manager::ConfigManager::without_managed_config_for_tests(
+            home.path().to_path_buf(),
+        )
+        .load_latest_config(None)
+        .await?;
+        let registry = thread_extensions(
+            &config,
+            ThreadExtensionDependencies {
+                sample_responses: Arc::new(crate::thread_sample::SampleResponseRegistry::default()),
+                event_sink: Arc::new(codex_extension_api::NoopExtensionEventSink),
+                auth_manager: AuthManager::from_auth_for_testing(
+                    codex_login::CodexAuth::from_api_key("dummy"),
+                ),
+                state_db: None,
+                analytics_events_client: AnalyticsEventsClient::disabled(),
+                thread_manager: Weak::new(),
+                goal_service: Arc::new(GoalService::new()),
+                environment_manager: Arc::new(EnvironmentManager::default_for_tests()),
+                executor_skill_provider: Arc::new(
+                    codex_skills_extension::ExecutorSkillProvider::new_with_restriction_product(
+                        codex_protocol::protocol::SessionSource::Exec.restriction_product(),
+                    ),
+                ),
+                cloud_skill_provider: None,
+                git_attribution_base_url: config.chatgpt_base_url.clone(),
+                http_client_factory: config.http_client_factory(),
+                queue_service: None,
+                turn_start_admission: None,
+            },
+        );
+        // The production cleanup hook must be last, after other terminal callbacks.
+        let lifecycle = registry
+            .turn_lifecycle_contributors()
+            .last()
+            .expect("cleanup hook");
+        let permits = crate::account_work_permits::AccountWorkPermits::new();
+        let work = crate::account_turn_work::AccountTurnWork::default();
+        let mode = codex_protocol::config_types::CollaborationMode {
+            mode: codex_protocol::config_types::ModeKind::Default,
+            settings: codex_protocol::config_types::Settings {
+                model: "test-model".into(),
+                reasoning_effort: None,
+                developer_instructions: None,
+            },
+        };
+        for abort in [false, true] {
+            let session_store = ExtensionData::new("session");
+            let thread_store = ExtensionData::new("thread");
+            let turn_store = ExtensionData::new("turn");
+            let session = work.session(Box::pin(std::future::pending()));
+            let mut pending = session
+                .begin(permits.try_acquire().expect("permit"))
+                .expect("slot");
+            pending.bind_submission("turn");
+            Box::new(pending).retain_until_terminal();
+            thread_store.insert(session);
+            lifecycle
+                .on_turn_start(TurnStartInput {
+                    mcp_access: Ok(codex_mcp::McpAttemptAccess::Unscoped),
+                    turn_id: "turn",
+                    collaboration_mode: &mode,
+                    token_usage_at_turn_start: None,
+                    session_store: &session_store,
+                    thread_store: &thread_store,
+                    turn_store: &turn_store,
+                })
+                .await;
+            assert_eq!(permits.admitted_count(), 1);
+            if abort {
+                lifecycle
+                    .on_turn_abort(TurnAbortInput {
+                        reason: codex_protocol::protocol::TurnAbortReason::Interrupted,
+                        session_store: &session_store,
+                        thread_store: &thread_store,
+                        turn_store: &turn_store,
+                    })
+                    .await;
+            } else {
+                lifecycle
+                    .on_turn_stop(TurnStopInput {
+                        session_store: &session_store,
+                        thread_store: &thread_store,
+                        turn_store: &turn_store,
+                    })
+                    .await;
+            }
+            assert_eq!(
+                permits.admitted_count(),
+                0,
+                "terminal callback must release work while thread lives"
+            );
+        }
+        Ok(())
+    }
+}

@@ -415,7 +415,16 @@ impl Session {
         let runtime_context =
             self.mcp_runtime_context(&desired.environments, &desired.local_process_cwd);
         McpRuntimeInput {
-            attempt_requirement: codex_mcp::McpAttemptRequirement::Ungated,
+            attempt_requirement: if self
+                .services
+                .host_admission
+                .as_ref()
+                .is_some_and(|host| host.requires_account_work())
+            {
+                codex_mcp::McpAttemptRequirement::Required
+            } else {
+                codex_mcp::McpAttemptRequirement::Ungated
+            },
             startup_work: None,
             network_policy_metadata: None,
             runtime_auth: desired
