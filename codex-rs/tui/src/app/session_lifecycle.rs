@@ -35,12 +35,39 @@ pub(super) enum ThreadAttachPresentation {
     SessionLineage,
 }
 
-/// Caller intent is separate from lifecycle metadata: plan implementation
-/// keeps upstream ThreadStart(Clear), while slash-clear recovery is negotiated.
+/// Caller intent is separate from lifecycle metadata: unavailable predecessors
+/// use negotiated clear recovery rather than an ordinary clear-source start.
 #[derive(Clone, Copy)]
 enum FreshSessionIntent {
     Start(Option<ThreadStartSource>),
     ClearRecovery(Option<ThreadId>),
+}
+
+enum ClearFirstInput {
+    Message(Option<crate::chatwidget::UserMessage>),
+    ApprovedPlan(String),
+}
+
+async fn prepare_approved_plan_prompt(
+    app_server: &mut AppServerSession,
+    thread_id: ThreadId,
+    local_codex_home: &codex_utils_absolute_path::AbsolutePathBuf,
+    plan: String,
+) -> Result<String> {
+    let codex_home = app_server.codex_home_path(local_codex_home);
+    let attachment_path =
+        crate::attachment_files::write_approved_plan(app_server, codex_home.as_ref(), plan.clone())
+            .await
+            .map(|path| path.to_string())
+            .inspect_err(|err| tracing::debug!(%err, "approved plan attachment unavailable"))
+            .ok();
+    app_server
+        .thread_prepare_approved_plan(ThreadPrepareApprovedPlanParams {
+            thread_id: thread_id.to_string(),
+            markdown: plan,
+            attachment_path,
+        })
+        .await
 }
 
 pub(super) struct PreparedFreshSession {
@@ -1379,11 +1406,19 @@ impl App {
         if self.reject_pending_permission_root_switch() {
             return Ok(());
         }
-        let prepared = match self
-            .prepare_fresh_session(
+        let displayed = self.current_displayed_thread_id();
+        if displayed.is_some_and(|id| !self.thread_unavailable(id)) {
+            crate::boxed_future!(self.clear_displayed_session_with(
+                tui,
                 app_server,
-                FreshSessionIntent::Start(Some(ThreadStartSource::Clear)),
-            )
+                ClearFirstInput::ApprovedPlan(plan),
+                /*new_thread_name*/ None,
+            ))
+            .await;
+            return Ok(());
+        }
+        let prepared = match self
+            .prepare_fresh_session(app_server, FreshSessionIntent::ClearRecovery(displayed))
             .await
         {
             Ok(prepared) => prepared,
@@ -1394,22 +1429,7 @@ impl App {
             }
         };
         let thread_id = prepared.started.session.thread_id;
-        let codex_home = app_server.codex_home_path(&prepared.config.codex_home);
-        let attachment_path = crate::attachment_files::write_approved_plan(
-            app_server,
-            codex_home.as_ref(),
-            plan.clone(),
-        )
-        .await
-        .map(|path| path.to_string())
-        .inspect_err(|err| tracing::debug!(%err, "approved plan attachment unavailable"))
-        .ok();
-        match app_server
-            .thread_prepare_approved_plan(ThreadPrepareApprovedPlanParams {
-                thread_id: thread_id.to_string(),
-                markdown: plan,
-                attachment_path,
-            })
+        match prepare_approved_plan_prompt(app_server, thread_id, &prepared.config.codex_home, plan)
             .await
         {
             Ok(prompt) => {
@@ -1555,16 +1575,42 @@ impl App {
         initial_user_message: Option<crate::chatwidget::UserMessage>,
         new_thread_name: Option<String>,
     ) {
+        self.clear_displayed_session_with(
+            tui,
+            app_server,
+            ClearFirstInput::Message(initial_user_message),
+            new_thread_name,
+        )
+        .await;
+    }
+
+    async fn clear_displayed_session_with(
+        &mut self,
+        tui: &mut tui::Tui,
+        app_server: &mut AppServerSession,
+        first: ClearFirstInput,
+        new_thread_name: Option<String>,
+    ) {
         let displayed = self.current_displayed_thread_id();
         if displayed.is_none() || displayed.is_some_and(|id| self.thread_unavailable(id)) {
-            self.start_fresh_session_with_intent(
-                tui,
-                app_server,
-                FreshSessionIntent::ClearRecovery(displayed),
-                initial_user_message,
-                new_thread_name,
-            )
-            .await;
+            match first {
+                ClearFirstInput::Message(message) => {
+                    self.start_fresh_session_with_intent(
+                        tui,
+                        app_server,
+                        FreshSessionIntent::ClearRecovery(displayed),
+                        message,
+                        new_thread_name,
+                    )
+                    .await;
+                }
+                ClearFirstInput::ApprovedPlan(plan) => {
+                    let _ = crate::boxed_future!(
+                        self.implement_plan_in_fresh_session(tui, app_server, plan)
+                    )
+                    .await;
+                }
+            }
             return;
         }
         let Some(predecessor_thread_id) = displayed else {
@@ -1573,7 +1619,7 @@ impl App {
         let (config, _local_settings) = match self.load_new_session_config(app_server).await {
             Ok(config) => config,
             Err(err) => {
-                if let Some(message) = initial_user_message {
+                if let ClearFirstInput::Message(Some(message)) = first {
                     self.chat_widget.restore_user_message_to_composer(message);
                 }
                 self.chat_widget
@@ -1631,6 +1677,26 @@ impl App {
             turns: response.successor_thread.turns,
             blocks_direct_input,
             task_tools_available: false,
+        };
+
+        // The clear is committed. A failed plan handoff must not leave the UI
+        // attached to the predecessor whose subscription the server has moved.
+        let (initial_user_message, plan_error) = match first {
+            ClearFirstInput::Message(message) => (message, None),
+            ClearFirstInput::ApprovedPlan(plan) => match prepare_approved_plan_prompt(
+                app_server,
+                successor_thread_id,
+                &config.codex_home,
+                plan,
+            )
+            .await
+            {
+                Ok(prompt) => (Some(prompt.into()), None),
+                Err(err) => (
+                    None,
+                    Some(format!("Failed to hand off the approved plan: {err:#}")),
+                ),
+            },
         };
 
         let name_error = if let Some(name) = new_thread_name {
@@ -1694,6 +1760,9 @@ impl App {
                 retention.commit();
             }
             if let Some(err) = name_error {
+                self.chat_widget.add_error_message(err);
+            }
+            if let Some(err) = plan_error {
                 self.chat_widget.add_error_message(err);
             }
         }

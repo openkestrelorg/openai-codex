@@ -567,21 +567,24 @@ async fn plan_implementation_reads_approved_plan_file_in_fresh_session() -> Resu
     let thread_id = app.chat_widget.thread_id().expect("fresh thread");
     assert_ne!(thread_id, source_id);
     let starts = super::session_lifecycle_requests::recorded_params(&wire_requests, "thread/start");
-    assert_eq!(starts.len(), 2, "one original start and one plan start");
-    assert_eq!(starts[1]["sessionStartSource"], "clear");
-    assert_eq!(starts[1]["retainForConnection"], true);
-    assert_eq!(starts[1]["clearPredecessorThreadId"], source_id.to_string());
-    assert!(
-        super::session_lifecycle_requests::recorded_params(&wire_requests, "thread/clear")
-            .is_empty()
-    );
     assert_eq!(
-        super::session_lifecycle_requests::recorded_params(
-            &wire_requests,
-            "thread/prepareApprovedPlan"
-        )
-        .len(),
-        1
+        starts.len(),
+        1,
+        "only the original thread uses thread/start"
+    );
+    let clears = super::session_lifecycle_requests::recorded_params(&wire_requests, "thread/clear");
+    assert_eq!(clears.len(), 1);
+    assert_eq!(clears[0]["threadId"], source_id.to_string());
+    assert_eq!(clears[0]["retainForConnection"], true);
+    assert!(clears[0]["modelSettings"].is_object());
+    let prepares = super::session_lifecycle_requests::recorded_params(
+        &wire_requests,
+        "thread/prepareApprovedPlan",
+    );
+    assert_eq!(prepares.len(), 1);
+    assert_eq!(prepares[0]["threadId"], thread_id.to_string());
+    assert!(
+        super::session_lifecycle_requests::recorded_params(&wire_requests, "turn/start").is_empty()
     );
 
     let attachments = app.config.codex_home.join("attachments");
@@ -630,6 +633,26 @@ async fn plan_implementation_reads_approved_plan_file_in_fresh_session() -> Resu
         }
     }
     insta::assert_snapshot!(user_rows.join("\n"), @"Read the approved plan at <PLAN_FILE> and implement it.");
+    let methods = wire_requests
+        .lock()
+        .expect("request recorder lock")
+        .iter()
+        .map(|request| request.method.clone())
+        .collect::<Vec<_>>();
+    let clear = methods
+        .iter()
+        .position(|method| method == "thread/clear")
+        .expect("clear");
+    let prepare = methods
+        .iter()
+        .position(|method| method == "thread/prepareApprovedPlan")
+        .expect("prepare");
+    let first_turn = methods
+        .iter()
+        .position(|method| method == "turn/start")
+        .expect("first prompt");
+    assert!(clear < prepare && prepare < first_turn);
+
     super::safety_buffering::wait_for_turn_completed(&mut app, &mut server, thread_id).await;
     let requests = response.requests();
     let [initial, after_read] = requests.as_slice() else {
@@ -695,7 +718,9 @@ async fn assert_plan_implementation_with_unavailable_attachment(
     app.config = app
         .rebuild_config_for_cwd(workspace.path().canonicalize()?)
         .await?;
-    let mut server = crate::start_embedded_app_server_for_picker(&app.config).await?;
+    let (mut server, wire_requests, proxy) =
+        super::session_lifecycle_requests::start_recording_app_server(&app.config, None, None)
+            .await?;
     let mut tui = crate::tui::test_support::make_test_tui()?;
     let source = server.start_thread(&app.config).await?;
     let source_id = source.session.thread_id;
@@ -722,9 +747,39 @@ async fn assert_plan_implementation_with_unavailable_attachment(
         assert_eq!(std::fs::read_to_string(path)?, plan);
     }
     let thread_id = app.chat_widget.thread_id().expect("current thread");
+    let clears = super::session_lifecycle_requests::recorded_params(&wire_requests, "thread/clear");
+    assert_eq!(clears.len(), 1);
+    assert_eq!(clears[0]["threadId"], source_id.to_string());
+    let prepares = super::session_lifecycle_requests::recorded_params(
+        &wire_requests,
+        "thread/prepareApprovedPlan",
+    );
+    assert_eq!(prepares.len(), 1);
+    assert_eq!(prepares[0]["threadId"], thread_id.to_string());
+    assert_eq!(
+        super::session_lifecycle_requests::recorded_params(&wire_requests, "thread/start").len(),
+        1
+    );
+    assert_ne!(
+        thread_id, source_id,
+        "committed clear successor remains attached even if handoff fails"
+    );
     if oversized {
-        assert_eq!(thread_id, source_id);
         assert!(response.requests().is_empty());
+        assert!(
+            super::session_lifecycle_requests::recorded_params(&wire_requests, "turn/start")
+                .is_empty()
+        );
+        let mut rendered = String::new();
+        while let Ok(event) = events.try_recv() {
+            if let AppEvent::InsertHistoryCell(cell) = event {
+                rendered.push_str(&lines_to_single_string(&cell.raw_lines()));
+            }
+        }
+        assert!(
+            rendered.contains("Failed to hand off the approved plan"),
+            "{rendered}"
+        );
     } else {
         assert_ne!(thread_id, source_id);
         while let Ok(event) = events.try_recv() {
@@ -750,6 +805,7 @@ async fn assert_plan_implementation_with_unavailable_attachment(
         assert_eq!(recovered, plan);
     }
     server.shutdown().await?;
+    proxy.await??;
     Ok(())
 }
 
