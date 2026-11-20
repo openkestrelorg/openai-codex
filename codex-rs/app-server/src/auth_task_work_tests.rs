@@ -107,3 +107,69 @@ async fn admitted_rpc_auth_original_keeps_count_after_observer_cancellation() {
     );
     assert_eq!(permits.admitted_count(), 0);
 }
+
+#[tokio::test]
+async fn startup_auth_descendant_keeps_account_work_after_initializer_returns() {
+    let permits = crate::account_work_permits::AccountWorkPermits::new();
+    let tasks = ProcessorTasks::default();
+    let admission = crate::account_turn_admission::AccountTurnAdmission {
+        shutdown: crate::turn_admission::TurnAdmission::default(),
+        permits: permits.clone(),
+        work: crate::account_turn_work::AccountTurnWork::default(),
+        auth_tasks: Some(tasks.ticket()),
+    };
+    let (initialized, initialization_done) = tokio::sync::oneshot::channel();
+    let (started, child_started) = tokio::sync::oneshot::channel();
+    let (release, released) = tokio::sync::oneshot::channel();
+    spawn_startup_operation(&admission, tasks.ticket(), async move {
+        let (request, observation) = codex_model_provider::prepare_deferred_auth_task()
+            .unwrap()
+            .expect("startup must have a managed auth scope");
+        request
+            .dispatch(Box::pin(async move {
+                started.send(()).unwrap();
+                released.await.unwrap();
+            }))
+            .unwrap();
+        drop(request);
+        drop(observation);
+        initialized.send(()).unwrap();
+    })
+    .unwrap();
+    initialization_done.await.unwrap();
+    child_started.await.unwrap();
+    permits.close();
+    assert!(permits.admitted_count() > 0);
+    assert!(permits.try_acquire().is_none());
+    release.send(()).unwrap();
+    assert!(
+        tasks
+            .shutdown_until(Instant::now() + Duration::from_secs(1))
+            .await
+            .is_clean()
+    );
+    assert_eq!(permits.admitted_count(), 0);
+}
+
+#[tokio::test]
+async fn closed_account_admission_refuses_startup_before_polling() {
+    let permits = crate::account_work_permits::AccountWorkPermits::new();
+    permits.close();
+    let tasks = ProcessorTasks::default();
+    let admission = crate::account_turn_admission::AccountTurnAdmission {
+        shutdown: crate::turn_admission::TurnAdmission::default(),
+        permits: permits.clone(),
+        work: crate::account_turn_work::AccountTurnWork::default(),
+        auth_tasks: Some(tasks.ticket()),
+    };
+    let polled = Arc::new(AtomicBool::new(false));
+    let observed = Arc::clone(&polled);
+    assert!(
+        spawn_startup_operation(&admission, tasks.ticket(), async move {
+            observed.store(true, Ordering::SeqCst);
+        })
+        .is_err()
+    );
+    assert!(!polled.load(Ordering::SeqCst));
+    assert_eq!(permits.admitted_count(), 0);
+}

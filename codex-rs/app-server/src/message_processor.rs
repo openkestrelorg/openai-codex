@@ -890,14 +890,24 @@ impl MessageProcessor {
             };
             let on_effective_plugins_changed =
                 plugin_processor.effective_plugins_changed_callback();
-            thread_manager
-                .plugins_manager()
-                .maybe_start_plugin_startup_tasks_for_config(
-                    &config.plugins_config_input(),
-                    reload_config,
-                    Some(on_effective_plugins_changed),
-                    startup_warnings_tx,
-                );
+            let plugins_manager = thread_manager.plugins_manager();
+            let plugins_config = config.plugins_config_input();
+            if crate::auth_task_work::spawn_startup_operation(
+                turn_start_admission.as_ref(),
+                request_auth_tasks.ticket(),
+                async move {
+                    plugins_manager.maybe_start_plugin_startup_tasks_for_config(
+                        &plugins_config,
+                        reload_config,
+                        Some(on_effective_plugins_changed),
+                        startup_warnings_tx,
+                    );
+                },
+            )
+            .is_err()
+            {
+                warn!("plugin startup account work could not be admitted");
+            }
         }
         let initialize_processor = InitializeRequestProcessor::new(
             gateway_login_control,

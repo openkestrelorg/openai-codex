@@ -76,6 +76,26 @@ impl AuthTaskSpawner for CatalogAuthTasks {
     }
 }
 
+/// Startup has no RPC scope. Admit its finite initializer before spawning so
+/// every auth/plugin descendant remains counted by the managed reset drain.
+pub(crate) fn spawn_startup_operation(
+    admission: &dyn codex_extension_api::TurnStartAdmission,
+    ticket: ProcessorTaskTicket,
+    future: impl Future<Output = ()> + Send + 'static,
+) -> Result<(), ()> {
+    let work = admission
+        .admit_operation_work()
+        .map_err(|_| ())?
+        .ok_or(())?;
+    let task_ticket = ticket.clone();
+    ticket
+        .spawn(async move {
+            let _ = scope_with_ticket(task_ticket, Some(work), future).await;
+        })
+        .map(|_| ())
+        .map_err(|_| ())
+}
+
 /// A finite operation holds only a weak registration ticket, never its own ledger.
 pub(crate) fn spawner(
     ticket: ProcessorTaskTicket,
