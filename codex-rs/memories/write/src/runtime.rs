@@ -490,7 +490,13 @@ impl MemoryStartupContext {
                 // budget expires; timeout is not proof that the writer stopped.
                 Err(_) => (shutdown.await, true),
             };
-        if report.is_complete() {
+        if report.cleanup
+            == (codex_core::ThreadCleanupOutcome::Finished {
+                persistence_failed: false,
+            })
+        {
+            // Positive cleanup permits removing the exact dead child even if its
+            // loop failed. The full report below still makes that job fail.
             self.thread_manager
                 .remove_thread_if_same(&thread_id, &thread)
                 .await;
