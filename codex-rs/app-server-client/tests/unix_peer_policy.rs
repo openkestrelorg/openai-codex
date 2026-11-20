@@ -234,9 +234,26 @@ async fn connect_once(
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    let started = ready.with_extension("started");
+    let spawned_at = Instant::now();
     let mut server = command
         .spawn()
         .unwrap_or_else(|error| panic!("Unix peer fixture invariant failed: {error:?}"));
+    // Process admission of a freshly signed image belongs to case()'s existing
+    // 25-second lifecycle bound. The three-second bound below measures our bind.
+    while !started.exists() {
+        assert!(
+            server
+                .try_wait()
+                .unwrap_or_else(|error| panic!("Unix peer fixture invariant failed: {error:?}"))
+                .is_none(),
+            "fixture server exited before starting after {:?}",
+            spawned_at.elapsed()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let startup_elapsed = spawned_at.elapsed();
+    let binding_started = Instant::now();
     tokio::time::timeout(Duration::from_secs(3), async {
         while !ready.exists() {
             assert!(
@@ -244,13 +261,19 @@ async fn connect_once(
                     .try_wait()
                     .unwrap_or_else(|error| panic!("Unix peer fixture invariant failed: {error:?}"))
                     .is_none(),
-                "fixture server exited before binding"
+                "fixture server exited before binding: startup={startup_elapsed:?}, bind={:?}",
+                binding_started.elapsed()
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
-    .unwrap_or_else(|error| panic!("bounded fixture bind: {error:?}"));
+    .unwrap_or_else(|error| {
+        panic!(
+            "bounded fixture bind: {error:?}; startup={startup_elapsed:?}, bind={:?}",
+            binding_started.elapsed()
+        )
+    });
     let result = tokio::time::timeout(
         Duration::from_secs(10),
         RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
@@ -318,6 +341,7 @@ fn peer_server_helper() {
     let ready = std::path::PathBuf::from(std::env::var_os(READY_ENV).unwrap());
     let observed = std::path::PathBuf::from(std::env::var_os(OBSERVED_ENV).unwrap());
     let expect_eof = std::env::var("KCF_TEST_UNIX_PEER_EXPECT_EOF").unwrap() == "1";
+    std::fs::write(ready.with_extension("started"), b"started").unwrap();
     tokio::runtime::Runtime::new().unwrap().block_on(async {
         // A helper also has its own bound, so an outer-test timeout cannot
         // leave a detached server waiting indefinitely.
