@@ -482,7 +482,18 @@ pub async fn read_mcp_resource(
     tool_catalog_cache: crate::McpToolCatalogCache,
     server: &str,
     params: ReadResourceRequestParams,
+    access: crate::McpAttemptAccess<'_>,
 ) -> anyhow::Result<ReadResourceResult> {
+    let startup_work = match access {
+        crate::McpAttemptAccess::Unscoped => None,
+        crate::McpAttemptAccess::Admitted(work) => Some(work.derive_attempt()?),
+    };
+    let attempt_requirement = if startup_work.is_some() {
+        crate::McpAttemptRequirement::Required
+    } else {
+        crate::McpAttemptRequirement::Ungated
+    };
+
     let mut mcp_servers = effective_mcp_servers(config, auth);
     mcp_servers.retain(|name, _| name == server);
     let cancel_token = CancellationToken::new();
@@ -493,8 +504,8 @@ pub async fn read_mcp_resource(
         /*previous*/ None,
         McpPublicationGate::already_published(),
         McpRuntimeInput {
-            attempt_requirement: crate::McpAttemptRequirement::Ungated,
-            startup_work: None,
+            attempt_requirement,
+            startup_work,
             network_policy_metadata: None,
             runtime_auth,
             startup_policy: McpStartupPolicy::Eager,
@@ -519,7 +530,9 @@ pub async fn read_mcp_resource(
     )
     .await;
 
-    let result = manager.read_resource(server, params).await;
+    let result = manager
+        .read_resource_with_authority(server, params, access)
+        .await;
     cancel_token.cancel();
     result
 }
@@ -551,11 +564,22 @@ pub async fn collect_mcp_server_status_snapshot_with_detail(
     tool_catalog_cache: crate::McpToolCatalogCache,
     detail: McpSnapshotDetail,
     server_name: Option<&str>,
-) -> McpServerStatusSnapshot {
+    access: crate::McpAttemptAccess<'_>,
+) -> anyhow::Result<McpServerStatusSnapshot> {
+    let startup_work = match access {
+        crate::McpAttemptAccess::Unscoped => None,
+        crate::McpAttemptAccess::Admitted(work) => Some(work.derive_attempt()?),
+    };
+    let attempt_requirement = if startup_work.is_some() {
+        crate::McpAttemptRequirement::Required
+    } else {
+        crate::McpAttemptRequirement::Ungated
+    };
+
     let mut mcp_servers = effective_mcp_servers(config, auth);
     mcp_servers.retain(|name, _| server_name.is_none_or(|selected| name == selected));
     if mcp_servers.is_empty() {
-        return McpServerStatusSnapshot {
+        return Ok(McpServerStatusSnapshot {
             server_infos: HashMap::new(),
             server_capabilities: HashMap::new(),
             tool_list_meta: HashMap::new(),
@@ -565,7 +589,7 @@ pub async fn collect_mcp_server_status_snapshot_with_detail(
             resource_templates: HashMap::new(),
             auth_statuses: HashMap::new(),
             server_names: Vec::new(),
-        };
+        });
     }
 
     let auth_status_entries = compute_auth_statuses(
@@ -589,8 +613,8 @@ pub async fn collect_mcp_server_status_snapshot_with_detail(
         /*previous*/ None,
         McpPublicationGate::already_published(),
         McpRuntimeInput {
-            attempt_requirement: crate::McpAttemptRequirement::Ungated,
-            startup_work: None,
+            attempt_requirement,
+            startup_work,
             network_policy_metadata: None,
             runtime_auth,
             startup_policy: McpStartupPolicy::Eager,
@@ -620,14 +644,13 @@ pub async fn collect_mcp_server_status_snapshot_with_detail(
         auth_status_entries,
         server_names,
         detail,
-        crate::McpAttemptAccess::Unscoped,
+        access,
     )
-    .await
-    .unwrap_or_else(|error| panic!("threadless status manager is explicitly Ungated: {error:?}"));
+    .await?;
 
     cancel_token.cancel();
 
-    snapshot
+    Ok(snapshot)
 }
 
 /// The Responses API requires tool names to match `^[a-zA-Z0-9_-]+$`.

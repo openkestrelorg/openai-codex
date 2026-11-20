@@ -495,6 +495,8 @@ impl McpRequestProcessor {
                     internal_error(format!("failed to read MCP server status: {error:#}"))
                 })?
         } else {
+            let request_work = crate::account_turn_admission::derive_request_work()
+                .map_err(|_| internal_error("MCP status account work unavailable"))?;
             let config = match thread.as_ref() {
                 Some(thread) => {
                     let thread_config = thread.config().await;
@@ -541,8 +543,16 @@ impl McpRequestProcessor {
                 mcp_manager.tool_catalog_cache(),
                 detail,
                 params.server_name.as_deref(),
+                codex_mcp::McpAttemptAccess::from_work(
+                    request_work
+                        .as_ref()
+                        .map(|work| work as &dyn codex_mcp::McpAttemptWork),
+                ),
             )
-            .await;
+            .await
+            .map_err(|error| {
+                internal_error(format!("failed to read MCP server status: {error:#}"))
+            })?;
             if mcp_config.xaa_enabled
                 && let Some(thread) = thread.as_ref()
             {
@@ -792,6 +802,8 @@ impl McpRequestProcessor {
             return Err(invalid_request("originCallId requires threadId"));
         }
 
+        let request_work = crate::account_turn_admission::derive_request_work()
+            .map_err(|_| internal_error("MCP resource account work unavailable"))?;
         let config = self.load_global_config().await?;
         let mcp_manager = self.thread_manager.mcp_manager();
         let mcp_config = mcp_manager.runtime_config(&config).await;
@@ -824,6 +836,11 @@ impl McpRequestProcessor {
                 tool_catalog_cache,
                 &server,
                 resource_params,
+                codex_mcp::McpAttemptAccess::from_work(
+                    request_work
+                        .as_ref()
+                        .map(|work| work as &dyn codex_mcp::McpAttemptWork),
+                ),
             )
             .await
             .and_then(|result| serde_json::to_value(result).map_err(anyhow::Error::from));

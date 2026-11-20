@@ -917,3 +917,90 @@ async fn effective_mcp_servers_preserve_runtime_servers() {
         other => panic!("expected streamable http transport, got {other:?}"),
     }
 }
+
+struct RefusedThreadlessWork(std::sync::atomic::AtomicUsize);
+
+impl crate::McpAttemptWork for RefusedThreadlessWork {
+    fn derive_attempt(&self) -> Result<Box<dyn crate::McpAttemptWork>, crate::McpAttemptRefused> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(crate::McpAttemptRefused)
+    }
+}
+
+#[tokio::test]
+async fn threadless_resource_refuses_attempt_derivation_before_runtime_startup() {
+    let home = tempfile::tempdir().unwrap();
+    let work = RefusedThreadlessWork(std::sync::atomic::AtomicUsize::new(0));
+    let result = read_mcp_resource(
+        &test_mcp_config(home.path().to_path_buf()),
+        None,
+        None,
+        McpRuntimeContext::new(
+            Arc::new(environment_manager_without_environments()),
+            home.path().to_path_buf(),
+        ),
+        Default::default(),
+        Default::default(),
+        "unknown-server",
+        ReadResourceRequestParams::new("test://resource"),
+        crate::McpAttemptAccess::Admitted(&work),
+    )
+    .await;
+    assert!(
+        result
+            .err()
+            .expect("refused attempt")
+            .downcast_ref::<crate::McpAttemptRefused>()
+            .is_some()
+    );
+    assert_eq!(work.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn threadless_status_refuses_attempt_derivation_before_empty_catalog_return() {
+    let home = tempfile::tempdir().unwrap();
+    let config = test_mcp_config(home.path().to_path_buf());
+    let work = RefusedThreadlessWork(std::sync::atomic::AtomicUsize::new(0));
+    let result = collect_mcp_server_status_snapshot_with_detail(
+        &config,
+        None,
+        None,
+        None,
+        McpRuntimeContext::new(
+            Arc::new(environment_manager_without_environments()),
+            home.path().to_path_buf(),
+        ),
+        Default::default(),
+        Default::default(),
+        McpSnapshotDetail::Full,
+        None,
+        crate::McpAttemptAccess::Admitted(&work),
+    )
+    .await;
+    assert!(
+        result
+            .err()
+            .expect("refused attempt")
+            .downcast_ref::<crate::McpAttemptRefused>()
+            .is_some()
+    );
+    assert_eq!(work.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let unscoped = collect_mcp_server_status_snapshot_with_detail(
+        &config,
+        None,
+        None,
+        None,
+        McpRuntimeContext::new(
+            Arc::new(environment_manager_without_environments()),
+            home.path().to_path_buf(),
+        ),
+        Default::default(),
+        Default::default(),
+        McpSnapshotDetail::Full,
+        None,
+        crate::McpAttemptAccess::Unscoped,
+    )
+    .await
+    .expect("standalone empty catalog remains ungated");
+    assert!(unscoped.server_names.is_empty());
+}
