@@ -144,6 +144,7 @@ pub(crate) async fn sync_remote_installed_plugin_bundles_once_with_snapshot(
         auth,
         previous_plugin_ids,
         &generation,
+        &crate::WorkerStop::never(),
     )
     .await
 }
@@ -154,18 +155,21 @@ pub(crate) async fn sync_remote_installed_plugin_bundles_once_with_snapshot_and_
     auth: Option<&CodexAuth>,
     previous_plugin_ids: &[PluginId],
     generation: &RemotePluginBundleSyncGeneration,
+    stop: &crate::WorkerStop,
 ) -> Result<RemoteInstalledPluginBundleSyncResult, RemoteInstalledPluginBundleSyncError> {
     let auth = ensure_chatgpt_auth(auth)?;
     let config = &config.for_current_account();
     let authenticated_account_id = auth.get_account_id();
-    let fetched_installed_plugins = fetch_installed_plugins(
-        config,
-        auth,
-        RemoteInstalledPluginScope::All,
-        /*include_download_urls*/ true,
-        InstalledPluginDisplayAssets::Include,
-    )
-    .await?;
+    let fetched_installed_plugins = stop
+        .run_read_until_shutdown(fetch_installed_plugins(
+            config,
+            auth,
+            RemoteInstalledPluginScope::All,
+            /*include_download_urls*/ true,
+            InstalledPluginDisplayAssets::Include,
+        ))
+        .await
+        .ok_or(RemoteInstalledPluginBundleSyncError::Superseded)??;
     // `/installed` is an authoritative full snapshot. If any row cannot be
     // canonicalized to a local cache key, omitting it makes an installed plugin
     // indistinguishable from an uninstall, so reject the pass before downloads,
@@ -239,6 +243,9 @@ pub(crate) async fn sync_remote_installed_plugin_bundles_once_with_snapshot_and_
     let mut installed_plugins = Vec::new();
 
     for (installed_plugin, cached_plugin, plugin_id) in validated_installed_plugins {
+        if stop.is_stopped() {
+            return Err(RemoteInstalledPluginBundleSyncError::Superseded);
+        }
         let marketplace_name = cached_plugin.marketplace_name.clone();
         let plugin = installed_plugin.plugin;
         let scope = plugin.scope;
@@ -301,14 +308,30 @@ pub(crate) async fn sync_remote_installed_plugin_bundles_once_with_snapshot_and_
         // by the new version. Unchanged bundles never reach this metadata-loading path.
         let mut capabilities = RemotePluginCapabilities::default();
         capabilities.include_active_bundle(&store, &plugin_id).await;
-        match crate::remote_bundle::download_and_install_remote_plugin_bundle_with_generation(
-            config,
-            codex_home.clone(),
-            bundle,
-            generation,
-        )
-        .await
-        {
+        let bytes = stop
+            .run_read_until_shutdown(crate::remote_bundle::download_remote_plugin_bundle(
+                config, &bundle,
+            ))
+            .await
+            .ok_or(RemoteInstalledPluginBundleSyncError::Superseded)?;
+        if stop.is_stopped() {
+            return Err(RemoteInstalledPluginBundleSyncError::Superseded);
+        }
+        // A physical commit, once started, is always awaited. Cancelling its
+        // observer would otherwise let the registry hide a live blocking writer.
+        let installation = match bytes {
+            Ok(bytes) => {
+                crate::remote_bundle::install_downloaded_remote_plugin_bundle(
+                    codex_home.clone(),
+                    bundle,
+                    bytes,
+                    generation,
+                )
+                .await
+            }
+            Err(error) => Err(error),
+        };
+        match installation {
             Ok(result) => {
                 let plugin_id = result.plugin_id;
                 capabilities.include_active_bundle(&store, &plugin_id).await;
@@ -344,6 +367,9 @@ pub(crate) async fn sync_remote_installed_plugin_bundles_once_with_snapshot_and_
         installed_plugins.push(cached_plugin);
     }
 
+    if stop.is_stopped() {
+        return Err(RemoteInstalledPluginBundleSyncError::Superseded);
+    }
     installed_plugins.sort_by(|left, right| {
         left.marketplace_name
             .cmp(&right.marketplace_name)
@@ -355,6 +381,7 @@ pub(crate) async fn sync_remote_installed_plugin_bundles_once_with_snapshot_and_
         &installed_plugin_names_by_marketplace,
         &mut removed_cache_plugins,
         generation,
+        stop,
     )
     .await
     {
@@ -368,6 +395,9 @@ pub(crate) async fn sync_remote_installed_plugin_bundles_once_with_snapshot_and_
 
     // Best-effort ordinary download/cleanup failures are not reset success.
     // Refuse an epoch retired while any of those awaited operations ran.
+    if stop.is_stopped() {
+        return Err(RemoteInstalledPluginBundleSyncError::Superseded);
+    }
     let _publication_check = generation
         .begin_commit()
         .map_err(|_| RemoteInstalledPluginBundleSyncError::Superseded)?;
@@ -435,6 +465,7 @@ async fn remove_stale_remote_plugin_caches(
         installed_plugin_names_by_marketplace,
         removed_plugins,
         &generation,
+        &crate::WorkerStop::never(),
     )
     .await
 }
@@ -444,6 +475,7 @@ async fn remove_stale_remote_plugin_caches_with_generation(
     installed_plugin_names_by_marketplace: &BTreeMap<String, BTreeSet<String>>,
     removed_plugins: &mut Vec<RemotePluginChange>,
     generation: &RemotePluginBundleSyncGeneration,
+    stop: &crate::WorkerStop,
 ) -> Result<(), String> {
     let codex_home = store.codex_home().as_path();
     for marketplace_name in [
@@ -495,6 +527,7 @@ async fn remove_stale_remote_plugin_caches_with_generation(
             if let Ok(plugin_id) = &plugin_id {
                 capabilities.include_active_bundle(store, plugin_id).await;
             }
+            stop.ensure_running("the next stale plugin cache removal")?;
             let lease = generation
                 .begin_commit()
                 .map_err(|_| "remote plugin publication authority unavailable".to_string())?;
@@ -563,6 +596,45 @@ mod tests {
     use wiremock::matchers::path;
     use wiremock::matchers::query_param;
     use wiremock::matchers::query_param_is_missing;
+
+    #[tokio::test]
+    async fn shutdown_does_not_hide_a_started_physical_bundle_commit() {
+        let home = tempfile::tempdir().unwrap();
+        let generation = RemotePluginBundleSyncGeneration::capture(home.path()).unwrap();
+        let lease = generation.begin_commit().unwrap();
+        let registry = crate::PluginTaskRegistry::default();
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let completed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let physical_completed = completed.clone();
+        let receipt = registry
+            .spawn(async move {
+                // The production install/removal primitive owns the lease in its
+                // actual blocking original. Its observer must remain awaited.
+                let (_, _lease) = lease
+                    .run_blocking(move || {
+                        let _ = entered.send(());
+                        if released.recv().is_ok() {
+                            physical_completed.store(true, std::sync::atomic::Ordering::SeqCst);
+                        }
+                    })
+                    .await
+                    .unwrap();
+            })
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), started)
+            .await
+            .unwrap()
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(20);
+        let report = registry.shutdown_until(deadline).await;
+        assert!(!report.terminal && !report.is_clean());
+        assert!(!completed.load(std::sync::atomic::Ordering::SeqCst));
+        release.send(()).unwrap();
+        assert_eq!(receipt.await, crate::retirement::JoinOutcome::Joined);
+        assert!(completed.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(registry.shutdown_until(deadline).await.is_clean());
+    }
 
     #[tokio::test]
     async fn sync_same_version_backfills_metadata_and_missing_version_requires_materialization() {
@@ -880,6 +952,7 @@ mod tests {
                 &BTreeMap::new(),
                 &mut removed,
                 &generation,
+                &crate::WorkerStop::never(),
             )
             .await
             .is_err()

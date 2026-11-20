@@ -1664,6 +1664,62 @@ async fn late_shutdown_interrupts_actual_http_without_fallback_or_activation() {
     assert!(!curated_plugins_sha_path(home.path()).exists());
 }
 
+#[tokio::test]
+async fn shutdown_request_releases_a_real_sync_lock_waiter_before_expiry_without_stealing() {
+    use futures::FutureExt;
+    let home = tempdir().unwrap();
+    let held = lock_curated_plugins_startup_sync(home.path()).unwrap();
+    let registry = crate::PluginTaskRegistry::default();
+    let stop = registry.worker_stop();
+    let owned_home = home.path().to_owned();
+    let (entered, started) = tokio::sync::oneshot::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let (done, result) = tokio::sync::oneshot::channel();
+    let receipt = registry
+        .spawn_thread("curated-sync-lock-waiter", move || {
+            let _scope = SyncStopScope::enter(stop);
+            let mut entered = Some(entered);
+            let outcome = lock_curated_plugins_startup_sync_with_wait(&owned_home, move |delay| {
+                assert!(delay <= Duration::from_millis(10));
+                if let Some(entered) = entered.take() {
+                    let _ = entered.send(());
+                    let _ = released.recv();
+                }
+            });
+            let _ = done.send(outcome.map(|_| ()));
+        })
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), started)
+        .await
+        .unwrap()
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let drain = registry.shutdown_until(deadline);
+    tokio::pin!(drain);
+    assert!((&mut drain).now_or_never().is_none());
+    release.send(()).unwrap();
+    assert!(drain.await.is_clean());
+    assert!(tokio::time::Instant::now() < deadline);
+    assert_eq!(receipt.await, crate::retirement::JoinOutcome::Joined);
+    assert!(
+        result
+            .await
+            .unwrap()
+            .unwrap_err()
+            .contains("shutdown request")
+    );
+    let contender = File::options()
+        .write(true)
+        .open(home.path().join(CURATED_PLUGINS_SYNC_LOCK_FILE))
+        .unwrap();
+    assert!(matches!(
+        contender.try_lock(),
+        Err(std::fs::TryLockError::WouldBlock)
+    ));
+    held.unlock().unwrap();
+    contender.try_lock().unwrap();
+}
+
 #[test]
 fn expired_owner_does_not_wait_for_or_steal_the_existing_sync_lock() {
     let home = tempdir().unwrap();

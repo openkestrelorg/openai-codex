@@ -2144,13 +2144,17 @@ impl PluginsManager {
         };
         let manager = Arc::clone(self);
         let config = config.clone();
+        let stop = self.task_registry.worker_stop();
         let admitted = self.task_registry.spawn_callback(async move {
             let _permit = permit;
             let result = manager
                 .reconcile_remote_installed_plugins_after_acquiring_gate(
-                    &config, Some(&auth), &publication_generation,
+                    &config, Some(&auth), &publication_generation, &stop,
                 )
                 .await;
+            // Shutdown is not an ordinary failure: do not attempt a refused
+            // follow-up birth that would poison this managed auth context.
+            if stop.is_stopped() { return; }
             match result {
                 Ok((outcome, update)) => {
                     tracing::info!(
@@ -2224,6 +2228,7 @@ impl PluginsManager {
                 config,
                 auth,
                 &publication_generation,
+                &crate::WorkerStop::never(),
             )
             .await?;
         Ok(outcome)
@@ -2234,6 +2239,7 @@ impl PluginsManager {
         config: &PluginsConfigInput,
         auth: Option<&CodexAuth>,
         publication_generation: &RemotePluginBundleSyncGeneration,
+        stop: &crate::WorkerStop,
     ) -> Result<
         (
             RemoteInstalledPluginBundleSyncOutcome,
@@ -2277,6 +2283,7 @@ impl PluginsManager {
                 auth,
                 &previous_plugin_ids,
                 publication_generation,
+                stop,
             )
             .await?;
         let mut outcome = result.outcome;
@@ -2317,6 +2324,9 @@ impl PluginsManager {
         outcome
             .changed_plugins
             .sort_unstable_by(|left, right| left.plugin_id.cmp(&right.plugin_id));
+        if stop.is_stopped() {
+            return Err(RemoteInstalledPluginBundleSyncError::Superseded);
+        }
         let Some(update) = self.write_remote_installed_plugins_cache_snapshot(
             generation,
             result.installed_plugins,
@@ -4043,11 +4053,16 @@ impl PluginsManager {
         callback_owner: Option<codex_model_provider::DeferredAuthTask>,
         backend_owner: Option<codex_model_provider::DeferredAuthTask>,
     ) {
-        let plugins = crate::remote::fetch_remote_installed_plugins(
-            &request.service_config,
-            request.auth.as_ref(),
-        )
-        .await;
+        let stop = self.task_registry.worker_stop();
+        let Some(plugins) = stop
+            .run_read_until_shutdown(crate::remote::fetch_remote_installed_plugins(
+                &request.service_config,
+                request.auth.as_ref(),
+            ))
+            .await
+        else {
+            return;
+        };
         match plugins {
             Ok(plugins) => {
                 let Some(update) = self.write_remote_installed_plugins_cache_snapshot(
@@ -4161,7 +4176,11 @@ impl PluginsManager {
     }
 
     async fn refresh_remote_catalog_request(&self, request: RemoteCatalogCacheRefreshRequest) {
+        let stop = self.task_registry.worker_stop();
         for scope in request.scopes {
+            if stop.is_stopped() {
+                return;
+            }
             if crate::remote::has_fresh_cached_remote_plugin_catalog(
                 self.codex_home.as_path(),
                 &request.service_config,
@@ -4171,14 +4190,18 @@ impl PluginsManager {
                 continue;
             }
 
-            match crate::remote::fetch_and_cache_remote_plugin_catalog(
-                self.codex_home.as_path(),
-                &request.service_config,
-                request.auth.as_ref(),
-                scope,
-            )
-            .await
-            {
+            let Some(result) = stop
+                .run_read_until_shutdown(crate::remote::fetch_and_cache_remote_plugin_catalog(
+                    self.codex_home.as_path(),
+                    &request.service_config,
+                    request.auth.as_ref(),
+                    scope,
+                ))
+                .await
+            else {
+                return;
+            };
+            match result {
                 Ok(()) => {}
                 Err(
                     RemotePluginCatalogError::AuthRequired

@@ -300,7 +300,7 @@ pub(crate) async fn download_and_install_remote_plugin_bundle_with_generation(
     install_downloaded_remote_plugin_bundle(codex_home, bundle, bundle_bytes, generation).await
 }
 
-async fn install_downloaded_remote_plugin_bundle(
+pub(crate) async fn install_downloaded_remote_plugin_bundle(
     codex_home: PathBuf,
     bundle: ValidatedRemotePluginBundle,
     bundle_bytes: Vec<u8>,

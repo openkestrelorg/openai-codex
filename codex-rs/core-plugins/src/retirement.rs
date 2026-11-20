@@ -152,6 +152,37 @@ impl WorkerStop {
         }
     }
 
+    /// Interrupt only an owned, cancellation-safe read. Do not wrap a blocking
+    /// commit or its observer: those must remain awaited through physical completion.
+    /// The read retains its own timeout; this adds only the shutdown request.
+    pub(crate) async fn run_read_until_shutdown<T>(
+        &self,
+        future: impl Future<Output = T>,
+    ) -> Option<T> {
+        let Some(state) = self.state.as_ref() else {
+            return Some(future.await);
+        };
+        let changed = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .shutdown_changed
+            .clone();
+        tokio::pin!(future);
+        loop {
+            let notification = changed.notified();
+            tokio::pin!(notification);
+            notification.as_mut().enable();
+            if self.is_stopped() {
+                return None;
+            }
+            tokio::select! {
+                biased;
+                _ = &mut notification => {},
+                result = &mut future => return Some(result),
+            }
+        }
+    }
+
     /// No owner: never stops (tests and callers without a registry).
     pub fn never() -> Self {
         Self::default()

@@ -7544,6 +7544,108 @@ fn remote_installed_plugins_cache_refresh_coalesces_materializations() {
 }
 
 #[tokio::test]
+async fn managed_async_plugin_reads_stop_without_publication_callback_or_auth_poisoning() {
+    for operation in ["installed", "catalog", "bundle"] {
+        let home = tempfile::tempdir().unwrap();
+        write_file(
+            &home.path().join(CONFIG_TOML_FILE),
+            "[features]\nplugins = true\nremote_plugin = true\n",
+        );
+        let server = MockServer::start().await;
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let request_entered = entered.clone();
+        Mock::given(method("GET"))
+            .respond_with(move |_: &wiremock::Request| {
+                request_entered.notify_one();
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_secs(30))
+                    .set_body_json(serde_json::json!({
+                        "plugins": [], "pagination": {"next_page_token": null}
+                    }))
+            })
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut config = load_config(home.path(), home.path()).await;
+        config.chatgpt_base_url = format!("{}/backend-api", server.uri());
+        let manager = Arc::new(test_plugins_manager_with_options(
+            home.path().to_path_buf(),
+            Some(Product::Codex),
+            Some(AuthMode::Chatgpt),
+        ));
+        let auth = CodexAuth::create_dummy_chatgpt_auth_for_testing();
+        let callbacks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = callbacks.clone();
+        let callback: EffectivePluginsChangedCallback = Arc::new(move |_| {
+            count.fetch_add(1, Ordering::SeqCst);
+        });
+        let host = QueuedTestHost::new(31);
+        codex_model_provider::with_auth_task_scope(host.access(), async {
+            match operation {
+                "installed" => manager
+                    .maybe_start_remote_installed_plugins_cache_refresh_after_mutation(
+                        &config,
+                        Some(auth.clone()),
+                        Some(callback),
+                    ),
+                "catalog" => manager.maybe_start_remote_catalog_cache_refresh(
+                    &config,
+                    Some(auth.clone()),
+                    BTreeSet::from([RemotePluginScope::Global]),
+                ),
+                "bundle" => manager.maybe_start_remote_installed_plugin_bundle_sync(
+                    &config,
+                    Some(auth.clone()),
+                    Some(callback),
+                    InstalledPluginSyncSource::Startup,
+                ),
+                _ => unreachable!(),
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let report = manager.shutdown_until(deadline).await;
+        assert!(report.is_clean(), "{operation}: {report:?}");
+        assert!(tokio::time::Instant::now() < deadline, "{operation}");
+        host.joined().await;
+        assert_eq!(callbacks.load(Ordering::SeqCst), 0, "{operation}");
+        assert!(
+            manager
+                .remote_installed_plugins_cache
+                .read()
+                .unwrap()
+                .plugins
+                .is_none()
+        );
+        assert!(!crate::remote::has_fresh_cached_remote_plugin_catalog(
+            home.path(),
+            &manager.remote_plugin_service_config(&config),
+            Some(&auth),
+            RemotePluginScope::Global,
+        ));
+        assert!(
+            !manager
+                .remote_installed_plugins_cache_refresh_state
+                .read()
+                .unwrap()
+                .in_flight
+        );
+        assert!(
+            !manager
+                .remote_catalog_cache_refresh_state
+                .read()
+                .unwrap()
+                .in_flight
+        );
+        server.verify().await;
+    }
+}
+
+#[tokio::test]
 async fn background_remote_installed_bundle_sync_stays_deduped() {
     let codex_home = TempDir::new().unwrap();
     write_file(

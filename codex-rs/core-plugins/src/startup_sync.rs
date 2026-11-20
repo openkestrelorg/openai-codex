@@ -226,6 +226,13 @@ fn sync_openai_plugins_repo_with_transport_overrides(
 }
 
 fn lock_curated_plugins_startup_sync(codex_home: &Path) -> Result<File, String> {
+    lock_curated_plugins_startup_sync_with_wait(codex_home, std::thread::sleep)
+}
+
+fn lock_curated_plugins_startup_sync_with_wait(
+    codex_home: &Path,
+    mut wait: impl FnMut(Duration),
+) -> Result<File, String> {
     let lock_path = codex_home.join(CURATED_PLUGINS_SYNC_LOCK_FILE);
     std::fs::create_dir_all(codex_home.join(".tmp"))
         .map_err(|err| format!("failed to create curated plugins sync directory: {err}"))?;
@@ -242,7 +249,7 @@ fn lock_curated_plugins_startup_sync(codex_home: &Path) -> Result<File, String> 
             match lock_file.try_lock() {
                 Ok(()) => break,
                 Err(std::fs::TryLockError::WouldBlock) => {
-                    std::thread::sleep(step_budget(Duration::from_millis(10)));
+                    wait(step_budget(Duration::from_millis(10)));
                 }
                 Err(error) => return Err(format!("failed to lock curated plugins sync: {error}")),
             }
