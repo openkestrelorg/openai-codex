@@ -612,7 +612,7 @@ impl PluginTaskRegistry {
                     ..Default::default()
                 };
             };
-            let deadline = state.deadline.expect("shutdown deadline latched");
+            let deadline = *state.deadline.get_or_insert(deadline);
             state.compact();
             (deadline, state.tasks.clone())
         };

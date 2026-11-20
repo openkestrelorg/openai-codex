@@ -1408,14 +1408,18 @@ impl MessageProcessor {
         deadline: tokio::time::Instant,
         progress: &SharedBackgroundProgress,
     ) -> ProcessorBackgroundShutdown {
+        fn retain_report<T: Clone>(slot: &mut Option<T>, report: T) -> T {
+            *slot = Some(report.clone());
+            report
+        }
         macro_rules! record {
             ($field:ident, $work:expr) => {
                 async {
                     let report = $work.await;
-                    progress
+                    let mut reports = progress
                         .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .$field = Some(report);
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    retain_report(&mut reports.$field, report)
                 }
             };
         }
@@ -1432,7 +1436,18 @@ impl MessageProcessor {
         }
         let login = self.begin_login_shutdown(deadline);
         let plugins = self.thread_manager.plugins_manager();
-        tokio::join!(
+        let (
+            models,
+            turn_cost,
+            thread_starts,
+            apps,
+            skills,
+            plugins,
+            command_exec,
+            workspace_routing,
+            auxiliary_tasks,
+            login,
+        ) = tokio::join!(
             record!(models, self.shutdown_models_refresh_worker_until(deadline)),
             record!(turn_cost, async {
                 match &self.turn_cost_worker {
@@ -1469,56 +1484,29 @@ impl MessageProcessor {
         );
         // The periodic model producer must finish before taking this auth-task
         // observation. A timeout/panic above remains unclean even if this is zero.
-        record!(
+        let model_auth = record!(
             model_auth,
             self.model_catalog.observe_auth_tasks_until(deadline)
         )
         .await;
-        record!(
+        let request_auth = record!(
             request_auth,
             self.request_auth_tasks.shutdown_until(deadline)
         )
         .await;
-        let mut reports = progress
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         ProcessorBackgroundShutdown {
-            models: reports.models.take().expect("completed models observation"),
-            turn_cost: reports
-                .turn_cost
-                .take()
-                .expect("completed turn_cost observation"),
-            thread_starts: reports
-                .thread_starts
-                .take()
-                .expect("completed thread_starts observation"),
-            apps: reports.apps.take().expect("completed apps observation"),
-            skills: reports.skills.take().expect("completed skills observation"),
-            plugins: reports
-                .plugins
-                .take()
-                .expect("completed plugins observation"),
-            command_exec: reports
-                .command_exec
-                .take()
-                .expect("completed command_exec observation"),
-            model_auth: reports
-                .model_auth
-                .take()
-                .expect("completed model_auth observation"),
-            request_auth: reports
-                .request_auth
-                .take()
-                .expect("completed request_auth observation"),
-            auxiliary_tasks: reports
-                .auxiliary_tasks
-                .take()
-                .expect("completed auxiliary_tasks observation"),
-            workspace_routing: reports
-                .workspace_routing
-                .take()
-                .expect("completed workspace_routing observation"),
-            login: reports.login.take().expect("completed login observation"),
+            models,
+            turn_cost,
+            thread_starts,
+            apps,
+            skills,
+            plugins,
+            command_exec,
+            model_auth,
+            request_auth,
+            auxiliary_tasks,
+            workspace_routing,
+            login,
         }
     }
 
