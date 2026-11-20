@@ -240,7 +240,7 @@ async fn definite_server_rejection_allows_later_adoption() -> Result<()> {
         let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
         let initialize: serde_json::Value =
             serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
-        socket.send(Message::Text(json!({"jsonrpc": "2.0", "id": initialize["id"], "result": {"userAgent": "codex_cli_rs/0.0.0", "codexHome": "/tmp/test"}}).to_string().into())).await.unwrap();
+        socket.send(Message::Text(json!({"jsonrpc": "2.0", "id": initialize["id"], "result": {"userAgent": "codex_cli_rs/0.0.0", "codexHome": "/tmp/test", "platformFamily": std::env::consts::FAMILY, "platformOs": std::env::consts::OS}}).to_string().into())).await.unwrap();
         let _initialized = socket.next().await.unwrap().unwrap();
         for refuse in [true, false] {
             let acquire: serde_json::Value =
@@ -317,7 +317,7 @@ async fn retention_transport_failure_preserves_reconnect_cause() -> Result<()> {
         let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
         let initialize: serde_json::Value =
             serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
-        socket.send(Message::Text(json!({"jsonrpc": "2.0", "id": initialize["id"], "result": {"userAgent": "codex_cli_rs/0.0.0", "codexHome": "/tmp/test"}}).to_string().into())).await.unwrap();
+        socket.send(Message::Text(json!({"jsonrpc": "2.0", "id": initialize["id"], "result": {"userAgent": "codex_cli_rs/0.0.0", "codexHome": "/tmp/test", "platformFamily": std::env::consts::FAMILY, "platformOs": std::env::consts::OS}}).to_string().into())).await.unwrap();
         let _initialized = socket.next().await.unwrap().unwrap();
         let acquire: serde_json::Value =
             serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
