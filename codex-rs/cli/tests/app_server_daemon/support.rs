@@ -98,6 +98,20 @@ impl TestDaemon {
             .as_u64()
             .context("pid missing")? as u32)
     }
+    pub(super) fn assert_no_updater(&self) {
+        let state = self.home.path().join("app-server-daemon");
+        assert!(!state.join("app-server-updater.pid").exists());
+        assert!(!state.join("daemon-updater.pid").exists());
+    }
+}
+
+pub(super) fn assert_update_disabled(output: &std::process::Output) {
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr).trim(),
+        "Error: codex self-update is disabled in this managed distribution; use the managed release and promotion workflow instead"
+    );
 }
 
 impl Drop for TestDaemon {
