@@ -1878,17 +1878,72 @@ async fn refused_memory_child_turn_retires_the_exact_constructed_thread() -> any
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
 
+    #[derive(Debug, Default)]
+    struct AuthOwner(std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>);
+    impl codex_protocol::host_auth_work::AuthTaskSpawner for AuthOwner {
+        fn spawn(
+            &self,
+            task: codex_protocol::host_auth_work::AuthTaskFuture,
+        ) -> Result<
+            codex_protocol::host_auth_work::AuthTaskObservation,
+            codex_protocol::host_auth_work::AuthTaskFailure,
+        > {
+            let (sent, observed) = tokio::sync::oneshot::channel();
+            self.0.lock().unwrap().push(tokio::spawn(async move {
+                task.await;
+                let _ = sent.send(());
+            }));
+            Ok(Box::pin(async move {
+                observed
+                    .await
+                    .map_err(|_| codex_protocol::host_auth_work::AuthTaskFailure::Unavailable)
+            }))
+        }
+        fn spawn_blocking(
+            &self,
+            task: codex_protocol::host_auth_work::AuthTaskBlocking,
+        ) -> Result<
+            codex_protocol::host_auth_work::AuthTaskObservation,
+            codex_protocol::host_auth_work::AuthTaskFailure,
+        > {
+            let (sent, observed) = tokio::sync::oneshot::channel();
+            self.0
+                .lock()
+                .unwrap()
+                .push(tokio::task::spawn_blocking(move || {
+                    task();
+                    let _ = sent.send(());
+                }));
+            Ok(Box::pin(async move {
+                observed
+                    .await
+                    .map_err(|_| codex_protocol::host_auth_work::AuthTaskFailure::Unavailable)
+            }))
+        }
+    }
     #[derive(Debug)]
     struct Work {
         constructions: Arc<AtomicUsize>,
         turns: Arc<AtomicUsize>,
+        root: bool,
+        auth: Arc<AuthOwner>,
     }
     impl HostOperationWork for Work {
+        fn auth_task_spawner(
+            &self,
+        ) -> Result<Arc<dyn codex_protocol::host_auth_work::AuthTaskSpawner>, TurnWorkRefused>
+        {
+            Ok(self.auth.clone())
+        }
         fn derive_operation(&self) -> Result<Box<dyn HostOperationWork>, TurnWorkRefused> {
-            self.constructions.fetch_add(1, Ordering::SeqCst);
+            if self.root {
+                self.constructions.fetch_add(1, Ordering::SeqCst);
+            }
             Ok(Box::new(Self {
                 constructions: Arc::clone(&self.constructions),
                 turns: Arc::clone(&self.turns),
+                root: false,
+                auth: Arc::clone(&self.auth),
             }))
         }
         fn derive_turn_work(
@@ -1912,6 +1967,7 @@ async fn refused_memory_child_turn_retires_the_exact_constructed_thread() -> any
         .collect::<std::collections::HashSet<_>>();
     let constructions = Arc::new(AtomicUsize::new(0));
     let turns = Arc::new(AtomicUsize::new(0));
+    let auth = Arc::new(AuthOwner::default());
     let context = MemoryStartupContext::new(
         Arc::clone(&test.thread_manager),
         test.codex
@@ -1925,6 +1981,8 @@ async fn refused_memory_child_turn_retires_the_exact_constructed_thread() -> any
         Some(Arc::new(Work {
             constructions: Arc::clone(&constructions),
             turns: Arc::clone(&turns),
+            root: true,
+            auth: Arc::clone(&auth),
         })),
     );
     let root = home.path().join("memory-refusal-workspace");
@@ -1958,5 +2016,15 @@ async fn refused_memory_child_turn_retires_the_exact_constructed_thread() -> any
     })
     .await?;
     shutdown_test_codex(&test).await?;
+    drop(context);
+    loop {
+        let originals = std::mem::take(&mut *auth.0.lock().unwrap());
+        if originals.is_empty() {
+            break;
+        }
+        for original in originals {
+            original.await?;
+        }
+    }
     Ok(())
 }
