@@ -1,6 +1,7 @@
 //! Actual RPC controls for the versioned synthetic command-auth owner fixture.
 use super::*;
 use base64::Engine;
+use pretty_assertions::assert_eq;
 use sha2::Digest;
 use std::os::unix::fs::PermissionsExt;
 
