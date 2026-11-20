@@ -1863,6 +1863,7 @@ async fn clear_recovery_facade_refusal_scenario() -> Result<()> {
 async fn recovery_installs_successor_with_one_warning_when_retention_is_refused() -> Result<()> {
     crate::boxed_future!(recovery_retention_install_scenario(
         HistoryCapabilities::RecoveryRetentionRefused,
+        false,
     ))
     .await
 }
@@ -1870,12 +1871,26 @@ async fn recovery_installs_successor_with_one_warning_when_retention_is_refused(
 #[tokio::test]
 async fn recovery_installs_successor_with_retention_without_warning() -> Result<()> {
     crate::boxed_future!(recovery_retention_install_scenario(
-        HistoryCapabilities::Current
+        HistoryCapabilities::Current,
+        false,
     ))
     .await
 }
 
-async fn recovery_retention_install_scenario(capabilities: HistoryCapabilities) -> Result<()> {
+#[tokio::test]
+async fn plan_implementation_recovers_unavailable_predecessor_before_preparing_prompt() -> Result<()>
+{
+    crate::boxed_future!(recovery_retention_install_scenario(
+        HistoryCapabilities::Current,
+        true,
+    ))
+    .await
+}
+
+async fn recovery_retention_install_scenario(
+    capabilities: HistoryCapabilities,
+    approved_plan: bool,
+) -> Result<()> {
     let (mut app, mut events, _) = make_test_app_with_channels().await;
     app.config
         .features
@@ -1906,8 +1921,19 @@ async fn recovery_retention_install_scenario(capabilities: HistoryCapabilities) 
     )
     .await?;
     let mut tui = crate::tui::test_support::make_test_tui()?;
-    app.clear_displayed_session_boxed(&mut tui, &mut server, None, None)
-        .await;
+    if approved_plan {
+        crate::boxed_future!(app.handle_event(
+            &mut tui,
+            &mut server,
+            AppEvent::ImplementPlanInFreshSession {
+                plan: "# Plan\n- Recover and implement the next step.".to_string(),
+            },
+        ))
+        .await?;
+    } else {
+        app.clear_displayed_session_boxed(&mut tui, &mut server, None, None)
+            .await;
+    }
     let successor = app.chat_widget.thread_id().expect("successor installed");
     assert_ne!(successor, current);
     let starts = recorded_params(&requests, "thread/start");
@@ -1921,6 +1947,16 @@ async fn recovery_retention_install_scenario(capabilities: HistoryCapabilities) 
     assert!(starts[0]["clearPredecessorThreadId"].is_null());
     assert_eq!(starts[0]["retainForConnection"], true);
     assert!(recorded_params(&requests, "thread/clear").is_empty());
+    if approved_plan {
+        let prepares = recorded_params(&requests, "thread/prepareApprovedPlan");
+        assert_eq!(prepares.len(), 1);
+        assert_eq!(prepares[0]["threadId"], successor.to_string());
+        assert!(
+            recorded_params(&requests, "turn/start").is_empty(),
+            "first prompt remains deferred"
+        );
+    }
+
     assert!(recorded_params(&requests, "thread/retention/acquire").is_empty());
     let warnings = take_ready_retention_warnings(&mut server);
     if capabilities == HistoryCapabilities::RecoveryRetentionRefused {
