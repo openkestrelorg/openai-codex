@@ -958,7 +958,13 @@ impl Session {
             return None;
         }
         let mailbox = self.input_queue.reserve_mailbox();
-        if mailbox.is_empty() {
+        // A competing task can reserve the trigger mail after the peek. Check
+        // this private batch before admitting account work or selecting options.
+        if mailbox.is_empty()
+            || (mailbox.start_metadata().1.is_none()
+                && !self.has_outstanding_durable_sleep()
+                && !self.should_wake_on_agent_messages().await)
+        {
             return None;
         }
         // Carried trigger work already owns this exact private batch. Otherwise
