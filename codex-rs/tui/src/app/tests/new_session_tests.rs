@@ -556,6 +556,7 @@ async fn plan_implementation_reads_approved_plan_file_in_fresh_session() -> Resu
     );
     let source = server.start_thread(&app.config).await?;
     let source_id = source.session.thread_id;
+    assert!(server.task_tools_available(source_id));
     app.enqueue_primary_thread_session(source.session, source.turns)
         .await?;
     Box::pin(app.handle_event(
@@ -566,6 +567,7 @@ async fn plan_implementation_reads_approved_plan_file_in_fresh_session() -> Resu
     .await?;
     let thread_id = app.chat_widget.thread_id().expect("fresh thread");
     assert_ne!(thread_id, source_id);
+    assert!(server.task_tools_available(thread_id));
     let starts = super::session_lifecycle_requests::recorded_params(&wire_requests, "thread/start");
     assert_eq!(
         starts.len(),

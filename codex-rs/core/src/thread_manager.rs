@@ -1597,6 +1597,10 @@ impl ThreadManager {
             ));
         }
         options.reserved_thread_id = Some(successor_thread_id);
+        // Clearing history must retain the client's current runtime tool surface.
+        let predecessor = self.get_thread(predecessor_thread_id).await?;
+        options.dynamic_tools = predecessor.session.dynamic_tools().await.to_vec();
+        options.client_mcp_extensions = predecessor.client_mcp_extensions();
         Box::pin(self.start_thread_inner(
             options,
             None,

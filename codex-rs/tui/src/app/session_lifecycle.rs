@@ -1663,6 +1663,10 @@ impl App {
                 return;
             }
         };
+        let task_tools_available = app_server.task_tools_available(predecessor_thread_id);
+        if task_tools_available {
+            app_server.remember_task_tool_thread(successor_thread_id);
+        }
         let retention = app_server
             .retain_clear_successor(&response.successor_thread.id, response.retention.clone())
             .await;
@@ -1676,7 +1680,7 @@ impl App {
             session,
             turns: response.successor_thread.turns,
             blocks_direct_input,
-            task_tools_available: false,
+            task_tools_available,
         };
 
         // The clear is committed. A failed plan handoff must not leave the UI
