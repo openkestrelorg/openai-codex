@@ -19,7 +19,7 @@ pub(crate) fn run_output(
     stop.ensure_running("process creation")?;
     if cap.is_zero() || stop.is_stopped() {
         return Err(format!(
-            "{context} stopped at the shutdown deadline or step budget before process creation"
+            "{context} stopped by shutdown request, shutdown deadline, or step budget before process creation"
         ));
     }
     #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -301,7 +301,7 @@ mod supported {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     format!(
-                        "{context} timed out: stopped by its step budget or the shutdown deadline: {}",
+                        "{context} timed out: stopped by its step budget, shutdown request, or shutdown deadline: {}",
                         String::from_utf8_lossy(&diagnostic).trim()
                     ),
                 ));

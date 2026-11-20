@@ -40,12 +40,13 @@ pub(crate) type Receipt = Shared<BoxFuture<'static, JoinOutcome>>;
 #[derive(Default)]
 struct State {
     closed: bool,
+    stop_requested: bool,
     deadline: Option<Instant>,
     tasks: Vec<Receipt>,
     cancelled: bool,
     panicked: bool,
     unavailable: bool,
-    deadline_changed: Arc<tokio::sync::Notify>,
+    shutdown_changed: Arc<tokio::sync::Notify>,
 }
 
 impl State {
@@ -75,11 +76,10 @@ pub struct PluginTaskRegistry {
 }
 
 /// Cooperative stop for an OS-thread plugin worker, derived from the
-/// registry's latched shutdown deadline (the host's owner deadline, clamped
-/// by its stage cap). Workers check it between steps and clamp each step's
-/// own timeout to the remaining budget; at expiry they stop scheduling work
-/// and return, so the retained join completes instead of pinning the
-/// blocking pool and `Runtime::drop`.
+/// registry's shutdown request. Workers stop taking new steps immediately;
+/// the separately latched deadline bounds observation of their original joins.
+/// An interrupted step must release its owned resources before the worker
+/// returns, so a clean drain still requires the physical original to finish.
 #[derive(Clone, Default)]
 pub struct WorkerStop {
     state: Option<Arc<Mutex<State>>>,
@@ -95,7 +95,7 @@ impl WorkerStop {
         });
         if self.is_stopped() || unavailable {
             return Err(format!(
-                "plugin worker stopped at the shutdown deadline or unavailable custody before {context}"
+                "plugin worker stopped after shutdown request, shutdown deadline, or unavailable custody before {context}"
             ));
         }
         Ok(())
@@ -116,8 +116,8 @@ impl WorkerStop {
         }
     }
 
-    /// Bound an owned read step even when shutdown first latches a deadline
-    /// after IO begins. No elapsed deadline polls a new step or extends its cap.
+    /// Interrupt an owned read step when shutdown is requested, including
+    /// after IO begins. The original join remains owned by the registry.
     pub(crate) async fn run_until<T>(
         &self,
         cap: std::time::Duration,
@@ -130,7 +130,7 @@ impl WorkerStop {
         let changed = state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .deadline_changed
+            .shutdown_changed
             .clone();
         tokio::pin!(future);
         loop {
@@ -140,7 +140,7 @@ impl WorkerStop {
             let deadline = self
                 .deadline()
                 .map_or(cap_deadline, |owner| owner.min(cap_deadline));
-            if Instant::now() >= deadline {
+            if self.is_stopped() || Instant::now() >= deadline {
                 return None;
             }
             tokio::select! {
@@ -166,14 +166,24 @@ impl WorkerStop {
         state.deadline
     }
 
-    /// True once the latched deadline has passed.
+    /// True once shutdown requests a stop, or its latched deadline expires.
     pub fn is_stopped(&self) -> bool {
-        self.deadline()
-            .is_some_and(|deadline| Instant::now() >= deadline)
+        self.state.as_ref().is_some_and(|state| {
+            let state = state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.stop_requested
+                || state
+                    .deadline
+                    .is_some_and(|deadline| Instant::now() >= deadline)
+        })
     }
 
     /// `min(cap, remaining)`; zero once stopped. Never extends the deadline.
     pub fn step_timeout(&self, cap: std::time::Duration) -> std::time::Duration {
+        if self.is_stopped() {
+            return std::time::Duration::ZERO;
+        }
         match self.deadline() {
             Some(deadline) => cap.min(deadline.saturating_duration_since(Instant::now())),
             None => cap,
@@ -549,7 +559,6 @@ impl PluginTaskRegistry {
     }
 
     pub async fn shutdown_until(&self, deadline: Instant) -> PluginTaskDrain {
-        let _ = self.poll_originals(); // A poisoned state is reported below.
         let (deadline, tasks) = {
             let Ok(mut state) = self.state.lock() else {
                 return PluginTaskDrain {
@@ -558,14 +567,18 @@ impl PluginTaskRegistry {
                 };
             };
             state.closed = true;
+            state.stop_requested = true;
             let first_deadline = state.deadline.is_none();
             let deadline = *state.deadline.get_or_insert(deadline);
             if first_deadline {
-                state.deadline_changed.notify_waiters();
+                state.shutdown_changed.notify_waiters();
             }
             state.compact();
             (deadline, state.tasks.clone())
         };
+        // Request the stop before polling any retained original. Even an
+        // already-expired observer still takes a non-blocking join census.
+        let _ = self.poll_originals(); // A poisoned state is reported below.
         if !tasks.is_empty() && Instant::now() < deadline {
             tokio::select! {
                 biased;
@@ -771,38 +784,29 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn worker_stop_clamps_steps_to_the_latched_deadline() {
+    async fn worker_stop_requests_immediate_stop_without_extending_the_join_deadline() {
         let registry = PluginTaskRegistry::default();
         let stop = registry.worker_stop();
         let cap = Duration::from_secs(30);
         let budget = Duration::from_millis(20);
-        let one_ms = Duration::from_millis(1);
         assert!(!stop.is_stopped());
         assert_eq!(stop.step_timeout(cap), cap);
 
-        // An empty registry drains immediately, so the paused clock has not
-        // moved: the deadline is latched but not yet reached.
-        let report = registry.shutdown_until(Instant::now() + budget).await;
-        assert!(report.is_clean());
+        // Closing admission alone is not a request to interrupt existing work.
+        registry.close();
         assert!(!stop.is_stopped());
-        assert_eq!(stop.step_timeout(cap), budget);
-        assert_eq!(stop.step_timeout(one_ms), one_ms);
-
-        // Latched: a later shutdown with a longer deadline never extends it.
-        registry
-            .shutdown_until(Instant::now() + Duration::from_secs(60))
-            .await;
-        assert_eq!(stop.step_timeout(cap), budget);
-
-        // One millisecond before the deadline: still running, budget clamped.
-        tokio::time::advance(budget - one_ms).await;
-        assert!(!stop.is_stopped());
-        assert_eq!(stop.step_timeout(cap), one_ms);
-
-        // Exactly at the deadline: stopped, and no step budget remains.
-        tokio::time::advance(one_ms).await;
+        let began = Instant::now();
+        let deadline = began + budget;
+        assert!(registry.shutdown_until(deadline).await.is_clean());
+        assert_eq!(Instant::now(), began);
         assert!(stop.is_stopped());
         assert_eq!(stop.step_timeout(cap), Duration::ZERO);
+        assert_eq!(stop.deadline(), Some(deadline));
+
+        // A later observer neither reopens work nor extends the original join budget.
+        assert!(registry.shutdown_until(began + cap).await.is_clean());
+        assert!(stop.is_stopped());
+        assert_eq!(stop.deadline(), Some(deadline));
         assert_eq!(WorkerStop::never().step_timeout(cap), cap);
     }
 
@@ -926,14 +930,15 @@ mod tests {
             assert!((&mut drain).now_or_never().is_none());
             tokio::time::advance(budget - one_ms).await;
             assert!((&mut drain).now_or_never().is_none());
-            assert!(!registry.worker_stop().is_stopped());
+            assert!(registry.worker_stop().is_stopped());
             tokio::time::advance(one_ms).await;
             let report = drain.await;
             assert_eq!(Instant::now(), deadline);
             assert!(!report.terminal);
             assert!(!report.is_clean(), "stopped at the deadline, not completed");
 
-            // The worker's next stop check observes expiry and it returns
+            // The parked worker has not observed the earlier request yet;
+            // its next stop check observes that request and it returns
             // without doing another unit of work.
             assert!(worker.run_step().await, "worker observes the stop");
             assert_eq!(worker.steps.load(Ordering::SeqCst), 2);
@@ -977,7 +982,7 @@ mod tests {
             let report = drain.await;
             assert!(Instant::now() < deadline);
             assert!(report.is_clean());
-            assert!(!registry.worker_stop().is_stopped());
+            assert!(registry.worker_stop().is_stopped());
             assert_eq!(worker.steps.load(Ordering::SeqCst), 1);
             assert_eq!(worker.receipt.await, JoinOutcome::Joined);
         });
@@ -1059,7 +1064,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn in_flight_step_observes_a_deadline_latched_after_its_first_poll() {
+    async fn in_flight_step_observes_shutdown_requested_after_its_first_poll() {
         let registry = PluginTaskRegistry::default();
         let stop = registry.worker_stop();
         let step = stop.run_until(Duration::from_secs(30), std::future::pending::<()>());
@@ -1067,9 +1072,8 @@ mod tests {
         assert!(futures::poll!(step.as_mut()).is_pending());
         let deadline = Instant::now() + Duration::from_secs(1);
         assert!(registry.shutdown_until(deadline).await.is_clean());
-        tokio::time::advance(Duration::from_secs(1)).await;
         assert_eq!(step.await, None);
-        assert_eq!(Instant::now(), deadline);
+        assert!(Instant::now() < deadline);
     }
 
     #[tokio::test]

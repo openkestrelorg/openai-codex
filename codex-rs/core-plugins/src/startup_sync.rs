@@ -86,12 +86,12 @@ fn sync_stopped() -> bool {
     crate::retirement::ensure_worker_running("curated sync").is_err()
 }
 
-/// Checked between steps: at the shutdown deadline the worker schedules no
-/// further step and returns, so its retained join completes.
+/// Checked between steps: once shutdown is requested the worker schedules no
+/// further step and returns, so its retained join can finish before the deadline.
 fn ensure_not_stopped(next_step: &str) -> Result<(), String> {
     if sync_stopped() {
         return Err(format!(
-            "curated plugins sync stopped at the shutdown deadline before {next_step}"
+            "curated plugins sync stopped after shutdown request or shutdown deadline before {next_step}"
         ));
     }
     Ok(())
@@ -111,9 +111,9 @@ async fn with_step_budget<T>(
         // Do not add an aggregate cap to existing unowned multi-request steps.
         return step.await;
     }
-    stop.run_until(cap, step)
-        .await
-        .ok_or_else(|| format!("{context} stopped by its step budget or the shutdown deadline"))?
+    stop.run_until(cap, step).await.ok_or_else(|| {
+        format!("{context} stopped by its step budget, shutdown request, or shutdown deadline")
+    })?
 }
 
 /// As [`sync_openai_plugins_repo`], cooperatively stopped by `stop`.

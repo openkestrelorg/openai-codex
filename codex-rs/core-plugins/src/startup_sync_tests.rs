@@ -1569,12 +1569,11 @@ async fn late_shutdown_reaps_the_actual_in_flight_git_child() {
     .await
     .unwrap();
     assert!(pid > 0);
-    assert!(
-        !registry
-            .shutdown_until(tokio::time::Instant::now())
-            .await
-            .terminal
-    );
+    // The stop request interrupts this already-running step while there is
+    // still budget to reap the physical original; expiry is not the signal.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    assert!(registry.shutdown_until(deadline).await.is_clean());
+    assert!(tokio::time::Instant::now() < deadline);
     let error = tokio::time::timeout(Duration::from_secs(2), result)
         .await
         .unwrap()
@@ -1635,12 +1634,11 @@ async fn late_shutdown_interrupts_actual_http_without_fallback_or_activation() {
     tokio::time::timeout(Duration::from_secs(2), entered.notified())
         .await
         .unwrap();
-    assert!(
-        !registry
-            .shutdown_until(tokio::time::Instant::now())
-            .await
-            .terminal
-    );
+    // The stop request interrupts this already-running step while there is
+    // still budget to reap the physical original; expiry is not the signal.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    assert!(registry.shutdown_until(deadline).await.is_clean());
+    assert!(tokio::time::Instant::now() < deadline);
     let error = tokio::time::timeout(Duration::from_secs(2), result)
         .await
         .unwrap()

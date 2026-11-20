@@ -8562,6 +8562,44 @@ fn curated_worker_delayed_start_does_not_poll_read_after_deadline() {
 }
 
 #[tokio::test]
+async fn curated_worker_shutdown_interrupts_read_and_joins_before_deadline() {
+    static STARTED: AtomicBool = AtomicBool::new(false);
+    let home = tempfile::tempdir().unwrap();
+    let manager = Arc::new(test_plugins_manager(home.path().to_owned()));
+    let (entered, started) = tokio::sync::oneshot::channel();
+    let receipt = manager
+        .start_curated_repo_sync_with(
+            test_http_client_factory(),
+            None,
+            CuratedSyncStart::begin(&STARTED).unwrap(),
+            move |_, _, stop| {
+                let result = tokio::runtime::Handle::current().block_on(stop.run_until(
+                    Duration::from_secs(30),
+                    async move {
+                        let _ = entered.send(());
+                        std::future::pending::<String>().await
+                    },
+                ));
+                result.ok_or_else(|| "synthetic read interrupted by shutdown".into())
+            },
+        )
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), started)
+        .await
+        .unwrap()
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    assert!(manager.shutdown_until(deadline).await.is_clean());
+    assert!(tokio::time::Instant::now() < deadline);
+    assert_eq!(receipt.await, crate::retirement::JoinOutcome::Joined);
+    assert!(
+        !STARTED.load(Ordering::SeqCst),
+        "interrupted sync remains retryable"
+    );
+    assert!(!curated_plugins_repo_path(home.path()).exists());
+}
+
+#[tokio::test]
 async fn curated_worker_late_sync_success_does_not_begin_cache_publication() {
     static STARTED: AtomicBool = AtomicBool::new(false);
     fn snapshot(
