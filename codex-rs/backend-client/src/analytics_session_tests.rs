@@ -112,3 +112,67 @@ async fn assert_unauthorized_after_recovery(outcome: RefreshOutcome, expected_re
     assert_eq!(credentials.refreshes.load(Ordering::SeqCst), 1);
     server.verify().await;
 }
+
+#[tokio::test]
+async fn request_evidence_tracks_renewed_provider_output_instead_of_opening_auth() {
+    let initial = CodexAuth::from_external_chatgpt_tokens(
+        "e30.eyJleHAiOjQxMDI0NDQ4MDAsImh0dHBzOi8vYXBpLm9wZW5haS5jb20vYXV0aCI6eyJjaGF0Z3B0X3VzZXJfaWQiOiJ1c2VyLWEifX0.opening", "account-a", Some("plus"),
+    ).unwrap();
+    let renewed = CodexAuth::from_external_chatgpt_tokens(
+        "e30.eyJleHAiOjQxMDI0NDQ4MDAsImh0dHBzOi8vYXBpLm9wZW5haS5jb20vYXV0aCI6eyJjaGF0Z3B0X3VzZXJfaWQiOiJ1c2VyLWEifX0.renewed", "account-a", Some("plus"),
+    ).unwrap();
+    let manager = AuthManager::from_auth_for_testing(initial.clone());
+    let server = MockServer::start().await;
+    let token = renewed.get_token().unwrap();
+    Mock::given(method("GET"))
+        .and(wiremock::matchers::header(
+            "authorization",
+            format!("Bearer {token}"),
+        ))
+        .respond_with(ResponseTemplate::new(401))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let client = Client::new_without_redirects(
+        server.uri(),
+        HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+    )
+    .with_auth_provider(codex_model_provider::auth_provider_from_auth_manager(
+        Arc::clone(&manager),
+        &initial,
+    ))
+    .unwrap();
+    manager
+        .set_external_auth(Arc::new(ExternalCredentials {
+            auth: renewed,
+            outcome: RefreshOutcome::Rejected,
+            refreshes: AtomicUsize::new(0),
+        }))
+        .await
+        .unwrap();
+    let (attempt, evidence) = client.clone().observe_request_auth();
+    assert!(evidence.fingerprint().is_none());
+    assert!(
+        attempt
+            .get_accounts_check()
+            .await
+            .unwrap_err()
+            .is_unauthorized()
+    );
+    assert!(
+        evidence.fingerprint()
+            == codex_login::AuthCredentialFingerprint::from_bearer_header(&format!(
+                "Bearer {token}"
+            ))
+    );
+    assert!(
+        evidence.fingerprint()
+            != codex_login::AuthCredentialFingerprint::from_bearer_header(&format!(
+                "Bearer {}",
+                initial.get_token().unwrap()
+            ))
+    );
+    let (_, next_attempt) = client.observe_request_auth();
+    assert!(next_attempt.fingerprint().is_none());
+    server.verify().await;
+}

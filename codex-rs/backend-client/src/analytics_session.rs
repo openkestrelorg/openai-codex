@@ -161,7 +161,11 @@ impl AnalyticsSession {
             self.ensure_identity()
                 .await
                 .map_err(|error| RequestError::Other(anyhow::anyhow!(error)))?;
-            let result = request(self.client.clone()).await;
+            let (client, evidence) = self.client.clone().observe_request_auth();
+            let result = request(client).await;
+            if result.as_ref().is_err_and(RequestError::is_unauthorized) {
+                recovery.record_failed_credential(evidence.fingerprint());
+            }
             // Keep the original 401 when recovery fails so callers retain sign-in guidance.
             if result.as_ref().is_err_and(RequestError::is_unauthorized)
                 && recovery.has_next()

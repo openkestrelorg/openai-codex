@@ -87,13 +87,15 @@ pub(super) async fn resolve_attribution_policy(
                     if auth_generation(auth_manager) != auth_generation_at_start {
                         continue;
                     }
-                    let settings = client.ok()?.get_user_settings().await;
+                    let (client, evidence) = client.ok()?.observe_request_auth();
+                    let settings = client.get_user_settings().await;
                     if auth_generation(auth_manager) != auth_generation_at_start {
                         continue;
                     }
                     match settings {
                         Ok(settings) => Some(settings.commit_attribution_enabled),
                         Err(err) if err.is_unauthorized() && auth_recovery.has_next() => {
+                            auth_recovery.record_failed_credential(evidence.fingerprint());
                             if auth_recovery.next().await.is_ok() {
                                 recovery_generation = auth_generation(auth_manager);
                                 continue;

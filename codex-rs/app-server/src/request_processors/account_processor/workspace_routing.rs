@@ -445,11 +445,13 @@ impl AccountRequestProcessor {
                         )
                         .await
                         .map_err(|_| WorkspaceRoutingError::DiscoveryFailed)?;
+                        let (client, evidence) = client.observe_request_auth();
                         match client.get_accounts_check().await {
                             Ok(response) => break response,
                             Err(error) => {
                                 let unauthorized = error.is_unauthorized();
                                 if unauthorized && recovery.has_next() {
+                                    recovery.record_failed_credential(evidence.fingerprint());
                                     let result = recovery.next().await;
                                     let refreshed = *current_auth_changes.borrow();
                                     if refreshed.owner_generation != auth_state.owner_generation {

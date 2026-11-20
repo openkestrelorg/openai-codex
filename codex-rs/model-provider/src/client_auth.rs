@@ -70,6 +70,17 @@ impl ClientAuth {
         }
     }
 
+    /// Observe one ordinary request's actual provider output. Runtime-bound
+    /// credentials are a different authority and cannot prove rejection of a
+    /// command credential; their evidence deliberately stays empty.
+    pub fn observe_request_auth(&mut self) -> crate::RequestAuthEvidence {
+        let evidence = crate::RequestAuthEvidence::default();
+        if let ClientAuthSource::Provider(provider) = &mut self.source {
+            *provider = evidence.observe(Arc::clone(provider));
+        }
+        evidence
+    }
+
     /// Resolve one request, preserving the source that authenticated the client.
     pub async fn resolve(&self, headers: &HeaderMap) -> Result<ResolvedProviderAuth, AuthError> {
         let mode = match &self.source {

@@ -74,6 +74,7 @@ impl<C: BundleClient> BundleSource for ChatGptSource<C> {
                 Some("auth_recovery_unavailable"),
             ));
         }
+        recovery.record_failed_auth(Some(auth));
         match recovery.next().await {
             Ok(_) => {
                 *auth = self.auth_manager.auth().await.ok_or_else(|| {

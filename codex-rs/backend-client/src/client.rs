@@ -344,6 +344,13 @@ impl Client {
         Ok(self)
     }
 
+    /// Bind fresh evidence to this attempt without changing its selected auth
+    /// source or transport. Call on a clone for each attempt, never a shared client.
+    pub fn observe_request_auth(mut self) -> (Self, codex_model_provider::RequestAuthEvidence) {
+        let evidence = self.auth.observe_request_auth();
+        (self, evidence)
+    }
+
     pub fn with_bearer_token(self, token: String) -> Result<Self> {
         self.with_auth_provider(std::sync::Arc::new(
             codex_model_provider::BearerAuthProvider::new(token),
