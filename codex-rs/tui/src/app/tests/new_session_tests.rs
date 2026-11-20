@@ -633,6 +633,7 @@ async fn plan_implementation_reads_approved_plan_file_in_fresh_session() -> Resu
         }
     }
     insta::assert_snapshot!(user_rows.join("\n"), @"Read the approved plan at <PLAN_FILE> and implement it.");
+    super::safety_buffering::wait_for_turn_completed(&mut app, &mut server, thread_id).await;
     let methods = wire_requests
         .lock()
         .expect("request recorder lock")
@@ -652,8 +653,6 @@ async fn plan_implementation_reads_approved_plan_file_in_fresh_session() -> Resu
         .position(|method| method == "turn/start")
         .expect("first prompt");
     assert!(clear < prepare && prepare < first_turn);
-
-    super::safety_buffering::wait_for_turn_completed(&mut app, &mut server, thread_id).await;
     let requests = response.requests();
     let [initial, after_read] = requests.as_slice() else {
         panic!("expected a plan read and a follow-up request")
