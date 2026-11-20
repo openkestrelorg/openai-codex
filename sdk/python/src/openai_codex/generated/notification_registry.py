@@ -35,7 +35,6 @@ from .v2_all import ItemCompletedNotification
 from .v2_all import ItemGuardianApprovalReviewCompletedNotification
 from .v2_all import ItemGuardianApprovalReviewStartedNotification
 from .v2_all import ItemStartedNotification
-from .v2_all import ManagedTransitionStatusNotification
 from .v2_all import McpServerEventStreamNotification
 from .v2_all import McpServerOauthLoginCompletedNotification
 from .v2_all import McpServerStatusUpdatedNotification
@@ -125,7 +124,6 @@ KnownNotificationPayload: TypeAlias = (
     | ItemGuardianApprovalReviewCompletedNotification
     | ItemGuardianApprovalReviewStartedNotification
     | ItemStartedNotification
-    | ManagedTransitionStatusNotification
     | McpServerEventStreamNotification
     | McpServerOauthLoginCompletedNotification
     | McpServerStatusUpdatedNotification
@@ -190,7 +188,6 @@ KnownNotificationPayload: TypeAlias = (
 NOTIFICATION_MODELS: dict[str, type[KnownNotificationPayload]] = {
     "account/gatewayOAuth/changed": GatewayOAuthChangedNotification,
     "account/login/completed": AccountLoginCompletedNotification,
-    "account/managedAuthTransition/updated": ManagedTransitionStatusNotification,
     "account/rateLimits/updated": AccountRateLimitsUpdatedNotification,
     "account/updated": AccountUpdatedNotification,
     "app/list/updated": AppListUpdatedNotification,

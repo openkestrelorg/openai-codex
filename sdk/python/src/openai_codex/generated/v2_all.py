@@ -2552,69 +2552,6 @@ class ManagedHooksRequirements(BaseModel):
     windows_managed_dir: Annotated[str | None, Field(alias="windowsManagedDir")] = None
 
 
-class ManagedTransitionIntent(Enum):
-    adopt_managed_auth = "adoptManagedAuth"
-    adopt_managed_logout = "adoptManagedLogout"
-
-
-class ManagedTransitionPhase(Enum):
-    idle = "idle"
-    admitted = "admitted"
-    draining = "draining"
-    adopting = "adopting"
-    resetting = "resetting"
-    succeeded = "succeeded"
-    cancelled = "cancelled"
-    quarantined = "quarantined"
-
-
-class ManagedTransitionRefusalKind(Enum):
-    invalid_request = "invalidRequest"
-    process_mismatch = "processMismatch"
-    stale_auth_revision = "staleAuthRevision"
-    stale_transition_revision = "staleTransitionRevision"
-    stale_auth_fingerprint = "staleAuthFingerprint"
-    concurrent_transition = "concurrentTransition"
-    completed_replay = "completedReplay"
-    transition_id_conflict = "transitionIdConflict"
-    late_cancellation = "lateCancellation"
-    authorization_not_admitted = "authorizationNotAdmitted"
-    authoritative_auth_unavailable = "authoritativeAuthUnavailable"
-    drain_timed_out = "drainTimedOut"
-    target_changed = "targetChanged"
-    auth_source_changed = "authSourceChanged"
-    reset_failed = "resetFailed"
-    auth_install_failed = "authInstallFailed"
-    intended_result_mismatch = "intendedResultMismatch"
-
-
-class ManagedTransitionStatus(BaseModel):
-    model_config = ConfigDict(
-        extra="forbid",
-        populate_by_name=True,
-    )
-    auth_revision: Annotated[int, Field(alias="authRevision", ge=0)]
-    intent: ManagedTransitionIntent | None
-    phase: ManagedTransitionPhase
-    prior_auth_fingerprint: Annotated[str | None, Field(alias="priorAuthFingerprint")]
-    prior_auth_revision: Annotated[int, Field(alias="priorAuthRevision", ge=0)]
-    prior_transition_revision: Annotated[int, Field(alias="priorTransitionRevision", ge=0)]
-    process_instance_id: Annotated[str, Field(alias="processInstanceId")]
-    refusal: ManagedTransitionRefusalKind | None
-    result_auth_fingerprint: Annotated[str | None, Field(alias="resultAuthFingerprint")]
-    retryable: bool
-    transition_id: Annotated[str | None, Field(alias="transitionId")]
-    transition_revision: Annotated[int, Field(alias="transitionRevision", ge=0)]
-
-
-class ManagedTransitionStatusNotification(BaseModel):
-    model_config = ConfigDict(
-        extra="forbid",
-        populate_by_name=True,
-    )
-    status: ManagedTransitionStatus
-
-
 class MarketplaceAddParams(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -5031,24 +4968,6 @@ class McpServerEventStreamNotificationServerNotification(BaseModel):
     params: McpServerEventStreamNotification
 
 
-class AccountManagedAuthTransitionUpdatedServerNotification(BaseModel):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    emitted_at_ms: Annotated[
-        int | None,
-        Field(
-            alias="emittedAtMs",
-            description="Unix timestamp (in milliseconds) when app-server emitted this notification.",
-        ),
-    ] = None
-    method: Annotated[
-        Literal["account/managedAuthTransition/updated"],
-        Field(title="Account/managedAuthTransition/updatedNotificationMethod"),
-    ]
-    params: ManagedTransitionStatusNotification
-
-
 class RemoteControlStatusChangedServerNotification(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -6854,13 +6773,6 @@ class ThreadResumeParams(BaseModel):
     sandbox: SandboxMode | None = None
     service_tier: Annotated[str | None, Field(alias="serviceTier")] = None
     thread_id: Annotated[str, Field(alias="threadId")]
-
-
-class ThreadRetentionRefusalReason(Enum):
-    ineligible_principal = "ineligiblePrincipal"
-    authority_unavailable = "authorityUnavailable"
-    unknown_thread = "unknownThread"
-    invalid_thread_id = "invalidThreadId"
 
 
 class ThreadRevertParams(BaseModel):
@@ -9740,20 +9652,6 @@ class LoginAccountParams(
         | AmazonBedrockAccessKeysLoginAccountParams,
         Field(title="LoginAccountParams"),
     ]
-
-
-class ManagedTransitionRefusal(BaseModel):
-    model_config = ConfigDict(
-        extra="forbid",
-        populate_by_name=True,
-    )
-    auth_fingerprint: Annotated[str | None, Field(alias="authFingerprint")]
-    auth_revision: Annotated[int, Field(alias="authRevision", ge=0)]
-    kind: ManagedTransitionRefusalKind
-    process_instance_id: Annotated[str, Field(alias="processInstanceId")]
-    retryable: bool
-    transition_id: Annotated[str, Field(alias="transitionId")]
-    transition_revision: Annotated[int, Field(alias="transitionRevision", ge=0)]
 
 
 class McpResourceReadParams(BaseModel):
@@ -14751,7 +14649,6 @@ class ServerNotification(
         | McpServerOauthLoginCompletedServerNotification
         | McpServerStartupStatusUpdatedServerNotification
         | McpServerEventStreamNotificationServerNotification
-        | AccountManagedAuthTransitionUpdatedServerNotification
         | AccountUpdatedServerNotification
         | AccountGatewayOAuthChangedServerNotification
         | AccountRateLimitsUpdatedServerNotification
@@ -14844,7 +14741,6 @@ class ServerNotification(
         | McpServerOauthLoginCompletedServerNotification
         | McpServerStartupStatusUpdatedServerNotification
         | McpServerEventStreamNotificationServerNotification
-        | AccountManagedAuthTransitionUpdatedServerNotification
         | AccountUpdatedServerNotification
         | AccountGatewayOAuthChangedServerNotification
         | AccountRateLimitsUpdatedServerNotification
