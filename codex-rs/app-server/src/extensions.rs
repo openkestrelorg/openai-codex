@@ -138,6 +138,10 @@ pub(crate) fn thread_extensions(
                 .enabled(codex_features::Feature::SkillSearch),
         },
     );
+    // Release logical turn custody only after every other stop/abort callback.
+    builder.turn_lifecycle_contributor(Arc::new(
+        crate::account_turn_admission::AccountTurnLifecycle,
+    ));
     builder.model_request_contributor(sample_responses);
     Arc::new(builder.build())
 }

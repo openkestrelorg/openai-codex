@@ -235,8 +235,9 @@ pub(crate) fn forward_session_io(io: Arc<SessionIo>, cancel_token: CancellationT
     });
 
     // Forward ops from the caller to the sub-agent.
+    let submissions = caller_io.tx_sub.dispatch_control();
     tokio::spawn(async move {
-        forward_ops(io, rx_ops, cancel_token_ops).await;
+        forward_ops(io, rx_ops, cancel_token_ops, Some(submissions)).await;
     });
 
     caller_io
@@ -329,12 +330,19 @@ pub(crate) async fn run_codex_thread_one_shot(
     let agent_status = io.agent_status.clone();
     let session_loop_termination = io.session_loop_termination.clone();
     let io_for_bridge = io;
+    let child_for_evidence = Arc::clone(&session);
     tokio::spawn(async move {
         while let Ok(event) = io_for_bridge.next_event().await {
             let should_shutdown = matches!(
                 event.msg,
                 EventMsg::TurnComplete(_) | EventMsg::TurnAborted(_)
             );
+            if should_shutdown && let Some(host) = &host {
+                host.turn_work_terminal(
+                    &child_for_evidence.services.thread_extension_data,
+                    &event.id,
+                );
+            }
             let _ = tx_bridge.send(event).await;
             if should_shutdown {
                 let _ = ops_tx
@@ -450,12 +458,16 @@ async fn forward_ops(
     io: Arc<SessionIo>,
     rx_ops: Receiver<Submission>,
     cancel_token_ops: CancellationToken,
+    submissions: Option<crate::session::SubmissionDispatch>,
 ) {
     loop {
         let submission = match rx_ops.recv().or_cancel(&cancel_token_ops).await {
             Ok(Ok(submission)) => submission,
             Ok(Err(_)) | Err(_) => break,
         };
+        let _dispatch = submissions
+            .as_ref()
+            .map(crate::session::SubmissionDispatch::begin);
         let _ = io.submit_with_id(submission).await;
     }
 }

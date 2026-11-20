@@ -269,6 +269,7 @@ mod submission;
 pub(crate) use reasoning_effort::RequestEffortUsage;
 pub(crate) use submission::IdleAdmissionError;
 pub(crate) use submission::Submission;
+pub(crate) use submission::SubmissionDispatch;
 pub(crate) use submission::SubmissionSender;
 mod input_queue;
 mod mailbox;

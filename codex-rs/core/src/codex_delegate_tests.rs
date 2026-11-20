@@ -148,7 +148,7 @@ async fn forward_ops_preserves_submission_trace_context() {
     });
     let (tx_ops, rx_ops) = bounded(1);
     let cancel = CancellationToken::new();
-    let forward = tokio::spawn(forward_ops(Arc::clone(&io), rx_ops, cancel));
+    let forward = tokio::spawn(forward_ops(Arc::clone(&io), rx_ops, cancel, None));
 
     let submission = Submission {
         id: "sub-1".to_string(),
@@ -575,4 +575,95 @@ async fn private_delegate_registers_runtime_identity_with_its_parent_host() {
         drop(members);
     }
     io.shutdown_and_wait().await.expect("delegate shuts down");
+}
+
+#[derive(Debug)]
+struct RefusedDelegateParent {
+    store: String,
+    turn: String,
+    derived: AtomicUsize,
+}
+
+impl codex_extension_api::TurnStartAdmission for RefusedDelegateParent {
+    fn admit_turn_start(&self) -> Option<Box<dyn Send>> {
+        panic!("delegate must not acquire fresh parent admission")
+    }
+
+    fn requires_account_work(&self) -> bool {
+        true
+    }
+
+    fn derive_operation_work(
+        &self,
+        store: &codex_extension_api::ExtensionData,
+        turn: &str,
+    ) -> Result<
+        Option<Box<dyn codex_extension_api::HostOperationWork>>,
+        codex_extension_api::TurnWorkRefused,
+    > {
+        assert_eq!(store.level_id(), self.store);
+        assert_eq!(turn, self.turn);
+        self.derived.fetch_add(1, Ordering::SeqCst);
+        Err(codex_extension_api::TurnWorkRefused::Unavailable)
+    }
+}
+
+async fn refused_parent_delegate(one_shot: bool) {
+    let (mut parent, context, _events) =
+        crate::session::tests::make_session_and_context_with_rx().await;
+    let gate = Arc::new(RefusedDelegateParent {
+        store: parent.services.thread_extension_data.level_id().to_owned(),
+        turn: context.sub_id.clone(),
+        derived: AtomicUsize::new(0),
+    });
+    Arc::get_mut(&mut parent)
+        .expect("unique parent")
+        .services
+        .host_admission = Some(gate.clone());
+    let mut config = context.config.as_ref().clone();
+    config.permissions.approval_policy = Constrained::allow_only(AskForApproval::Never);
+    let result = if one_shot {
+        run_codex_thread_one_shot(
+            config,
+            parent.services.auth_manager.clone(),
+            parent.services.models_manager.clone(),
+            Vec::new(),
+            parent,
+            context,
+            CancellationToken::new(),
+            SubAgentSource::Review,
+            None,
+            None,
+        )
+        .await
+    } else {
+        run_codex_thread_interactive(
+            config,
+            parent.services.auth_manager.clone(),
+            parent.services.models_manager.clone(),
+            parent.clone(),
+            context.clone(),
+            context.initial_environments.clone(),
+            CancellationToken::new(),
+            SubAgentSource::Review,
+            codex_extension_api::SessionIsolation::Inherit,
+            None,
+            GitEnrichmentPolicy::Fresh,
+            codex_sandboxing::WindowsSandboxProxySettingsMode::Reconcile,
+        )
+        .await
+    };
+    assert!(matches!(result, Err(CodexErr::Fatal(ref message))
+        if message == "MCP turn account work is unavailable"));
+    assert_eq!(gate.derived.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn interactive_delegate_refuses_exact_parent_work_before_construction() {
+    refused_parent_delegate(false).await;
+}
+
+#[tokio::test]
+async fn one_shot_delegate_refuses_exact_parent_work_before_construction() {
+    refused_parent_delegate(true).await;
 }
