@@ -109,23 +109,7 @@ impl SessionInner {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .admit_invocation(&call)?;
-        let callback_span = tracing::info_span!(
-            "code_mode.grpc.callback",
-            otel.name = "code_mode.grpc.callback",
-            session.id = %call.session_id,
-            execution.id = %call.execution_id,
-            cell.id = %call.cell_id,
-            invocation.id = %call.invocation_id,
-        );
-        if let Some(traceparent) = call.traceparent.as_ref() {
-            codex_otel::set_parent_from_w3c_trace_context(
-                &callback_span,
-                &W3cTraceContext {
-                    traceparent: Some(traceparent.clone()),
-                    tracestate: None,
-                },
-            );
-        }
+        let callback_span = callback_span(&call);
         let invocation_id = call.invocation_id.clone();
         let cancellation = match admission {
             CallbackAdmission::Active(cancellation, delegate) => Ok((cancellation, delegate)),
@@ -271,3 +255,27 @@ impl SessionInner {
 #[cfg(test)]
 #[path = "callbacks_tests.rs"]
 mod tests;
+
+// Select the incoming context before managed telemetry eagerly builds the span.
+fn callback_span(call: &grpc::ToolCall) -> tracing::Span {
+    let parent = call.traceparent.as_ref().and_then(|traceparent| {
+        codex_otel::context_from_w3c_trace_context(&W3cTraceContext {
+            traceparent: Some(traceparent.clone()),
+            tracestate: None,
+        })
+    });
+    codex_otel::span_with_parent_context(parent, || {
+        tracing::info_span!(
+            "code_mode.grpc.callback",
+            otel.name = "code_mode.grpc.callback",
+            session.id = %call.session_id,
+            execution.id = %call.execution_id,
+            cell.id = %call.cell_id,
+            invocation.id = %call.invocation_id,
+        )
+    })
+}
+
+#[cfg(test)]
+#[path = "callbacks_managed_trace_parent_tests.rs"]
+mod managed_trace_parent_tests;

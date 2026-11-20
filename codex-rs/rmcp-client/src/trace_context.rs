@@ -132,9 +132,9 @@ pub(crate) fn request_span_and_trace_headers(
         .get("method")
         .and_then(Value::as_str)
         .unwrap_or("unknown");
-    let span = tracing::info_span!("mcp.http.request", mcp.method = method);
-    // Set the parent before the span is entered; never reparent the shared worker.
-    codex_otel::set_parent_from_context(&span, context.clone());
+    let span = codex_otel::span_with_parent_context(Some(context.clone()), || {
+        tracing::info_span!("mcp.http.request", mcp.method = method)
+    });
     if codex_otel::span_w3c_trace_context(&span).is_none()
         && let Some(trace) = codex_otel::w3c_trace_context_from_context(&context)
     {
@@ -156,3 +156,7 @@ pub(crate) fn request_span_and_trace_headers(
 #[cfg(test)]
 #[path = "trace_context_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "managed_trace_parent_tests.rs"]
+mod managed_trace_parent_tests;
