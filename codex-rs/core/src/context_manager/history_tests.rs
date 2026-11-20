@@ -553,6 +553,63 @@ fn legacy_checkpoint_rollback_keeps_answers_before_a_same_turn_steer() {
 }
 
 #[test]
+fn legacy_rollback_keeps_an_answer_to_a_call_before_an_unsequenced_steer() {
+    for with_message_ids in [true, false] {
+        let mut checkpoint: codex_history::CompactedItem = serde_json::from_value(json!({
+            "message": "Legacy unsequenced rollout.",
+            "replacement_history": [
+                {"type": "message", "id": if with_message_ids { Some("initial") } else { None },
+                 "role": "user", "content": [{"type": "input_text", "text": "Inspect."}]},
+                {"type": "function_call", "call_id": "before", "name": "request_user_input", "arguments": "{}"},
+                {"type": "message", "id": if with_message_ids { Some("steer") } else { None },
+                 "role": "user", "content": [{"type": "input_text", "text": "Inspect the README too."}]},
+                {"type": "function_call", "call_id": "after", "name": "request_user_input", "arguments": "{}"}
+            ]
+        })).expect("legacy rollout");
+        let mut items = checkpoint.replacement_history.take().unwrap();
+        for item in &mut items {
+            item.item.set_turn_id_if_missing("shared-turn");
+        }
+        let mut history = root_history();
+        history.record_annotated_items(&mut items, TruncationPolicy::Tokens(10_000));
+        // Both replies arrive after the steer; source-call identity, not arrival, owns them.
+        for call_id in ["before", "after"] {
+            history.record_retained_context(&codex_history::RetainedContextEvent::VerifiedAnswer {
+                answer: codex_history::VerifiedAnswer {
+                    turn_id: "shared-turn".to_owned(),
+                    call_id: call_id.to_owned(),
+                    questions: vec![codex_history::VerifiedQuestionAnswer {
+                        question: "Publish?".to_owned(),
+                        answer: "Only privately.".to_owned(),
+                    }],
+                },
+                acceptance_order: None,
+            });
+        }
+        history.drop_last_n_user_turns(1);
+        assert_eq!(
+            history
+                .retained_context()
+                .verified_answers()
+                .map(|answer| answer.call_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["before"],
+        );
+        assert_eq!(
+            history
+                .retained_context()
+                .ordered_entries()
+                .filter(|(_, entry)| matches!(
+                    entry,
+                    codex_history::RetainedContextEntry::UserMessage(_)
+                ))
+                .count(),
+            1
+        );
+    }
+}
+
+#[test]
 fn conversation_history_snapshot_excludes_contextual_user_messages() {
     let contextual_message = crate::context::ContextualUserFragment::into(UserInstructions {
         directory: None,
