@@ -74,6 +74,9 @@ pub(crate) async fn run_codex_thread_interactive(
         return Err(CodexErr::TurnAborted);
     }
     config.permissions.approval_policy = Constrained::allow_only(AskForApproval::Never);
+    let initial_mcp_work = parent_session
+        .turn_mcp_work(&parent_ctx)
+        .map_err(|error| CodexErr::Fatal(error.to_string()))?;
     config.model_provider.supports_websockets &= parent_session
         .services
         .model_client
@@ -105,7 +108,7 @@ pub(crate) async fn run_codex_thread_interactive(
     let spawn_result = Session::spawn(SessionSpawnArgs {
         deferred_clear_session_start: None,
         host_admission: parent_session.services.host_admission.clone(),
-        initial_mcp_work: None,
+        initial_mcp_work,
         control_endpoint: None,
         attached_thread: false,
         startup: Some(Arc::clone(&startup)),
@@ -259,6 +262,8 @@ pub(crate) async fn run_codex_thread_one_shot(
     // requiring the caller to cancel the parent token.
     let child_cancel = cancel_token.child_token();
     let parent_turn_id = parent_ctx.sub_id.clone();
+    let parent_for_admission = Arc::clone(&parent_session);
+    let host = parent_session.services.host_admission.clone();
     let parent_environments = parent_ctx.initial_environments.clone();
     let root_turn_id = parent_ctx.turn_metadata_state.root_turn_id();
     let (session, io) = Box::pin(run_codex_thread_interactive(
@@ -278,6 +283,23 @@ pub(crate) async fn run_codex_thread_one_shot(
     .await?;
 
     // Send the initial input to kick off the one-shot turn.
+    let termination = io.session_loop_termination.clone();
+    let host_work = match &host {
+        Some(host) => host
+            .derive_turn_work(
+                &parent_for_admission.services.thread_extension_data,
+                &parent_turn_id,
+                &session.services.thread_extension_data,
+                Box::pin(async move {
+                    termination.await;
+                }),
+            )
+            .map_err(|_| {
+                CodexErr::Fatal("delegate parent has no admitted account work".to_string())
+            })?,
+        None => None,
+    };
+    drop(parent_for_admission);
     let submission = io
         .submit_turn_input(
             TurnInputRequest::user_input(input).on_start(TurnStartOptions {
@@ -288,7 +310,7 @@ pub(crate) async fn run_codex_thread_one_shot(
                 ..Default::default()
             }),
             TurnInputMode::StartIfIdle,
-            /*host_work*/ None,
+            host_work,
             /*residency_guard*/ None,
         )
         .await?;
