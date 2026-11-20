@@ -604,7 +604,7 @@ fn legacy_rollback_keeps_an_answer_to_a_call_before_an_unsequenced_steer() {
                     codex_history::RetainedContextEntry::UserMessage(_)
                 ))
                 .count(),
-            1
+            usize::from(with_message_ids)
         );
     }
 }
