@@ -264,6 +264,10 @@ impl ModelCatalog {
         .map_err(|_| std::io::Error::other("model auth task custody unavailable"))?
     }
 
+    pub(crate) fn auth_task_census(&self) -> crate::processor_task_retirement::ProcessorTaskCensus {
+        self.auth_tasks.census()
+    }
+
     /// Separate original-join proof: permit zero alone is not a clean auth-task census.
     pub(crate) async fn observe_auth_tasks_until(
         &self,

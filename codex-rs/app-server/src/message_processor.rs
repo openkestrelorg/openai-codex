@@ -301,6 +301,35 @@ pub(crate) struct ProcessorBackgroundShutdown {
     pub login: Result<crate::request_processors::AccountLoginReport, ()>,
 }
 
+/// A missing slot means that family has not returned an observation.
+#[derive(Debug, Default)]
+pub(crate) struct ProcessorBackgroundProgress {
+    pub models: Option<crate::models_refresh_worker::ModelsRefreshShutdown>,
+    pub turn_cost: Option<Option<crate::turn_cost_worker::TurnCostShutdown>>,
+    pub thread_starts: Option<crate::processor_task_retirement::ProcessorTaskDrain>,
+    pub apps: Option<crate::request_processors::AppsShutdown>,
+    pub skills: Option<crate::skills_watcher::SkillsWatcherShutdown>,
+    pub plugins: Option<codex_core_plugins::PluginTaskDrain>,
+    pub command_exec: Option<crate::command_exec::CommandExecSandboxShutdown>,
+    pub model_auth: Option<crate::processor_task_retirement::ProcessorTaskDrain>,
+    pub request_auth: Option<crate::processor_task_retirement::ProcessorTaskDrain>,
+    pub auxiliary_tasks: Option<crate::processor_task_retirement::ProcessorTaskDrain>,
+    pub workspace_routing: Option<crate::processor_task_retirement::ProcessorTaskDrain>,
+    pub login: Option<Result<crate::request_processors::AccountLoginReport, ()>>,
+}
+
+pub(crate) type SharedBackgroundProgress = Arc<std::sync::Mutex<ProcessorBackgroundProgress>>;
+
+#[derive(Debug)]
+pub(crate) struct ProcessorBackgroundTimeoutCensus {
+    pub finished: ProcessorBackgroundProgress,
+    pub unfinished: Vec<&'static str>,
+    pub registries: std::collections::BTreeMap<
+        &'static str,
+        crate::processor_task_retirement::ProcessorTaskCensus,
+    >,
+}
+
 impl ProcessorBackgroundShutdown {
     pub(crate) fn is_clean(&self) -> bool {
         self.models == crate::models_refresh_worker::ModelsRefreshShutdown::Joined
@@ -1369,6 +1398,27 @@ impl MessageProcessor {
         &self,
         deadline: tokio::time::Instant,
     ) -> ProcessorBackgroundShutdown {
+        let progress = SharedBackgroundProgress::default();
+        self.drain_background_tasks_recording(deadline, &progress)
+            .await
+    }
+
+    pub(crate) async fn drain_background_tasks_recording(
+        &self,
+        deadline: tokio::time::Instant,
+        progress: &SharedBackgroundProgress,
+    ) -> ProcessorBackgroundShutdown {
+        macro_rules! record {
+            ($field:ident, $work:expr) => {
+                async {
+                    let report = $work.await;
+                    progress
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .$field = Some(report);
+                }
+            };
+        }
         let deadline = self
             .intake_shutdown_deadline
             .get()
@@ -1382,57 +1432,177 @@ impl MessageProcessor {
         }
         let login = self.begin_login_shutdown(deadline);
         let plugins = self.thread_manager.plugins_manager();
-        let (
-            models,
-            turn_cost,
-            thread_starts,
-            apps,
-            skills,
-            plugins,
-            command_exec,
-            workspace_routing,
-            auxiliary_tasks,
-            login,
-        ) = tokio::join!(
-            self.shutdown_models_refresh_worker_until(deadline),
-            async {
+        tokio::join!(
+            record!(models, self.shutdown_models_refresh_worker_until(deadline)),
+            record!(turn_cost, async {
                 match &self.turn_cost_worker {
                     Some(worker) => Some(worker.shutdown_until(deadline).await),
                     None => None,
                 }
-            },
-            self.thread_processor.drain_background_tasks_until(deadline),
-            self.apps_processor.shutdown_until(deadline),
-            self.skills_watcher.shutdown_until(deadline),
-            plugins.shutdown_until(deadline),
-            self.command_exec_processor
-                .sandbox_cleanup_shutdown_until(deadline),
-            self.workspace_routing_tasks.shutdown_until(deadline),
-            self.auxiliary_tasks.shutdown_until(deadline),
-            async {
+            }),
+            record!(
+                thread_starts,
+                self.thread_processor.drain_background_tasks_until(deadline)
+            ),
+            record!(apps, self.apps_processor.shutdown_until(deadline)),
+            record!(skills, self.skills_watcher.shutdown_until(deadline)),
+            record!(plugins, plugins.shutdown_until(deadline)),
+            record!(
+                command_exec,
+                self.command_exec_processor
+                    .sandbox_cleanup_shutdown_until(deadline)
+            ),
+            record!(
+                workspace_routing,
+                self.workspace_routing_tasks.shutdown_until(deadline)
+            ),
+            record!(
+                auxiliary_tasks,
+                self.auxiliary_tasks.shutdown_until(deadline)
+            ),
+            record!(login, async {
                 match login {
                     Ok(owner) => Ok(owner.wait().await),
                     Err(_) => Err(()),
                 }
-            },
+            }),
         );
         // The periodic model producer must finish before taking this auth-task
         // observation. A timeout/panic above remains unclean even if this is zero.
-        let model_auth = self.model_catalog.observe_auth_tasks_until(deadline).await;
-        let request_auth = self.request_auth_tasks.shutdown_until(deadline).await;
-        ProcessorBackgroundShutdown {
-            models,
-            turn_cost,
-            thread_starts,
-            apps,
-            skills,
-            plugins,
-            command_exec,
+        record!(
             model_auth,
+            self.model_catalog.observe_auth_tasks_until(deadline)
+        )
+        .await;
+        record!(
             request_auth,
-            workspace_routing,
-            auxiliary_tasks,
-            login,
+            self.request_auth_tasks.shutdown_until(deadline)
+        )
+        .await;
+        let mut reports = progress
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        ProcessorBackgroundShutdown {
+            models: reports.models.take().expect("completed models observation"),
+            turn_cost: reports
+                .turn_cost
+                .take()
+                .expect("completed turn_cost observation"),
+            thread_starts: reports
+                .thread_starts
+                .take()
+                .expect("completed thread_starts observation"),
+            apps: reports.apps.take().expect("completed apps observation"),
+            skills: reports.skills.take().expect("completed skills observation"),
+            plugins: reports
+                .plugins
+                .take()
+                .expect("completed plugins observation"),
+            command_exec: reports
+                .command_exec
+                .take()
+                .expect("completed command_exec observation"),
+            model_auth: reports
+                .model_auth
+                .take()
+                .expect("completed model_auth observation"),
+            request_auth: reports
+                .request_auth
+                .take()
+                .expect("completed request_auth observation"),
+            auxiliary_tasks: reports
+                .auxiliary_tasks
+                .take()
+                .expect("completed auxiliary_tasks observation"),
+            workspace_routing: reports
+                .workspace_routing
+                .take()
+                .expect("completed workspace_routing observation"),
+            login: reports.login.take().expect("completed login observation"),
+        }
+    }
+
+    /// No await, no aggregate poll, and no new join budget after stage expiry.
+    pub(crate) fn background_census_after_timeout(
+        &self,
+        deadline: tokio::time::Instant,
+        progress: &SharedBackgroundProgress,
+    ) -> ProcessorBackgroundTimeoutCensus {
+        let deadline = self
+            .intake_shutdown_deadline
+            .get()
+            .copied()
+            .map_or(deadline, |intake| intake.min(deadline));
+        // The aggregate may never have received a first poll if the owner
+        // deadline was already expired. Request stop synchronously as well.
+        self.thread_manager
+            .plugins_manager()
+            .request_shutdown(deadline);
+        let finished = std::mem::take(
+            &mut *progress
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        let mut unfinished = Vec::new();
+        if finished.models.is_none() {
+            unfinished.push("models");
+        }
+        if finished.turn_cost.is_none() {
+            unfinished.push("turn_cost");
+        }
+        if finished.thread_starts.is_none() {
+            unfinished.push("thread_starts");
+        }
+        if finished.apps.is_none() {
+            unfinished.push("apps");
+        }
+        if finished.skills.is_none() {
+            unfinished.push("skills");
+        }
+        if finished.plugins.is_none() {
+            unfinished.push("plugins");
+        }
+        if finished.command_exec.is_none() {
+            unfinished.push("command_exec");
+        }
+        if finished.model_auth.is_none() {
+            unfinished.push("model_auth");
+        }
+        if finished.request_auth.is_none() {
+            unfinished.push("request_auth");
+        }
+        if finished.auxiliary_tasks.is_none() {
+            unfinished.push("auxiliary_tasks");
+        }
+        if finished.workspace_routing.is_none() {
+            unfinished.push("workspace_routing");
+        }
+        if finished.login.is_none() {
+            unfinished.push("login");
+        }
+        let registries = std::collections::BTreeMap::from([
+            (
+                "thread_starts",
+                self.thread_processor.background_task_census(deadline),
+            ),
+            (
+                "workspace_routing",
+                self.workspace_routing_tasks.close_and_census(deadline),
+            ),
+            (
+                "auxiliary_tasks",
+                self.auxiliary_tasks.close_and_census(deadline),
+            ),
+            (
+                "request_auth",
+                self.request_auth_tasks.close_and_census(deadline),
+            ),
+            ("model_auth", self.model_catalog.auth_task_census()),
+        ]);
+        ProcessorBackgroundTimeoutCensus {
+            finished,
+            unfinished,
+            registries,
         }
     }
 
@@ -1445,18 +1615,6 @@ impl MessageProcessor {
         if !report.is_clean() {
             tracing::warn!(?report, "processor background retirement incomplete");
         }
-    }
-
-    /// Standalone host drain: the historical worker stops plus the census the
-    /// in-process host takes, under the caller's already-clamped deadline.
-    pub(crate) async fn drain_standalone_background_tasks_until(
-        &self,
-        deadline: tokio::time::Instant,
-    ) -> ProcessorBackgroundShutdown {
-        if let Some(worker) = &self.turn_cost_worker {
-            worker.shutdown();
-        }
-        self.drain_background_tasks_until(deadline).await
     }
 
     /// Census of the plugin worker registry (curated sync and refresh

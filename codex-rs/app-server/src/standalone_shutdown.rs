@@ -567,6 +567,8 @@ pub(crate) trait StandaloneStages {
     fn bind_runtimes(&mut self, owner_deadline: Instant) -> BoxFuture<'static, bool>;
     fn connections(&mut self, stage_deadline: Instant) -> BoxFuture<'static, bool>;
     fn background(&mut self, stage_deadline: Instant) -> BoxFuture<'static, bool>;
+    /// Observe components without polling the timed-out aggregate or waiting.
+    fn background_timed_out(&mut self, stage_deadline: Instant);
     /// Plugin worker registry census (curated sync); sticky once latched.
     fn plugin_tasks(&mut self, stage_deadline: Instant) -> BoxFuture<'static, bool>;
     fn threads(&mut self, stage_deadline: Instant) -> BoxFuture<'static, bool>;
@@ -591,6 +593,8 @@ pub(crate) async fn drain_processor_stages<S: StandaloneStages>(
     let work = stages.background(deadline);
     if let Some(clean) = owner.drive("background", deadline, work).await {
         owner.record("background", clean);
+    } else {
+        stages.background_timed_out(deadline);
     }
     let deadline = owner.stage_deadline(caps.background);
     let work = stages.plugin_tasks(deadline);

@@ -3,6 +3,49 @@ use pretty_assertions::assert_eq;
 use std::sync::Arc;
 use std::time::Duration;
 
+#[tokio::test(start_paused = true)]
+async fn synchronous_shutdown_census_closes_births_without_waiting_or_losing_original() {
+    let tasks = ProcessorTasks::default();
+    let (release, released) = tokio::sync::oneshot::channel();
+    let receipt = tasks
+        .spawn(async move {
+            let _ = released.await;
+        })
+        .unwrap();
+    let began = Instant::now();
+    let census = tasks.close_and_census(began);
+    assert_eq!(Instant::now(), began);
+    assert_eq!(census.pending, Some(1));
+    assert!(!census.drain.terminal);
+    assert!(tasks.spawn(async {}).is_err());
+    release.send(()).unwrap();
+    assert_eq!(receipt.await, ProcessorTaskJoin::Joined);
+    assert!(
+        tasks
+            .shutdown_until(began + Duration::from_secs(30))
+            .await
+            .is_clean()
+    );
+    assert_eq!(Instant::now(), began);
+    assert_eq!(tasks.census().pending, Some(0));
+}
+
+#[tokio::test]
+async fn synchronous_census_preserves_panic_and_unverified_facts() {
+    let tasks = ProcessorTasks::default();
+    let panic = tasks
+        .spawn(async { panic!("census original panic") })
+        .unwrap();
+    assert_eq!(panic.await, ProcessorTaskJoin::Panicked);
+    let unverified = tasks.spawn_unverified(async {}).unwrap();
+    assert_eq!(unverified.await, ProcessorTaskJoin::Joined);
+    let census = tasks.close_and_census(Instant::now());
+    assert_eq!(census.pending, Some(0));
+    assert!(census.drain.terminal && census.drain.panicked && census.drain.unverified);
+    assert!(!census.drain.is_clean());
+    assert_eq!(tasks.census(), census);
+}
+
 #[tokio::test]
 async fn panic_is_sticky_after_join_compaction() {
     let tasks = ProcessorTasks::default();

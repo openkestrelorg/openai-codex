@@ -1046,6 +1046,11 @@ impl PluginsManager {
     }
 
     /// Observe this manager's actual plugin originals, never a cancellation acknowledgement.
+    /// Signal workers without waiting or claiming that their originals joined.
+    pub fn request_shutdown(&self, deadline: tokio::time::Instant) {
+        self.task_registry.request_shutdown(deadline);
+    }
+
     pub async fn shutdown_until(&self, deadline: tokio::time::Instant) -> crate::PluginTaskDrain {
         self.task_registry.shutdown_until(deadline).await
     }

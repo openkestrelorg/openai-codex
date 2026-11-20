@@ -1616,6 +1616,13 @@ impl ThreadRequestProcessor {
 
     /// Close birth and observe the exact retained originals. Observer cancellation
     /// or an expired wait never removes their join receipts from this owner.
+    pub(crate) fn background_task_census(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> crate::processor_task_retirement::ProcessorTaskCensus {
+        self.background_tasks.close_and_census(deadline)
+    }
+
     pub(crate) async fn drain_background_tasks_until(
         &self,
         deadline: tokio::time::Instant,

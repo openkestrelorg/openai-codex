@@ -242,6 +242,7 @@ fn account_reply_drop(
 /// any parked connection cleanup stay owned until the host returns.
 struct ProcessorShutdownStages {
     processor: Arc<MessageProcessor>,
+    background_progress: crate::message_processor::SharedBackgroundProgress,
     connections: Vec<(ConnectionId, ConnectionState)>,
     cleanup: Option<ConnectionCleanupTasks>,
     thread_retirement: Option<crate::request_processors::ProcessorThreadRetirement>,
@@ -300,9 +301,10 @@ impl standalone_shutdown::StandaloneStages for ProcessorShutdownStages {
 
     fn background(&mut self, stage_deadline: tokio::time::Instant) -> BoxFuture<'static, bool> {
         let processor = Arc::clone(&self.processor);
+        let progress = Arc::clone(&self.background_progress);
         async move {
             let report = processor
-                .drain_standalone_background_tasks_until(stage_deadline)
+                .drain_background_tasks_recording(stage_deadline, &progress)
                 .await;
             if !report.is_clean() {
                 warn!(?report, "standalone background shutdown incomplete");
@@ -310,6 +312,18 @@ impl standalone_shutdown::StandaloneStages for ProcessorShutdownStages {
             report.is_clean()
         }
         .boxed()
+    }
+
+    fn background_timed_out(&mut self, stage_deadline: tokio::time::Instant) {
+        let census = self
+            .processor
+            .background_census_after_timeout(stage_deadline, &self.background_progress);
+        warn!(finished = ?census.finished, unfinished = ?census.unfinished,
+            "standalone background shutdown timed out; component census");
+        for (component, observation) in &census.registries {
+            warn!(component, pending = ?observation.pending, drain = ?observation.drain,
+                "standalone background shutdown timed out; registry census");
+        }
     }
 
     fn plugin_tasks(&mut self, stage_deadline: tokio::time::Instant) -> BoxFuture<'static, bool> {
@@ -1815,6 +1829,7 @@ pub async fn run_main_with_transport_options(
             if !shutdown_state.forced() {
                 let mut stages = ProcessorShutdownStages {
                     processor: Arc::clone(&processor),
+                    background_progress: Default::default(),
                     connections: connections.drain().collect(),
                     cleanup: Some(connection_cleanup_tasks),
                     thread_retirement: None,

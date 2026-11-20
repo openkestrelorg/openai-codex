@@ -65,6 +65,7 @@ struct FakeStages {
     plugin_tasks_stall: bool,
     connections_probe: Probe,
     background_probe: Probe,
+    background_census_calls: usize,
     threads_probe: Probe,
     bound_at: Option<Instant>,
     /// The runtime binding found a runtime it could not bind (Legacy cleanup).
@@ -96,6 +97,10 @@ impl StandaloneStages for FakeStages {
         stage(self.background, &self.background_probe)
     }
 
+    fn background_timed_out(&mut self, _stage_deadline: Instant) {
+        self.background_census_calls += 1;
+    }
+
     fn plugin_tasks(&mut self, _stage_deadline: Instant) -> BoxFuture<'static, bool> {
         let delay = (!self.plugin_tasks_stall).then_some(Duration::ZERO);
         stage(delay, &Probe::default())
@@ -112,6 +117,19 @@ fn outcome(owner: &StandaloneShutdownOwner, name: &str) -> Option<StageOutcome> 
         .iter()
         .find(|record| record.stage == name)
         .map(|record| record.outcome)
+}
+
+#[tokio::test(start_paused = true)]
+async fn expired_background_still_takes_census_without_polling_the_aggregate() {
+    let now = Instant::now();
+    let mut owner = StandaloneShutdownOwner::new(now, OwnerExpiry::never());
+    let mut stages = FakeStages::default();
+    drain_processor_stages(&mut owner, &mut stages, STANDALONE_STAGE_CAPS).await;
+    assert_eq!(Instant::now(), now);
+    assert_eq!(outcome(&owner, "background"), Some(StageOutcome::TimedOut));
+    assert_eq!(stages.background_probe.polls(), 0);
+    assert_eq!(stages.background_census_calls, 1);
+    assert!(!owner.is_complete());
 }
 
 #[tokio::test(start_paused = true)]
@@ -136,6 +154,7 @@ async fn stalled_thread_cleanup_keeps_its_shorter_cap_and_times_out() {
         Some(("threads", THREAD_SHUTDOWN_CAP))
     );
     assert_eq!(stages.bound_at, Some(start + SHUTDOWN_ACK_TIMEOUT));
+    assert_eq!(stages.background_census_calls, 0);
     assert_eq!(outcome(&owner, "connections"), Some(StageOutcome::Complete));
     assert_eq!(outcome(&owner, "threads"), Some(StageOutcome::TimedOut));
     assert!(owner.timed_out());
@@ -163,6 +182,12 @@ async fn standalone_exit_with_stalled_thread_cleanup_returns_by_owner_deadline()
     assert_eq!(outcome(&owner, "connections"), Some(StageOutcome::Complete));
     assert_eq!(outcome(&owner, "background"), Some(StageOutcome::TimedOut));
     assert_eq!(outcome(&owner, "threads"), Some(StageOutcome::TimedOut));
+    assert_eq!(stages.background_census_calls, 1);
+    let polls_at_expiry = stages.background_probe.polls();
+    tokio::time::advance(Duration::from_secs(60)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(stages.background_probe.polls(), polls_at_expiry);
+    assert!(!stages.background_probe.dropped());
     // Reached after expiry: retained, but never polled even once.
     assert_eq!(stages.threads_probe.polls(), 0);
     assert!(!stages.threads_probe.dropped());

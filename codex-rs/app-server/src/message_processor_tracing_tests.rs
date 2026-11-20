@@ -807,6 +807,62 @@ async fn processor_thread_shutdown_facade_retains_first_attempt() -> Result<()> 
 #[tokio::test]
 #[expect(
     clippy::await_holding_invalid_type,
+    reason = "the fixture settles the model worker under its owner lock before testing the background census"
+)]
+async fn timed_out_background_keeps_component_reports_and_closes_request_auth() -> Result<()> {
+    use crate::message_processor::SharedBackgroundProgress;
+    use tokio::time::Instant;
+
+    let home = TempDir::new()?;
+    let config = Arc::new(build_test_config(home.path(), "http://127.0.0.1:1").await?);
+    let (processor, _outgoing) = build_test_processor_for_retirement(config).await;
+    assert_eq!(
+        processor
+            .models_refresh_worker
+            .lock()
+            .await
+            .shutdown_until(Instant::now() + std::time::Duration::from_secs(5))
+            .await,
+        crate::models_refresh_worker::ModelsRefreshShutdown::Joined
+    );
+    let (release, released) = tokio::sync::oneshot::channel();
+    let held = processor
+        .auxiliary_tasks
+        .spawn(async move {
+            let _ = released.await;
+        })
+        .unwrap();
+    let progress = SharedBackgroundProgress::default();
+    let deadline = Instant::now() + std::time::Duration::from_millis(20);
+    let aggregate = processor.drain_background_tasks_recording(deadline, &progress);
+    tokio::pin!(aggregate);
+    assert!(
+        crate::standalone_shutdown::poll_before(deadline, aggregate.as_mut())
+            .await
+            .is_none()
+    );
+    let census = processor.background_census_after_timeout(deadline, &progress);
+    assert_eq!(
+        census.unfinished,
+        vec!["model_auth", "request_auth", "auxiliary_tasks"]
+    );
+    assert!(census.finished.models.is_some());
+    assert!(census.finished.plugins.is_some());
+    assert_eq!(census.registries["auxiliary_tasks"].pending, Some(1));
+    assert!(!census.registries["auxiliary_tasks"].drain.terminal);
+    assert!(processor.request_auth_tasks.spawn(async {}).is_err());
+    release.send(()).unwrap();
+    assert_eq!(
+        held.await,
+        crate::processor_task_retirement::ProcessorTaskJoin::Joined
+    );
+    // The retained aggregate is never polled again, even after its original joins.
+    Ok(())
+}
+
+#[tokio::test]
+#[expect(
+    clippy::await_holding_invalid_type,
     reason = "the fixture exclusively observes worker shutdown under its owner lock before testing background custody"
 )]
 async fn background_drain_timeout_retains_work_and_reobserves_completion() -> Result<()> {
@@ -915,6 +971,88 @@ async fn background_drain_timeout_retains_work_and_reobserves_completion() -> Re
     assert!(weak_resource.upgrade().is_none());
     processor.clear_runtime_references();
     processor.shutdown_threads().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn production_plugin_change_callbacks_join_refresh_and_queued_trust_without_unverified()
+-> Result<()> {
+    use crate::request_serialization::RequestSerializationAccess;
+    use crate::request_serialization::RequestSerializationQueueKey;
+    use codex_core_plugins::EffectivePluginsChange;
+    use codex_core_plugins::remote::RemotePluginMaterialization;
+    use codex_core_plugins::remote::RemotePluginScope;
+    use codex_plugin::PluginId;
+    use std::time::Duration;
+    use tokio::time::Instant;
+
+    for with_materialization in [false, true] {
+        let home = TempDir::new()?;
+        let config = Arc::new(build_test_config(home.path(), "http://127.0.0.1:1").await?);
+        let (processor, _outgoing) = build_test_processor_for_retirement(config).await;
+        let queues = processor.request_serialization_queues.clone();
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let blocker = tokio::spawn(async move {
+            queues
+                .enqueue_background_and_wait(
+                    RequestSerializationQueueKey::Global("config"),
+                    RequestSerializationAccess::Exclusive,
+                    async move {
+                        let _ = entered.send(());
+                        let _ = released.await;
+                    },
+                )
+                .await
+        });
+        started.await?;
+        let materialized_remote_plugins = if with_materialization {
+            vec![RemotePluginMaterialization {
+                plugin_id: PluginId::new("fixture".into(), "test".into())?,
+                scope: RemotePluginScope::User,
+                discoverability: None,
+                authenticated_account_id: None,
+            }]
+        } else {
+            Vec::new()
+        };
+        let callback = processor
+            .plugin_processor
+            .effective_plugins_changed_callback();
+        callback(EffectivePluginsChange {
+            materialized_remote_plugins,
+            ..Default::default()
+        });
+        assert_eq!(
+            processor.auxiliary_tasks.len(),
+            1 + usize::from(with_materialization),
+            "the production factory must admit both actual callback originals"
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let census = processor.auxiliary_tasks.census();
+                assert!(!census.drain.unverified);
+                if census.pending == Some(usize::from(with_materialization)) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        if with_materialization {
+            assert!(
+                !processor.auxiliary_tasks.census().drain.terminal,
+                "the real trust callback stays owned while queued"
+            );
+        }
+        release.send(()).unwrap();
+        blocker.await??;
+        let report = processor
+            .drain_background_tasks_until(Instant::now() + Duration::from_secs(5))
+            .await;
+        assert!(report.auxiliary_tasks.is_clean(), "{report:?}");
+        assert!(report.request_auth.is_clean(), "{report:?}");
+    }
     Ok(())
 }
 

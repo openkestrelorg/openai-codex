@@ -28,6 +28,13 @@ pub(crate) struct ProcessorTaskDrain {
     pub unverified: bool,
 }
 
+/// A nonblocking observation. Unknown counts stay unknown on unavailable custody.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ProcessorTaskCensus {
+    pub drain: ProcessorTaskDrain,
+    pub pending: Option<usize>,
+}
+
 impl ProcessorTaskDrain {
     pub(crate) fn is_clean(self) -> bool {
         self.terminal && !self.cancelled && !self.panicked && !self.unavailable && !self.unverified
@@ -281,6 +288,42 @@ impl ProcessorTasks {
             panicked: state.panicked,
             unavailable: false,
             unverified: state.unverified,
+        }
+    }
+
+    /// Close births and latch the existing deadline without waiting for any task.
+    pub(crate) fn close_and_census(&self, deadline: Instant) -> ProcessorTaskCensus {
+        if let Ok(mut state) = self.state.lock() {
+            state.closed = true;
+            state.deadline.get_or_insert(deadline);
+        }
+        self.census()
+    }
+
+    /// Poll receipt clones once outside the lock; never poll a retained aggregate.
+    pub(crate) fn census(&self) -> ProcessorTaskCensus {
+        let unavailable = || ProcessorTaskCensus {
+            drain: ProcessorTaskDrain {
+                unavailable: true,
+                ..Default::default()
+            },
+            pending: None,
+        };
+        if self.compact_finished().is_err() {
+            return unavailable();
+        }
+        let Ok(state) = self.state.lock() else {
+            return unavailable();
+        };
+        ProcessorTaskCensus {
+            drain: ProcessorTaskDrain {
+                terminal: state.tasks.is_empty(),
+                cancelled: state.cancelled,
+                panicked: state.panicked,
+                unavailable: false,
+                unverified: state.unverified,
+            },
+            pending: Some(state.tasks.len()),
         }
     }
 

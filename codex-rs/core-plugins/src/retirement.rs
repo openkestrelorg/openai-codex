@@ -558,7 +558,22 @@ impl PluginTaskRegistry {
         Ok(receipt)
     }
 
+    /// Request cooperative stop even when the host cannot poll an async drain.
+    /// This closes births and keeps the first join deadline; it proves no join.
+    pub fn request_shutdown(&self, deadline: Instant) {
+        if let Ok(mut state) = self.state.lock() {
+            state.closed = true;
+            state.stop_requested = true;
+            let first_deadline = state.deadline.is_none();
+            state.deadline.get_or_insert(deadline);
+            if first_deadline {
+                state.shutdown_changed.notify_waiters();
+            }
+        }
+    }
+
     pub async fn shutdown_until(&self, deadline: Instant) -> PluginTaskDrain {
+        self.request_shutdown(deadline);
         let (deadline, tasks) = {
             let Ok(mut state) = self.state.lock() else {
                 return PluginTaskDrain {
@@ -566,13 +581,7 @@ impl PluginTaskRegistry {
                     ..Default::default()
                 };
             };
-            state.closed = true;
-            state.stop_requested = true;
-            let first_deadline = state.deadline.is_none();
-            let deadline = *state.deadline.get_or_insert(deadline);
-            if first_deadline {
-                state.shutdown_changed.notify_waiters();
-            }
+            let deadline = state.deadline.expect("shutdown deadline latched");
             state.compact();
             (deadline, state.tasks.clone())
         };
@@ -609,6 +618,35 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use std::sync::atomic::Ordering;
     use tokio::time::Duration;
+
+    #[tokio::test(start_paused = true)]
+    async fn synchronous_stop_request_keeps_the_original_and_first_join_deadline() {
+        let registry = PluginTaskRegistry::default();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let receipt = registry
+            .spawn(async move {
+                let _ = released.await;
+            })
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        registry.request_shutdown(deadline);
+        assert!(registry.worker_stop().is_stopped());
+        assert!(
+            receipt.peek().is_none(),
+            "request alone is no proof of joining"
+        );
+        assert!(registry.spawn(async {}).is_err());
+        release.send(()).unwrap();
+        assert_eq!(receipt.await, JoinOutcome::Joined);
+        assert!(
+            registry
+                .shutdown_until(deadline + Duration::from_secs(30))
+                .await
+                .is_clean()
+        );
+        assert_eq!(registry.worker_stop().deadline(), Some(deadline));
+        assert!(Instant::now() < deadline);
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn close_rejects_late_task_birth_without_starting_it() {
