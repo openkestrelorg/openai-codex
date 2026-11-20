@@ -222,3 +222,136 @@ async fn stale_already_held_evidence_is_revalidated_after_abandonment_release() 
         .unwrap())))
         .unwrap();
 }
+
+#[tokio::test]
+async fn definite_server_rejection_allows_later_adoption() -> Result<()> {
+    use codex_app_server_client::AppServerRequestHandle;
+    use codex_app_server_client::RemoteAppServerClient;
+    use codex_app_server_client::RemoteAppServerConnectArgs;
+    use codex_app_server_client::RemoteAppServerEndpoint;
+    use futures::SinkExt;
+    use futures::StreamExt;
+    use serde_json::json;
+    use tokio_tungstenite::tungstenite::Message;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+        let initialize: serde_json::Value =
+            serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+        socket.send(Message::Text(json!({"jsonrpc": "2.0", "id": initialize["id"], "result": {"userAgent": "codex_cli_rs/0.0.0", "codexHome": "/tmp/test"}}).to_string().into())).await.unwrap();
+        let _initialized = socket.next().await.unwrap().unwrap();
+        for refuse in [true, false] {
+            let acquire: serde_json::Value =
+                serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap())
+                    .unwrap();
+            assert_eq!(acquire["method"], "thread/retention/acquire");
+            let response = if refuse {
+                json!({"jsonrpc": "2.0", "id": acquire["id"], "error": {"code": -32601, "message": "method unavailable"}})
+            } else {
+                json!({"jsonrpc": "2.0", "id": acquire["id"], "result": {"status": "acquired", "grantId": "retry-grant"}})
+            };
+            socket
+                .send(Message::Text(response.to_string().into()))
+                .await
+                .unwrap();
+        }
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), socket.next())
+                .await
+                .is_err()
+        );
+    });
+    let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+        required_human_approval: false,
+        endpoint: RemoteAppServerEndpoint::WebSocket {
+            websocket_url: format!("ws://{address}"),
+            auth_token: None,
+        },
+        client_name: "retention-test".to_string(),
+        client_version: "0.0.0".to_string(),
+        experimental_api: true,
+        mcp_server_openai_form_elicitation: false,
+        interactive_client: true,
+        opt_out_notification_methods: Vec::new(),
+        channel_capacity: 8,
+    })
+    .await?;
+    let handle = AppServerRequestHandle::Remote(client.request_handle());
+    let (retention, _warnings) = RetentionClient::new();
+    let error = retention
+        .retain_thread(handle.clone(), "retry-thread".to_string())
+        .await
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("method unavailable"));
+    assert!(matches!(
+        error.downcast_ref::<codex_app_server_client::TypedRequestError>(),
+        Some(codex_app_server_client::TypedRequestError::Server { .. })
+    ));
+    retention
+        .retain_thread(handle, "retry-thread".to_string())
+        .await?
+        .commit();
+    tokio::time::timeout(std::time::Duration::from_secs(5), server).await??;
+    client.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn retention_transport_failure_preserves_reconnect_cause() -> Result<()> {
+    use codex_app_server_client::AppServerRequestHandle;
+    use codex_app_server_client::RemoteAppServerClient;
+    use codex_app_server_client::RemoteAppServerConnectArgs;
+    use codex_app_server_client::RemoteAppServerEndpoint;
+    use codex_app_server_client::TypedRequestError;
+    use futures::SinkExt;
+    use futures::StreamExt;
+    use serde_json::json;
+    use tokio_tungstenite::tungstenite::Message;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+        let initialize: serde_json::Value =
+            serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+        socket.send(Message::Text(json!({"jsonrpc": "2.0", "id": initialize["id"], "result": {"userAgent": "codex_cli_rs/0.0.0", "codexHome": "/tmp/test"}}).to_string().into())).await.unwrap();
+        let _initialized = socket.next().await.unwrap().unwrap();
+        let acquire: serde_json::Value =
+            serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+        assert_eq!(acquire["method"], "thread/retention/acquire");
+        socket.close(None).await.unwrap();
+    });
+    let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+        required_human_approval: false,
+        endpoint: RemoteAppServerEndpoint::WebSocket {
+            websocket_url: format!("ws://{address}"),
+            auth_token: None,
+        },
+        client_name: "retention-test".to_string(),
+        client_version: "0.0.0".to_string(),
+        experimental_api: true,
+        mcp_server_openai_form_elicitation: false,
+        interactive_client: true,
+        opt_out_notification_methods: Vec::new(),
+        channel_capacity: 8,
+    })
+    .await?;
+    let (retention, _warnings) = RetentionClient::new();
+    let error = retention
+        .retain_thread(
+            AppServerRequestHandle::Remote(client.request_handle()),
+            "disconnected-thread".to_string(),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<TypedRequestError>(),
+        Some(TypedRequestError::Transport { .. })
+    ));
+    tokio::time::timeout(std::time::Duration::from_secs(5), server).await??;
+    client.shutdown().await?;
+    Ok(())
+}

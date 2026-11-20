@@ -1798,3 +1798,49 @@ async fn failed_common_api_receipt_never_projects_shutdown_complete() {
         }
     }
 }
+
+#[tokio::test]
+async fn consumed_websocket_prewarm_keeps_its_real_join_registered() {
+    let (session, _) = super::super::tests::make_session_and_context().await;
+    let session = Arc::new(session);
+    let entered = Arc::new(Notify::new());
+    let worker_entered = Arc::clone(&entered);
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        let _result_tx = result_tx;
+        worker_entered.notify_one();
+        std::future::pending::<()>().await;
+    });
+    let original = task.abort_handle();
+    session
+        .set_session_startup_prewarm(
+            crate::session::startup_prewarm::SessionStartupPrewarmHandle::new(
+                session.task_joins.register(task),
+                result_rx,
+                std::time::Instant::now(),
+                Duration::from_secs(30),
+            ),
+        )
+        .await;
+    entered.notified().await;
+    let consumed = session
+        .take_session_startup_prewarm()
+        .await
+        .expect("prewarm");
+    drop(consumed);
+    let owner = session.cleanup_owner();
+    owner
+        .bind_deadline(Instant::now() + Duration::from_secs(3))
+        .expect("bind");
+    assert_eq!(
+        owner.observe(Arc::clone(&session)).await,
+        CleanupExecution::Finished {
+            persistence_failed: false
+        }
+    );
+    assert!(original.is_finished());
+    assert_eq!(
+        session.task_joins.shutdown_until(Instant::now()).await,
+        crate::tasks::TaskJoinOutcome::Complete { panicked: false }
+    );
+}
