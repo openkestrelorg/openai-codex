@@ -1,5 +1,6 @@
 use super::apps_processor::APP_READ_MAX_IDS;
 use super::config_processor::reload_user_config;
+use super::mcp_processor::spawn_scoped_mcp_request;
 use super::*;
 use crate::error_code::internal_error;
 use crate::error_code::invalid_request;
@@ -37,6 +38,7 @@ use codex_mcp::McpRuntimeContext;
 use codex_mcp::oauth_login_support;
 use codex_mcp::resolve_oauth_callback;
 use codex_mcp::should_retry_without_scopes;
+use codex_otel::auth_storage::AuthStorageOriginator;
 use codex_plugin::PluginId;
 use codex_plugin::PluginTelemetryMetadata;
 use codex_protocol::auth::AuthMode as DomainAuthMode;
@@ -1910,6 +1912,24 @@ impl PluginRequestProcessor {
             })
             .collect();
         let environment_manager = self.thread_manager.environment_manager();
+        let request_work = crate::account_turn_admission::derive_request_work();
+        let discovery = async {
+            let work = request_work
+                .map_err(|_| anyhow::anyhow!("plugin app discovery account work unavailable"))?;
+            let access = codex_mcp::McpAttemptAccess::from_work(
+                work.as_ref()
+                    .map(|work| work as &dyn codex_mcp::McpAttemptWork),
+            );
+            connectors::list_accessible_connectors_with_authority(
+                config,
+                /*force_refetch*/ true,
+                Arc::clone(&environment_manager),
+                self.thread_manager.mcp_manager(),
+                /*retirement*/ None,
+                access,
+            )
+            .await
+        };
         let (app_summaries, accessible_connectors_result) = tokio::join!(
             load_plugin_app_summaries(
                 &self.thread_manager,
@@ -1918,12 +1938,7 @@ impl PluginRequestProcessor {
                 &plugin_apps,
                 &app_category_by_id
             ),
-            connectors::list_accessible_connectors_from_mcp_tools_with_mcp_manager(
-                config,
-                /*force_refetch*/ true,
-                Arc::clone(&environment_manager),
-                self.thread_manager.mcp_manager(),
-            ),
+            discovery,
         );
 
         let (accessible_connectors, codex_apps_ready) = match accessible_connectors_result {
@@ -2040,72 +2055,86 @@ impl PluginRequestProcessor {
             let http_client = Arc::clone(&http_client);
             let global_callback_url = config.mcp_oauth_callback_url.clone();
 
-            tokio::spawn(async move {
-                let oauth_client_config = server.oauth.as_ref();
-                let first_attempt = perform_oauth_login_silent(
-                    &oauth_credential_name,
-                    &oauth_config.url,
-                    store_mode,
-                    keyring_backend_kind,
-                    oauth_config.http_headers.clone(),
-                    oauth_config.env_http_headers.clone(),
-                    &resolved_scopes.scopes,
-                    oauth_client_config,
-                    McpOAuthClientRegistration::Auto,
-                    server.oauth_resource.as_deref(),
-                    callback_port,
-                    callback_url.as_deref(),
-                    global_callback_url.as_deref(),
-                    Arc::clone(&http_client),
-                    redirect_mode,
-                )
-                .await;
-
-                let final_result = match first_attempt {
-                    Err(err) if should_retry_without_scopes(&resolved_scopes, &err) => {
-                        perform_oauth_login_silent(
-                            &oauth_credential_name,
-                            &oauth_config.url,
-                            store_mode,
-                            keyring_backend_kind,
-                            oauth_config.http_headers,
-                            oauth_config.env_http_headers,
-                            &[],
-                            oauth_client_config,
-                            McpOAuthClientRegistration::Auto,
-                            server.oauth_resource.as_deref(),
-                            callback_port,
-                            callback_url.as_deref(),
-                            global_callback_url.as_deref(),
-                            http_client,
-                            redirect_mode,
-                        )
-                        .await
-                    }
-                    result => result,
-                };
-
-                let (success, error) = match final_result {
-                    Ok(()) => (true, None),
-                    Err(err) => (false, Some(err.to_string())),
-                };
-                if success {
-                    thread_manager
-                        .invalidate_mcp_runtimes_for(McpRefreshReason::PluginOAuthLoginCompleted)
-                        .await;
+            let work = match crate::account_turn_admission::derive_request_work() {
+                Ok(work) => work,
+                Err(_) => {
+                    warn!("plugin OAuth account work unavailable");
+                    continue;
                 }
+            };
+            if let Err(error) = spawn_scoped_mcp_request(
+                work,
+                AuthStorageOriginator::current().scope(async move {
+                    let oauth_client_config = server.oauth.as_ref();
+                    let first_attempt = perform_oauth_login_silent(
+                        &oauth_credential_name,
+                        &oauth_config.url,
+                        store_mode,
+                        keyring_backend_kind,
+                        oauth_config.http_headers.clone(),
+                        oauth_config.env_http_headers.clone(),
+                        &resolved_scopes.scopes,
+                        oauth_client_config,
+                        McpOAuthClientRegistration::Auto,
+                        server.oauth_resource.as_deref(),
+                        callback_port,
+                        callback_url.as_deref(),
+                        global_callback_url.as_deref(),
+                        Arc::clone(&http_client),
+                        redirect_mode,
+                    )
+                    .await;
 
-                let notification = ServerNotification::McpServerOauthLoginCompleted(
-                    McpServerOauthLoginCompletedNotification {
-                        name: notification_name,
-                        thread_id: None,
-                        login_id: None,
-                        success,
-                        error,
-                    },
-                );
-                outgoing.send_server_notification(notification).await;
-            });
+                    let final_result = match first_attempt {
+                        Err(err) if should_retry_without_scopes(&resolved_scopes, &err) => {
+                            perform_oauth_login_silent(
+                                &oauth_credential_name,
+                                &oauth_config.url,
+                                store_mode,
+                                keyring_backend_kind,
+                                oauth_config.http_headers,
+                                oauth_config.env_http_headers,
+                                &[],
+                                oauth_client_config,
+                                McpOAuthClientRegistration::Auto,
+                                server.oauth_resource.as_deref(),
+                                callback_port,
+                                callback_url.as_deref(),
+                                global_callback_url.as_deref(),
+                                http_client,
+                                redirect_mode,
+                            )
+                            .await
+                        }
+                        result => result,
+                    };
+
+                    let (success, error) = match final_result {
+                        Ok(()) => (true, None),
+                        Err(err) => (false, Some(err.to_string())),
+                    };
+                    if success {
+                        thread_manager
+                            .invalidate_mcp_runtimes_for(
+                                McpRefreshReason::PluginOAuthLoginCompleted,
+                            )
+                            .await;
+                    }
+
+                    let notification = ServerNotification::McpServerOauthLoginCompleted(
+                        McpServerOauthLoginCompletedNotification {
+                            name: notification_name,
+                            thread_id: None,
+                            login_id: None,
+                            success,
+                            error,
+                        },
+                    );
+                    outgoing.send_server_notification(notification).await;
+                }),
+            ) {
+                warn!(server = %name, "plugin OAuth task admission closed during shutdown: {error:?}");
+            }
         }
     }
 

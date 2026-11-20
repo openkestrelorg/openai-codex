@@ -239,6 +239,8 @@ impl McpRequestProcessor {
         };
         let server = server.config();
         let enterprise = matches!(server.auth, McpServerAuth::EmaAuth);
+        let request_work = crate::account_turn_admission::derive_request_work()
+            .map_err(|_| internal_error("MCP OAuth account work is unavailable"))?;
         let (authorization_url, login_id, completion): (
             String,
             String,
@@ -375,6 +377,13 @@ impl McpRequestProcessor {
                         internal_error(format!("failed to resolve MCP OAuth callback: {err}"))
                     })?;
 
+            let flow_work = request_work
+                .as_ref()
+                .map(|work| {
+                    work.try_derive()
+                        .ok_or_else(|| internal_error("MCP OAuth account work is unavailable"))
+                })
+                .transpose()?;
             let handle = perform_oauth_login_return_url(
                 oauth_credential_name.as_ref(),
                 &url,
@@ -392,6 +401,7 @@ impl McpRequestProcessor {
                 mcp_config.mcp_oauth_callback_url.as_deref(),
                 http_client,
                 redirect_mode,
+                flow_work.map(|work| Box::new(work) as Box<dyn Send>),
             )
             .await
             .map_err(|err| {
@@ -409,28 +419,32 @@ impl McpRequestProcessor {
         let outgoing = Arc::clone(&self.outgoing);
         let thread_manager = Arc::clone(&self.thread_manager);
 
-        tokio::spawn(async move {
-            let (success, error) = match completion.await {
-                Ok(()) => (true, None),
-                Err(err) => (false, Some(err.to_string())),
-            };
-            if success && !enterprise {
-                thread_manager
-                    .invalidate_mcp_runtimes_for(McpRefreshReason::McpOAuthLoginCompleted)
-                    .await;
-            }
+        spawn_scoped_mcp_request(
+            request_work,
+            AuthStorageOriginator::current().scope(async move {
+                let (success, error) = match completion.await {
+                    Ok(()) => (true, None),
+                    Err(err) => (false, Some(err.to_string())),
+                };
+                if success && !enterprise {
+                    thread_manager
+                        .invalidate_mcp_runtimes_for(McpRefreshReason::McpOAuthLoginCompleted)
+                        .await;
+                }
 
-            let notification = ServerNotification::McpServerOauthLoginCompleted(
-                McpServerOauthLoginCompletedNotification {
-                    name: notification_name,
-                    thread_id: notification_thread_id,
-                    login_id: Some(notification_login_id),
-                    success,
-                    error,
-                },
-            );
-            outgoing.send_server_notification(notification).await;
-        });
+                let notification = ServerNotification::McpServerOauthLoginCompleted(
+                    McpServerOauthLoginCompletedNotification {
+                        name: notification_name,
+                        thread_id: notification_thread_id,
+                        login_id: Some(notification_login_id),
+                        success,
+                        error,
+                    },
+                );
+                outgoing.send_server_notification(notification).await;
+            }),
+        )
+        .map_err(|_| internal_error("MCP OAuth task admission failed"))?;
 
         Ok(McpServerOauthLoginResponse {
             authorization_url,
@@ -893,7 +907,7 @@ impl McpRequestProcessor {
     }
 }
 
-fn spawn_scoped_mcp_request(
+pub(super) fn spawn_scoped_mcp_request(
     work: Option<crate::account_work_permits::AccountWorkPermitGuard>,
     task: impl Future<Output = ()> + Send + 'static,
 ) -> Result<(), JSONRPCErrorError> {

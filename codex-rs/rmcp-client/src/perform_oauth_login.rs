@@ -266,6 +266,7 @@ pub async fn perform_oauth_login_return_url(
     global_callback_url: Option<&str>,
     http_client: Arc<dyn HttpClient>,
     redirect_mode: StreamableHttpRedirectMode,
+    operation_work: Option<Box<dyn Send>>,
 ) -> Result<OauthLoginHandle> {
     let http_context = OAuthHttpContext {
         http_headers,
@@ -293,7 +294,7 @@ pub async fn perform_oauth_login_return_url(
     .await?;
 
     let authorization_url = flow.authorization_url();
-    let completion = flow.spawn();
+    let completion = flow.spawn(operation_work);
 
     Ok(OauthLoginHandle::new(authorization_url, completion))
 }
@@ -863,11 +864,14 @@ impl OauthLoginFlow {
         result
     }
 
-    fn spawn(self) -> oneshot::Receiver<Result<()>> {
+    fn spawn(self, operation_work: Option<Box<dyn Send>>) -> oneshot::Receiver<Result<()>> {
         let server_name = self.server_name.clone();
         let (tx, rx) = oneshot::channel();
 
         let task = async move {
+            // The RPC may return before callback/token persistence completes.
+            // Keep the independently derived finite owner until this task ends.
+            let _operation_work = operation_work;
             let result = self.finish(/*emit_browser_url*/ false).await;
             if let Err(err) = &result {
                 eprintln!("Failed to complete OAuth login for '{server_name}': {err:#}");
@@ -1238,8 +1242,24 @@ mod tests {
             .query_pairs_mut()
             .append_pair("code", "test-code")
             .append_pair("state", state);
+        struct OperationWork(Option<oneshot::Sender<()>>);
+        impl Drop for OperationWork {
+            fn drop(&mut self) {
+                if let Some(released) = self.0.take() {
+                    let _ = released.send(());
+                }
+            }
+        }
+        let (released, mut release_observed) = oneshot::channel();
+        let completion = flow.spawn(Some(Box::new(OperationWork(Some(released)))));
+        tokio::task::yield_now().await;
+        assert!(matches!(
+            release_observed.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
         send_oauth_callback(callback_url).await?;
-        flow.finish(/*emit_browser_url*/ false).await?;
+        completion.await??;
+        tokio::time::timeout(std::time::Duration::from_secs(5), release_observed).await??;
         tokio::time::timeout(std::time::Duration::from_secs(5), closed).await?;
         let report = callback_server.wait().await;
         assert_eq!(
