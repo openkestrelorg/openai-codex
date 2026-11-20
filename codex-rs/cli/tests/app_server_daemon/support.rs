@@ -23,6 +23,11 @@ pub(super) struct TestDaemon {
 impl TestDaemon {
     pub(super) fn new() -> Result<Self> {
         let home = tempfile::Builder::new().tempdir_in("/tmp")?;
+        // Daemon lifecycle fixtures must not fetch the unrelated curated plugin repository.
+        std::fs::write(
+            home.path().join("config.toml"),
+            "[features]\nplugins = false\n",
+        )?;
         let codex = codex_utils_cargo_bin::cargo_bin("codex")?;
         let codex_source = std::fs::canonicalize(&codex)?;
         let target = if cfg!(target_os = "macos") {
@@ -145,6 +150,12 @@ impl Drop for TestDaemon {
         let _ = self.lifecycle("stop");
         if let Ok(pid) = self.pid("app-server-updater.pid") {
             let _ = signal(pid, libc::SIGTERM);
+        }
+        if !std::thread::panicking() {
+            assert!(
+                !self.home.path().join(".tmp/plugins.sha").exists(),
+                "daemon lifecycle fixture unexpectedly synchronized curated plugins"
+            );
         }
     }
 }

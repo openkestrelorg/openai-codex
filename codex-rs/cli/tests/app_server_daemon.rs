@@ -68,7 +68,7 @@ fn bootstrap_does_not_start_updater_in_deep_codex_home() -> Result<()> {
     let deep_home = tempfile::Builder::new()
         .prefix(&"deep-codex-home-".repeat(8))
         .tempdir_in("/tmp")?;
-    for name in ["packages", "app-server-daemon"] {
+    for name in ["packages", "app-server-daemon", "config.toml"] {
         std::fs::rename(daemon.home.path().join(name), deep_home.path().join(name))?;
     }
     daemon.home = deep_home;
