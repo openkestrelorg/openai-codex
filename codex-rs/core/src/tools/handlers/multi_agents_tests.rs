@@ -4921,3 +4921,6 @@ async fn build_agent_resume_config_clears_base_instructions() {
         .expect("approval policy set");
     assert_eq!(config, expected);
 }
+
+#[path = "multi_agents_parent_work_tests.rs"]
+mod parent_work_tests;
