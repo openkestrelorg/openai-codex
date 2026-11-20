@@ -653,8 +653,9 @@ async fn refused_parent_delegate(one_shot: bool) {
         )
         .await
     };
-    assert!(matches!(result, Err(CodexErr::Fatal(ref message))
-        if message == "MCP turn account work is unavailable"));
+    assert!(matches!(result, Err(error)
+        if matches!(error.details(), CodexErrorDetails::Fatal(message)
+            if message == "MCP turn account work is unavailable")));
     assert_eq!(gate.derived.load(Ordering::SeqCst), 1);
 }
 
