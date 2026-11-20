@@ -754,6 +754,7 @@ where
         })
         .collect();
     let client = start_client(InProcessClientStartArgs {
+        interactive_client: true,
         required_human_approval: true,
         arg0_paths,
         config: Arc::new(config),

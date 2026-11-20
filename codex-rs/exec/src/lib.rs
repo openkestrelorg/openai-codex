@@ -790,6 +790,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
     }
 
     let in_process_start_args = InProcessClientStartArgs {
+        interactive_client: false,
         required_human_approval: false,
         arg0_paths,
         config: std::sync::Arc::new(config.clone()),

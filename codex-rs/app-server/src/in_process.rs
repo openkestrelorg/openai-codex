@@ -542,6 +542,7 @@ async fn start_uninitialized(
         args.enable_codex_api_key_env,
     )
     .await?;
+    args.config.auth_config().validate()?;
     let channel_capacity = args.channel_capacity.max(1);
     let installation_id = resolve_installation_id(&args.config.codex_home).await?;
     let (client_tx, mut client_rx) = mpsc::channel::<InProcessClientMessage>(channel_capacity);

@@ -222,6 +222,8 @@ where
 
 #[derive(Clone)]
 pub struct InProcessClientStartArgs {
+    /// Request the interactive role; the server still verifies trusted provenance.
+    pub interactive_client: bool,
     /// This client collects fresh human decisions for managed command checkpoints.
     pub required_human_approval: bool,
     /// Resolved argv0 dispatch paths used by command execution internals.
@@ -270,7 +272,7 @@ impl InProcessClientStartArgs {
     /// Builds initialize params from caller-provided metadata.
     pub fn initialize_params(&self) -> InitializeParams {
         let capabilities = InitializeCapabilities {
-            interactive_client: false,
+            interactive_client: self.interactive_client,
             required_human_approval: self.required_human_approval,
             explicit_gateway_oauth: false,
             experimental_api: self.experimental_api,
@@ -1156,6 +1158,7 @@ mod tests {
         let client = InProcessAppServerClient::start_in_host(
             Arc::clone(&host),
             InProcessClientStartArgs {
+                interactive_client: false,
                 required_human_approval: false,
                 arg0_paths: Arg0DispatchPaths::default(),
                 config,
@@ -2499,50 +2502,70 @@ mod tests {
             .await,
         );
 
-        let runtime_args = InProcessClientStartArgs {
-            required_human_approval: false,
-            arg0_paths: Arg0DispatchPaths::default(),
-            config: config.clone(),
-            cli_overrides: Vec::new(),
-            loader_overrides: LoaderOverrides::default(),
-            strict_config: false,
-            cloud_config_bundle: CloudConfigBundleLoader::default(),
-            embedded_network_policy: Default::default(),
-            feedback: CodexFeedback::new(),
-            log_db: None,
-            state_db: None,
-            environment_manager: environment_manager.clone(),
-            config_warnings: Vec::new(),
-            session_source: SessionSource::Exec,
-            enable_codex_api_key_env: false,
-            client_name: "codex-app-server-client-test".to_string(),
-            client_version: "0.0.0-test".to_string(),
-            experimental_api: true,
-            mcp_server_openai_form_elicitation: true,
-            opt_out_notification_methods: Vec::new(),
-            channel_capacity: DEFAULT_IN_PROCESS_CHANNEL_CAPACITY,
-        }
-        .into_runtime_start_args();
+        for interactive in [false, true] {
+            let runtime_args = InProcessClientStartArgs {
+                interactive_client: interactive,
+                required_human_approval: false,
+                arg0_paths: Arg0DispatchPaths::default(),
+                config: config.clone(),
+                cli_overrides: Vec::new(),
+                loader_overrides: LoaderOverrides::default(),
+                strict_config: false,
+                cloud_config_bundle: CloudConfigBundleLoader::default(),
+                embedded_network_policy: Default::default(),
+                feedback: CodexFeedback::new(),
+                log_db: None,
+                state_db: None,
+                environment_manager: environment_manager.clone(),
+                config_warnings: Vec::new(),
+                session_source: SessionSource::Exec,
+                enable_codex_api_key_env: false,
+                client_name: "codex-app-server-client-test".to_string(),
+                client_version: "0.0.0-test".to_string(),
+                experimental_api: true,
+                mcp_server_openai_form_elicitation: true,
+                opt_out_notification_methods: Vec::new(),
+                channel_capacity: DEFAULT_IN_PROCESS_CHANNEL_CAPACITY,
+            }
+            .into_runtime_start_args();
 
-        assert_eq!(runtime_args.config, config);
-        assert!(
-            runtime_args
-                .initialize
-                .capabilities
-                .expect("initialize capabilities")
-                .mcp_server_openai_form_elicitation
-        );
-        assert!(Arc::ptr_eq(
-            &runtime_args.environment_manager,
-            &environment_manager
-        ));
-        assert!(
-            runtime_args
-                .environment_manager
-                .default_environment()
-                .expect("default environment")
-                .is_remote()
-        );
+            assert_eq!(runtime_args.config, config);
+            assert_eq!(
+                runtime_args
+                    .initialize
+                    .capabilities
+                    .as_ref()
+                    .unwrap()
+                    .interactive_client,
+                interactive
+            );
+            assert!(
+                !runtime_args
+                    .initialize
+                    .capabilities
+                    .as_ref()
+                    .unwrap()
+                    .required_human_approval
+            );
+            assert!(
+                runtime_args
+                    .initialize
+                    .capabilities
+                    .expect("initialize capabilities")
+                    .mcp_server_openai_form_elicitation
+            );
+            assert!(Arc::ptr_eq(
+                &runtime_args.environment_manager,
+                &environment_manager
+            ));
+            assert!(
+                runtime_args
+                    .environment_manager
+                    .default_environment()
+                    .expect("default environment")
+                    .is_remote()
+            );
+        }
     }
 
     #[tokio::test]

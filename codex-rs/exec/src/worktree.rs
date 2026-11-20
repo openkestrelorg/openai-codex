@@ -31,6 +31,7 @@ pub(super) async fn fork_source(
     let client = InProcessAppServerClient::start_in_host(
         Arc::clone(&embedded_host),
         InProcessClientStartArgs {
+            interactive_client: false,
             required_human_approval: false,
             arg0_paths: arg0_paths.clone(),
             config: std::sync::Arc::new(config.clone()),

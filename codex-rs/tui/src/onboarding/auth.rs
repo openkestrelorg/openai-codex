@@ -1450,6 +1450,7 @@ mod tests {
             .unwrap();
         let mut auth_config = config.auth_config();
         let client = InProcessAppServerClient::start(InProcessClientStartArgs {
+            interactive_client: false,
             required_human_approval: true,
             arg0_paths: Arg0DispatchPaths::default(),
             config: Arc::new(config),
