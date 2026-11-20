@@ -27,7 +27,7 @@ impl Session {
         let session = Arc::downgrade(self);
         let shutdown = self.mcp_prewarm_shutdown.clone();
         let worker = self.services.runtime_handle.spawn(async move {
-            loop {
+            'worker: loop {
                 let auth_changed = tokio::select! {
                     biased;
                     _ = shutdown.cancelled() => break,
@@ -44,16 +44,50 @@ impl Session {
                         true
                     },
                 };
-                let Some(session) = session.upgrade() else {
+                let Some(mut current) = session.upgrade() else {
                     break;
                 };
                 if auth_changed {
-                    session.mark_mcp_runtime_dirty(McpRefreshReason::AuthChangeNotification);
+                    current.mark_mcp_runtime_dirty(McpRefreshReason::AuthChangeNotification);
                 }
+                // Admit this finite background operation before refresh locks.
+                // Reopen waits retain neither the session nor idle account work.
+                let account_work = loop {
+                    let admission = current
+                        .services
+                        .host_admission
+                        .as_ref()
+                        .map_or(Ok(None), |host| host.admit_operation_work());
+                    match admission {
+                        Ok(work) => break work.map(super::mcp_work::McpOperationWork),
+                        Err(codex_extension_api::TurnWorkRefused::Unavailable) => continue 'worker,
+                        Err(codex_extension_api::TurnWorkRefused::RetryAfter(retry)) => {
+                            drop(current);
+                            tokio::select! {
+                                biased;
+                                _ = shutdown.cancelled() => break 'worker,
+                                _ = retry => {},
+                            }
+                            let Some(resumed) = session.upgrade() else {
+                                break 'worker;
+                            };
+                            current = resumed;
+                        }
+                    }
+                };
+                let access = account_work
+                    .as_ref()
+                    .map_or(codex_mcp::McpAttemptAccess::Unscoped, |work| {
+                        codex_mcp::McpAttemptAccess::Admitted(work)
+                    });
                 tokio::select! {
                     biased;
                     _ = shutdown.cancelled() => break,
-                    _ = session.refresh_mcp_if_dirty() => {},
+                    result = current.refresh_mcp_if_dirty_with_authority(access) => {
+                        if let Err(error) = result {
+                            warn!("background MCP runtime refresh failed: {error:#}");
+                        }
+                    },
                 }
             }
         });

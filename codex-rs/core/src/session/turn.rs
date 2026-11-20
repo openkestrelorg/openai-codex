@@ -324,6 +324,8 @@ pub(crate) async fn run_turn(
         match required_mcp_servers_for_input(&sess, turn_context.as_ref(), &user_input)
             .or_cancel(&cancellation_token)
             .await
+            .map_err(CodexErr::from)
+            .and_then(|result| result)
         {
             Ok(requirements) => requirements,
             Err(err) => {
@@ -335,7 +337,7 @@ pub(crate) async fn run_turn(
                     PersistContext::Standard,
                 )
                 .await;
-                return Err(err.into());
+                return Err(err);
             }
         };
 
@@ -605,7 +607,7 @@ pub(crate) async fn run_turn(
                     &pending_user_input,
                 )
                 .or_cancel(&cancellation_token)
-                .await?;
+                .await??;
                 required_servers.extend(pending_required_servers);
                 required_servers.sort_unstable();
                 required_servers.dedup();
@@ -1162,14 +1164,20 @@ async fn required_mcp_servers_for_input(
     sess: &Arc<Session>,
     turn_context: &TurnContext,
     user_input: &[UserInput],
-) -> (Vec<String>, Vec<crate::plugins::PluginCapabilitySummary>) {
+) -> CodexResult<(Vec<String>, Vec<crate::plugins::PluginCapabilitySummary>)> {
     if crate::guardian::is_basic_session_source(&turn_context.session_source) {
-        return (Vec::new(), Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     }
 
     // Plugin capabilities depend on authentication, so project them only after
     // the runtime has aligned the plugin manager with its current account.
-    sess.refresh_mcp_if_dirty().await;
+    let work = sess
+        .turn_mcp_work(turn_context)
+        .map_err(|err| CodexErr::Fatal(err.to_string()))?;
+    let access = codex_mcp::McpAttemptAccess::from_work(work.as_deref());
+    sess.refresh_mcp_if_dirty_with_authority(access)
+        .await
+        .map_err(|err| CodexErr::Fatal(err.to_string()))?;
     let loaded_plugins = sess
         .services
         .plugins_manager
@@ -1215,7 +1223,7 @@ async fn required_mcp_servers_for_input(
             None => sess
                 .services
                 .mcp_runtime
-                .current_binding()
+                .current_binding_with_authority(access)
                 .await
                 .map(|binding| connectors::accessible_connectors_from_mcp_tools(binding.tools()))
                 .unwrap_or_default(),
@@ -1258,7 +1266,7 @@ async fn required_mcp_servers_for_input(
         }
     }
 
-    (required_servers.into_iter().collect(), mentioned_plugins)
+    Ok((required_servers.into_iter().collect(), mentioned_plugins))
 }
 
 #[instrument(level = "trace", skip_all)]
