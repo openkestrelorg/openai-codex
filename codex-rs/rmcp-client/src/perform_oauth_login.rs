@@ -996,6 +996,7 @@ mod tests {
     use pretty_assertions::assert_eq;
     use serde_json::json;
     use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
     use url::Url;
 
     use super::CallbackOutcome;
