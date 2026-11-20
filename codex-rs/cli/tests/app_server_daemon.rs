@@ -329,8 +329,11 @@ fn package_ownership_check_does_not_start_an_updater() -> Result<()> {
             "--check-package-ownership",
         ])
         .output()?;
-    assert_update_disabled(&output);
+    assert!(output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
     daemon.assert_no_updater();
+    assert!(daemon.pid("app-server.pid").is_err());
     Ok(())
 }
 
