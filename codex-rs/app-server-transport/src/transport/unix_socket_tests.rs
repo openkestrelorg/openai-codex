@@ -1085,7 +1085,12 @@ fn assert_socket_path_removed(_socket_path: &Path) {
 #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
 #[tokio::test]
 async fn accepted_same_image_provenance_is_reestablished_on_reconnect() {
-    let home = tempfile::tempdir().unwrap();
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()
+        .unwrap();
     let socket = AbsolutePathBuf::from_absolute_path(home.path().join("peer.sock")).unwrap();
     let (tx, mut rx) = tokio::sync::mpsc::channel(CHANNEL_CAPACITY);
     let stop = CancellationToken::new();
