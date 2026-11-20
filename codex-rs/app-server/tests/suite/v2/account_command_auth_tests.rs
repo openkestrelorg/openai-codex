@@ -9,6 +9,7 @@ async fn command_auth_server(home: &Path) -> Result<(TestAppServer, Vec<u8>)> {
         home,
         CreateConfigTomlParams {
             requires_openai_auth: Some(true),
+            chatgpt_base_url: Some("http://127.0.0.1:0".to_string()),
             ..Default::default()
         },
     )?;
