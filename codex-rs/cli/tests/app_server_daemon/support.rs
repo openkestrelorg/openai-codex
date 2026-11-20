@@ -79,13 +79,35 @@ impl TestDaemon {
     }
 
     pub(super) fn lifecycle(&self, action: &str) -> Result<Value> {
+        let started = Instant::now();
         let output = self
             .command()
             .args(["app-server", "daemon", action])
             .output()?;
+        eprintln!(
+            "daemon {action}: status={}, elapsed={:?}",
+            output.status,
+            started.elapsed()
+        );
+        if !output.status.success() {
+            let state = self.home.path().join("app-server-daemon");
+            for name in [
+                "app-server.stderr.log",
+                "app-server.pid",
+                "app-server-updater.pid",
+            ] {
+                if let Ok(contents) = std::fs::read_to_string(state.join(name)) {
+                    let mut tail = contents.lines().rev().take(40).collect::<Vec<_>>();
+                    tail.reverse();
+                    eprintln!("daemon {action} {name} tail:\n{}", tail.join("\n"));
+                }
+            }
+        }
         ensure!(
             output.status.success(),
-            "daemon {action} failed: {}",
+            "daemon {action} failed ({}): stdout={}, stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
         Ok(serde_json::from_slice(&output.stdout)?)
