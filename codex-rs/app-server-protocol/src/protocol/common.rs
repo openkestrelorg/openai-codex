@@ -2281,6 +2281,16 @@ server_notification_definitions! {
 
 }
 
+/// Notification methods and payloads intentionally omitted from stable
+/// schema/TypeScript projections. The runtime enum still carries their
+/// `ExperimentalApi` marker so experimental consumers can opt in.
+#[cfg(test)]
+pub(crate) const EXPERIMENTAL_SERVER_NOTIFICATION_METHODS: &[&str] =
+    &["account/managedAuthTransition/updated"];
+#[cfg(test)]
+pub(crate) const EXPERIMENTAL_SERVER_NOTIFICATION_TYPES: &[&str] =
+    &["ManagedTransitionStatusNotification"];
+
 /// Server notification envelope sent over app-server transports.
 ///
 /// `emitted_at_ms` records when app-server emitted the notification, before it
@@ -3516,6 +3526,7 @@ mod tests {
                 "method": "thread/start",
                 "id": 7,
                 "response": {
+                    "clearRecovery": null,
                     "thread": {
                         "id": "67e55044-10b1-426f-9247-bb680e5fe0c8",
                         "environments": null,
