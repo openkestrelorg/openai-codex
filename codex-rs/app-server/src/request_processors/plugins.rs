@@ -1920,7 +1920,7 @@ impl PluginRequestProcessor {
                 work.as_ref()
                     .map(|work| work as &dyn codex_mcp::McpAttemptWork),
             );
-            connectors::list_accessible_connectors_with_authority(
+            codex_core::connectors::list_accessible_connectors_with_authority(
                 config,
                 /*force_refetch*/ true,
                 Arc::clone(&environment_manager),
