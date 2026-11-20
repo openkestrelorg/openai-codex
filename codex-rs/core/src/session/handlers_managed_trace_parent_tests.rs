@@ -104,7 +104,7 @@ async fn submission_dispatch_selects_carrier_and_preserves_ambient_fallback() {
             let id = format!("submission-{cell}");
             let ambient_id = format!("ambient-{cell}");
             let ambient = tracing::info_span!("sibling.ambient", test.cell = ambient_id);
-            let submission = codex_protocol::protocol::Submission {
+            let submission = crate::session::Submission {
                 turn_extension_init: None,
                 id,
                 op: codex_protocol::protocol::Op::Interrupt,
