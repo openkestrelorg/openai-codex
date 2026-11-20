@@ -299,8 +299,14 @@ mod tests {
         // Managed reset drains counted requests before retiring plugin caches.
         // Both backend mutations must stay behind that barrier.
         for (method, params) in [
-            ("plugin/install", serde_json::json!({"pluginName":"fixture"})),
-            ("plugin/uninstall", serde_json::json!({"pluginId":"fixture"})),
+            (
+                "plugin/install",
+                serde_json::json!({"pluginName":"fixture"}),
+            ),
+            (
+                "plugin/uninstall",
+                serde_json::json!({"pluginId":"fixture"}),
+            ),
         ] {
             assert_eq!(
                 classify(&request(method, params)),
