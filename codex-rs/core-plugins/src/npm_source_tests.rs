@@ -108,14 +108,11 @@ async fn managed_npm_pack_preserves_arguments_and_reaps_on_late_deadline() {
     let home = tempfile::tempdir().unwrap();
     let ready = home.path().join("ready");
     let args_path = home.path().join("args");
-    let executable = home.path().join("npm-probe");
-    codex_utils_cargo_bin::write_executable(
-        &executable,
-        &format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf '%s' $$ > '{}'\nexec /bin/sleep 5\n",
-            args_path.display(),
-            ready.display()
-        ),
+    // The first npm argument selects this script in the pack destination.
+    // Launch the system shell directly and record that argument as $0.
+    fs::write(
+        home.path().join("pack"),
+        "printf '%s\\n' \"$0\" \"$@\" > args\nprintf '%s' $$ > ready\nexec /bin/sleep 5\n",
     )
     .unwrap();
     let registry = crate::PluginTaskRegistry::default();
@@ -129,7 +126,7 @@ async fn managed_npm_pack_preserves_arguments_and_reaps_on_late_deadline() {
                 "@acme/plugin",
                 Some("1.2.3"),
                 Some("https://registry.example.invalid"),
-                executable.as_os_str(),
+                std::ffi::OsStr::new("/bin/sh"),
             ));
         })
         .unwrap();
@@ -140,7 +137,7 @@ async fn managed_npm_pack_preserves_arguments_and_reaps_on_late_deadline() {
             {
                 break pid;
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
     })
     .await

@@ -9169,14 +9169,15 @@ async fn catalog_queue_coalesces_scopes_under_latest_request_original_and_auth()
         assert_eq!(state.requests[0].obligations.len(), 1);
     }
     assert!(a.pending() > 0 && b.pending() > 0);
+    // Let the coalesced request finish under its owners. Shutdown stops new reads.
+    a.joined().await;
+    b.joined().await;
     assert!(
         manager
             .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(2))
             .await
             .is_clean()
     );
-    a.joined().await;
-    b.joined().await;
     {
         let records = records.lock().unwrap();
         assert_eq!(records.len(), 2);
