@@ -3,7 +3,7 @@ source: tui/src/history_cell/tests.rs
 expression: rendered
 ---
 ╭───────────────────────────────────────────────────────────────╮
-│ ✨ Update available! 0.169.0 -> 9.9.9                         │
+│ ✨ Update available! 0.169.0+kcf.006.0 -> 9.9.9               │
 │ Managed Codex updates use the release and promotion workflow. │
 │                                                               │
 │ See full release notes:                                       │
