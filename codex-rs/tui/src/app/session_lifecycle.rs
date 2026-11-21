@@ -419,9 +419,9 @@ impl App {
         &mut self,
         app_server: &mut AppServerSession,
         thread_id: ThreadId,
-    ) -> Result<bool> {
+    ) -> Result<(bool, Option<crate::app_server_session::PendingRetention>)> {
         if !self.should_attach_live_thread_for_selection(thread_id) {
-            return Ok(true);
+            return Ok((true, None));
         }
 
         use crate::app_server_session::ResumeModelSettings;
@@ -436,17 +436,32 @@ impl App {
         } else {
             ResumeModelSettings::PreserveExistingThread
         };
-        let prepared = super::thread_attachment::prepare(
+        // A previously installed, writable saved side chat keeps its interactive ownership
+        // when its writer has to be reloaded (for example after an archive failed).
+        let reopen_saved = side.is_some_and(|side| side.storage == SideChatStorage::Attached)
+            && !self.agent_navigation.is_parent_owned(thread_id)
+            && self
+                .thread_event_channels
+                .get(&thread_id)
+                .is_some_and(|channel| {
+                    channel
+                        .backend_id
+                        .is_none_or(|owner| owner == app_server.backend_id())
+                        && channel.attachment() == ThreadEventAttachment::ReplayOnly
+                });
+        let (prepared, retention) = super::thread_attachment::prepare_for_adoption(
             app_server,
             &self.local_settings,
             &self.config,
             thread_id,
             resume_settings,
+            reopen_saved,
         )
         .await?;
-        Ok(self
+        let live = self
             .install_thread_attachment(app_server, thread_id, prepared, ChannelMode::ReplaceLive)
-            .await)
+            .await;
+        Ok((live, retention))
     }
 
     pub(super) async fn install_thread_attachment(
@@ -694,13 +709,17 @@ impl App {
             ));
             return Ok(());
         }
+        let mut retention = None;
         let mode = if self.should_attach_live_thread_for_selection(thread_id) {
             match self
                 .attach_live_thread_for_selection(app_server, thread_id)
                 .await
             {
-                Ok(true) => SelectionMode::Live,
-                Ok(false) => SelectionMode::ReplayOnly,
+                Ok((true, pending)) => {
+                    retention = pending;
+                    SelectionMode::Live
+                }
+                Ok((false, _)) => SelectionMode::ReplayOnly,
                 Err(_) if self.thread_event_channels.contains_key(&thread_id) => {
                     SelectionMode::ReplayOnly
                 }
@@ -730,7 +749,14 @@ impl App {
                 pending_profile_on_unavailable_thread,
             },
         )
-        .await
+        .await?;
+        if let Some(retention) = retention
+            && self.current_displayed_thread_id() == Some(thread_id)
+            && !self.agent_navigation.is_parent_owned(thread_id)
+        {
+            retention.commit();
+        }
+        Ok(())
     }
 
     pub(super) fn can_select_thread(&mut self) -> bool {

@@ -162,7 +162,10 @@ async fn external_writer_fork_opens_editable_thread_without_taking_source_lease(
             .await
             .map_err(std::io::Error::other)?
     );
-    assert!(!Box::pin(app.attach_live_thread_for_selection(&mut server, thread_id)).await?);
+    let (live, retention) =
+        Box::pin(app.attach_live_thread_for_selection(&mut server, thread_id)).await?;
+    assert!(!live);
+    assert!(retention.is_none());
     let revision = db
         .thread_read_states(&[thread_id])
         .await

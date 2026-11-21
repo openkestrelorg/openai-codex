@@ -192,26 +192,7 @@ pub(super) async fn prepare_saved(
     }
 }
 
-pub(super) async fn prepare(
-    app_server: &mut AppServerSession,
-    local_settings: &crate::local_settings::LocalSettings,
-    config: &Config,
-    thread_id: ThreadId,
-    resume_settings: ResumeModelSettings,
-) -> Result<PreparedAttachment> {
-    prepare_for_adoption(
-        app_server,
-        local_settings,
-        config,
-        thread_id,
-        resume_settings,
-        false,
-    )
-    .await
-    .map(|(attachment, _retention)| attachment)
-}
-
-async fn prepare_for_adoption(
+pub(super) async fn prepare_for_adoption(
     app_server: &mut AppServerSession,
     local_settings: &crate::local_settings::LocalSettings,
     config: &Config,
