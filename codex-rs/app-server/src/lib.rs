@@ -657,7 +657,7 @@ pub async fn run_main(
     strict_config: bool,
     default_analytics_enabled: bool,
 ) -> IoResult<()> {
-    run_main_with_transport_options(
+    run_main_with_transport_report(
         arg0_paths,
         cli_config_overrides,
         loader_overrides,
@@ -699,6 +699,56 @@ impl AppServerExit {
                 "app-server shutdown incomplete: cleanup was not proven within its deadline",
             )),
         }
+    }
+}
+
+/// The final standalone disposition and its first unproven cleanup obligation.
+/// The executable renders the bounded reason through its existing error path.
+/// Library callers can inspect the disposition without writing to stderr.
+#[derive(Debug)]
+pub struct AppServerExitReport {
+    disposition: AppServerExit,
+    unproven: Option<(&'static str, &'static str)>,
+}
+
+impl From<AppServerExit> for AppServerExitReport {
+    fn from(disposition: AppServerExit) -> Self {
+        Self {
+            disposition,
+            unproven: None,
+        }
+    }
+}
+
+impl AppServerExitReport {
+    fn incomplete(obligation: &'static str, name: &'static str) -> Self {
+        let label = if name.len() <= 64
+            && !name.is_empty()
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+        {
+            name
+        } else {
+            "unclassified"
+        };
+        Self {
+            disposition: AppServerExit::ShutdownIncomplete,
+            unproven: Some((obligation, label)),
+        }
+    }
+
+    pub fn disposition(&self) -> AppServerExit {
+        self.disposition
+    }
+
+    pub fn into_shutdown_result(self) -> IoResult<()> {
+        if let Some((obligation, label)) = self.unproven {
+            return Err(std::io::Error::other(format!(
+                "app-server shutdown incomplete: cleanup was not proven within its deadline ({obligation}={label})"
+            )));
+        }
+        self.disposition.into_shutdown_result()
     }
 }
 
@@ -744,6 +794,33 @@ pub async fn run_main_with_transport_options(
     auth: WebsocketAuthSettings,
     runtime_options: AppServerRuntimeOptions,
 ) -> IoResult<AppServerExit> {
+    Ok(run_main_with_transport_report(
+        arg0_paths,
+        cli_config_overrides,
+        loader_overrides,
+        strict_config,
+        default_analytics_enabled,
+        transport,
+        session_source,
+        auth,
+        runtime_options,
+    )
+    .await?
+    .disposition())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn run_main_with_transport_report(
+    arg0_paths: Arg0DispatchPaths,
+    cli_config_overrides: CliConfigOverrides,
+    loader_overrides: LoaderOverrides,
+    strict_config: bool,
+    default_analytics_enabled: bool,
+    transport: AppServerTransport,
+    session_source: SessionSource,
+    auth: WebsocketAuthSettings,
+    runtime_options: AppServerRuntimeOptions,
+) -> IoResult<AppServerExitReport> {
     let cloud_skill_provider = match runtime_options.cloud_skills_snapshot {
         Some(path) => {
             let provider = tokio::task::spawn_blocking(move || {
@@ -1883,7 +1960,7 @@ pub async fn run_main_with_transport_options(
     )
     .await
     {
-        standalone_shutdown::ProcessorJoin::Forced => return Ok(AppServerExit::Forced),
+        standalone_shutdown::ProcessorJoin::Forced => return Ok(AppServerExit::Forced.into()),
         standalone_shutdown::ProcessorJoin::Owner(owner) => owner,
     };
     let exit = standalone_shutdown::finish_host_shutdown(

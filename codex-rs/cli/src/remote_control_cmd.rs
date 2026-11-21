@@ -208,7 +208,7 @@ async fn run_foreground_remote_control(
         ..Default::default()
     };
     let (stop_rx, stop_signal_task) = foreground_stop_signal();
-    let app_server = codex_app_server::run_main_with_transport_options(
+    let app_server = codex_app_server::run_main_with_transport_report(
         arg0_paths,
         root_config_overrides,
         LoaderOverrides::default(),
@@ -861,9 +861,9 @@ mod tests {
 
 /// An unproven shutdown surfaces as an error, never as a clean stop.
 fn foreground_app_server_result(
-    result: std::io::Result<codex_app_server::AppServerExit>,
+    result: std::io::Result<codex_app_server::AppServerExitReport>,
 ) -> std::io::Result<()> {
-    result.and_then(codex_app_server::AppServerExit::into_shutdown_result)
+    result.and_then(codex_app_server::AppServerExitReport::into_shutdown_result)
 }
 
 #[cfg(test)]
@@ -872,13 +872,13 @@ mod shutdown_outcome_tests {
     use codex_app_server::AppServerExit;
     #[test]
     fn normal_and_explicit_forced_outcomes_keep_their_existing_mapping() {
-        assert!(foreground_app_server_result(Ok(AppServerExit::Graceful)).is_ok());
-        assert!(foreground_app_server_result(Ok(AppServerExit::Forced)).is_ok());
+        assert!(foreground_app_server_result(Ok(AppServerExit::Graceful.into())).is_ok());
+        assert!(foreground_app_server_result(Ok(AppServerExit::Forced.into())).is_ok());
     }
     #[test]
     fn incomplete_outcome_is_not_clean_foreground_completion() {
         let error =
-            foreground_app_server_result(Ok(AppServerExit::ShutdownIncomplete)).unwrap_err();
+            foreground_app_server_result(Ok(AppServerExit::ShutdownIncomplete.into())).unwrap_err();
         assert!(error.to_string().contains("shutdown incomplete"));
     }
     #[test]

@@ -188,6 +188,96 @@ async fn long_control_socket_paths_connect_to_distinct_daemons() {
 }
 
 #[tokio::test]
+async fn raw_control_socket_peers_retire_before_acceptor_join() {
+    for release_custody in [false, true] {
+        timeout(
+            Duration::from_secs(10),
+            observe_raw_peer_retirement(release_custody),
+        )
+        .await
+        .expect("bounded peer and transport observations");
+    }
+}
+
+async fn observe_raw_peer_retirement(release_custody: bool) {
+    use tokio::io::AsyncReadExt;
+    let home = tempfile::tempdir().expect("temporary socket parent");
+    let path = test_socket_path(home.path());
+    let (events, mut receiver) = mpsc::channel::<TransportEvent>(CHANNEL_CAPACITY);
+    let shutdown = CancellationToken::new();
+    let custody = crate::OwnerCustody::new(CancellationToken::new());
+    let acceptor = start_control_socket_acceptor(
+        path.clone(),
+        events,
+        shutdown.clone(),
+        DaemonShutdownAccess::Disabled,
+        WebSocketCompression::Plain,
+        &custody,
+    )
+    .await
+    .expect("start acceptor");
+
+    // A probe that closes without upgrading does not become a processor
+    // connection. A second raw peer stays in the server's handshake.
+    drop(
+        connect_to_socket(path.as_path())
+            .await
+            .expect("closed peer"),
+    );
+    let mut held = connect_to_socket(path.as_path()).await.expect("held peer");
+    // A later successful upgrade witnesses FIFO acceptance of the held
+    // peer before shutdown. Keep that established session as a control.
+    let stream = connect_to_socket(path.as_path())
+        .await
+        .expect("witness peer");
+    let (mut witness, _) = client_async("ws://localhost/rpc", stream)
+        .await
+        .expect("witness upgrade");
+    let (connection_id, _writer) = match receiver.recv().await.expect("witness opened") {
+        TransportEvent::ConnectionOpened {
+            connection_id,
+            writer,
+            ..
+        } => (connection_id, writer),
+        _ => panic!("raw probes must not register a connection"),
+    };
+    if release_custody {
+        drop(custody);
+    } else {
+        shutdown.cancel();
+    }
+    timeout(Duration::from_secs(5), acceptor)
+        .await
+        .expect("bounded acceptor shutdown")
+        .expect("join");
+    // A joined acceptor has already retired the pending upgrade and its
+    // sender, even while the client keeps its raw descriptor open.
+    let got = timeout(Duration::from_secs(1), held.read(&mut [0u8]))
+        .await
+        .expect("raw peer closed");
+    assert_eq!(got.expect("clean EOF"), 0);
+    if !release_custody {
+        // Closing admission alone does not stop an established RPC session.
+        let ping = Bytes::from_static(b"after-admission-close");
+        witness
+            .send(WebSocketMessage::Ping(ping.clone()))
+            .await
+            .expect("ping");
+        assert_eq!(
+            witness.next().await.expect("pong frame").expect("pong"),
+            WebSocketMessage::Pong(ping)
+        );
+        witness.close(None).await.expect("witness close");
+    }
+    // Owner release can close an established session from the server side.
+    drop(witness);
+    assert!(matches!(receiver.recv().await,
+            Some(TransportEvent::ConnectionClosed { connection_id: closed }) if closed == connection_id));
+
+    assert!(receiver.recv().await.is_none());
+}
+
+#[tokio::test]
 async fn control_socket_acceptor_upgrades_and_forwards_websocket_text_messages_and_pings() {
     let temp_dir = tempfile::TempDir::new().expect("temp dir");
     let socket_path = test_socket_path(temp_dir.path());

@@ -1283,7 +1283,7 @@ async fn dispatch_cli(
                         },
                         ..Default::default()
                     };
-                    let exit = codex_app_server::run_main_with_transport_options(
+                    let exit = codex_app_server::run_main_with_transport_report(
                         arg0_paths.clone(),
                         root_config_overrides,
                         LoaderOverrides::default(),
@@ -1295,7 +1295,7 @@ async fn dispatch_cli(
                         runtime_options,
                     )
                     .await?;
-                    if exit == codex_app_server::AppServerExit::Forced {
+                    if exit.disposition() == codex_app_server::AppServerExit::Forced {
                         // Runtime teardown can wait forever for blocked rollout I/O.
                         std::process::exit(0);
                     }

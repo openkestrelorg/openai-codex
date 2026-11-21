@@ -5,7 +5,7 @@ use codex_app_server::AppServerCodeModeHostArgs;
 use codex_app_server::AppServerRuntimeOptions;
 use codex_app_server::AppServerTransport;
 use codex_app_server::PluginStartupTasks;
-use codex_app_server::run_main_with_transport_options;
+use codex_app_server::run_main_with_transport_report;
 use codex_arg0::Arg0DispatchPaths;
 use codex_arg0::arg0_dispatch_or_else;
 use codex_config::LoaderOverrides;
@@ -121,7 +121,7 @@ fn main() -> anyhow::Result<()> {
                 (false, false) => codex_app_server::RemoteControlStartupMode::ResolvePersisted,
             };
 
-        let exit = run_main_with_transport_options(
+        let exit = run_main_with_transport_report(
             arg0_paths,
             config_overrides,
             loader_overrides,
@@ -133,7 +133,7 @@ fn main() -> anyhow::Result<()> {
             runtime_options,
         )
         .await?;
-        if exit == codex_app_server::AppServerExit::Forced {
+        if exit.disposition() == codex_app_server::AppServerExit::Forced {
             // Runtime teardown can wait forever for blocked rollout I/O.
             std::process::exit(0);
         }

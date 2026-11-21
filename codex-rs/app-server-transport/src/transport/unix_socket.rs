@@ -29,6 +29,7 @@ use tokio_tungstenite::tungstenite::http::Response;
 use tokio_tungstenite::tungstenite::http::StatusCode;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use tracing::error;
 use tracing::info;
 use tracing::warn;
@@ -193,6 +194,7 @@ async fn run_control_socket_acceptor(
     owner_expiry: crate::OwnerExpiry,
 ) {
     let _socket_guard = socket_guard;
+    let handshakes = TaskTracker::new();
     loop {
         let stream = tokio::select! {
             biased;
@@ -229,6 +231,8 @@ async fn run_control_socket_acceptor(
         );
         let transport_event_tx = transport_event_tx.clone();
         let owner_expiry = owner_expiry.clone();
+        let shutdown_token = shutdown_token.clone();
+        let pending_handshake = handshakes.token();
         tokio::spawn(async move {
             let mut shutdown_request = false;
             let mut negotiated_compression = WebSocketCompression::Plain;
@@ -240,7 +244,7 @@ async fn run_control_socket_acceptor(
             .into_iter()
             .flatten()
             .min();
-            let websocket_stream = match accept_hdr_async_with_config(
+            let handshake = accept_hdr_async_with_config(
                 stream,
                 |request: &tokio_tungstenite::tungstenite::handshake::server::Request,
                  mut response: HandshakeResponse| {
@@ -272,15 +276,23 @@ async fn run_control_socket_acceptor(
                     Ok(response)
                 },
                 Some(websocket_config),
-            )
-            .await
-            {
+            );
+            // A raw peer has no processor connection yet. Retire its upgrade
+            // when admission closes, even if it never sends a WebSocket header.
+            let upgrade = tokio::select! {
+                biased;
+                () = shutdown_token.cancelled() => return,
+                () = owner_expiry.owner_released_wait() => return,
+                result = handshake => result,
+            };
+            let websocket_stream = match upgrade {
                 Ok(websocket_stream) => websocket_stream,
                 Err(err) => {
                     warn!("failed to upgrade control socket websocket connection: {err}");
                     return;
                 }
             };
+            drop(pending_handshake);
             if shutdown_request {
                 run_daemon_shutdown(websocket_stream, transport_event_tx, owner_expiry).await;
                 return;
@@ -297,6 +309,8 @@ async fn run_control_socket_acceptor(
             .await;
         });
     }
+    handshakes.close();
+    handshakes.wait().await;
     info!("control socket acceptor shutting down");
 }
 

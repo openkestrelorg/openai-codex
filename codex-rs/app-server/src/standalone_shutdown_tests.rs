@@ -282,6 +282,42 @@ async fn long_graceful_drain_consumes_the_same_owner_budget() {
     assert_eq!(outcome(&owner, "threads"), Some(StageOutcome::TimedOut));
 }
 
+#[test]
+fn default_error_report_names_one_unproven_obligation_and_excludes_runtime_text() {
+    let mut owner = StandaloneShutdownOwner::new(Instant::now(), OwnerExpiry::never());
+    assert!(owner.exit_report().into_shutdown_result().is_ok());
+    owner.report_before_release();
+    // A late abandoned byte must still be caught by the final exit check.
+    owner.expiry.record_abandoned(0, 1);
+    let message = |owner: &StandaloneShutdownOwner| {
+        let report = owner.exit_report();
+        assert_eq!(
+            report.disposition(),
+            crate::AppServerExit::ShutdownIncomplete
+        );
+        report
+            .into_shutdown_result()
+            .expect_err("incomplete exit")
+            .to_string()
+    };
+    let prefix = "app-server shutdown incomplete: cleanup was not proven within its deadline";
+    assert_eq!(
+        message(&owner),
+        format!("{prefix} (abandoned_output=outbound)")
+    );
+    owner.push("background", StageOutcome::TimedOut);
+    assert_eq!(
+        message(&owner),
+        format!("{prefix} (timed_out_stage=background)")
+    );
+    let mut other = StandaloneShutdownOwner::new(Instant::now(), OwnerExpiry::never());
+    other.record("private/path\nmore text", false);
+    assert_eq!(
+        message(&other),
+        format!("{prefix} (incomplete_stage=unclassified)")
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn stalled_curated_worker_is_incomplete_at_its_bounded_stage() {
     let start = Instant::now();
@@ -305,7 +341,7 @@ async fn stalled_curated_worker_is_incomplete_at_its_bounded_stage() {
     );
     assert_eq!(outcome(&owner, "threads"), Some(StageOutcome::Complete));
     assert_eq!(
-        owner.exit_outcome(),
+        owner.exit_report().disposition(),
         crate::AppServerExit::ShutdownIncomplete
     );
 }
@@ -323,15 +359,18 @@ async fn stalled_cleanup_can_never_be_reported_as_graceful() {
     };
     drain_processor_stages(&mut owner, &mut stages, STANDALONE_STAGE_CAPS).await;
     assert_eq!(
-        owner.exit_outcome(),
+        owner.exit_report().disposition(),
         crate::AppServerExit::ShutdownIncomplete
     );
-    assert_ne!(owner.exit_outcome(), crate::AppServerExit::Graceful);
+    assert_ne!(
+        owner.exit_report().disposition(),
+        crate::AppServerExit::Graceful
+    );
 
     // A later clean-looking record cannot launder the sticky TimedOut.
     owner.record("acceptors", /*clean*/ true);
     assert_eq!(
-        owner.exit_outcome(),
+        owner.exit_report().disposition(),
         crate::AppServerExit::ShutdownIncomplete
     );
 }
@@ -348,7 +387,10 @@ async fn clean_drain_stays_graceful() {
         ..Default::default()
     };
     drain_processor_stages(&mut owner, &mut stages, STANDALONE_STAGE_CAPS).await;
-    assert_eq!(owner.exit_outcome(), crate::AppServerExit::Graceful);
+    assert_eq!(
+        owner.exit_report().disposition(),
+        crate::AppServerExit::Graceful
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -361,7 +403,7 @@ async fn handed_back_owner_makes_the_exit_incomplete() {
     let mut owner = StandaloneShutdownOwner::new(Instant::now(), expiry);
     owner.adopt_custody(Some(custody));
     assert_eq!(
-        owner.exit_outcome(),
+        owner.exit_report().disposition(),
         crate::AppServerExit::ShutdownIncomplete
     );
 }
@@ -378,12 +420,15 @@ async fn abandoned_output_is_incomplete_even_when_custody_is_clean() {
         ..Default::default()
     };
     drain_processor_stages(&mut owner, &mut stages, STANDALONE_STAGE_CAPS).await;
-    assert_eq!(owner.exit_outcome(), crate::AppServerExit::Graceful);
+    assert_eq!(
+        owner.exit_report().disposition(),
+        crate::AppServerExit::Graceful
+    );
 
     // Every thread joined, but a response was dropped: not completion.
     expiry.record_abandoned(/*messages*/ 2, /*bytes*/ 1_400_000);
     assert_eq!(
-        owner.exit_outcome(),
+        owner.exit_report().disposition(),
         crate::AppServerExit::ShutdownIncomplete
     );
 }
@@ -421,7 +466,7 @@ async fn never_finishing_cooperative_join_is_retained_and_timed_out() {
     // Sticky: a later clean record cannot launder the TimedOut join.
     owner.record("outbound", /*clean*/ true);
     assert_eq!(
-        owner.exit_outcome(),
+        owner.exit_report().disposition(),
         crate::AppServerExit::ShutdownIncomplete
     );
     drop(owner);
@@ -515,7 +560,7 @@ async fn failed_processor_fallback_is_incomplete_and_bounded_by_the_original_lat
 
     // Bounded by the original latch (5s left), not a fresh 35s budget.
     assert_eq!(Instant::now() - edge, SHUTDOWN_ACK_TIMEOUT);
-    assert_eq!(exit, crate::AppServerExit::ShutdownIncomplete);
+    assert_eq!(exit.disposition(), crate::AppServerExit::ShutdownIncomplete);
     assert!(transport_stopped);
     assert_eq!(outcome(&owner, "outbound"), Some(StageOutcome::TimedOut));
     assert_eq!(outcome(&owner, "telemetry"), Some(StageOutcome::TimedOut));
@@ -546,7 +591,7 @@ async fn failed_processor_without_an_earlier_edge_latches_once_and_is_incomplete
 
     // Every join finished, but nothing proves the processor stages did.
     assert_eq!(Instant::now(), start);
-    assert_eq!(exit, crate::AppServerExit::ShutdownIncomplete);
+    assert_eq!(exit.disposition(), crate::AppServerExit::ShutdownIncomplete);
 }
 
 #[tokio::test(start_paused = true)]
@@ -563,7 +608,7 @@ async fn clean_host_joins_stay_graceful() {
         async { vec![Ok(())] },
     )
     .await;
-    assert_eq!(exit, crate::AppServerExit::Graceful);
+    assert_eq!(exit.disposition(), crate::AppServerExit::Graceful);
 }
 
 #[tokio::test(start_paused = true)]
@@ -583,7 +628,7 @@ async fn panicked_blocking_thread_makes_the_exit_incomplete() {
     assert_eq!(Instant::now(), start);
     assert_eq!(expiry.incomplete_blocking(), vec!["stdout_writer"]);
     assert_eq!(
-        owner.exit_outcome(),
+        owner.exit_report().disposition(),
         crate::AppServerExit::ShutdownIncomplete
     );
 }
@@ -619,7 +664,7 @@ async fn dropping_the_shutdown_owner_releases_work_retained_through_its_handles(
     assert_eq!(probe.polls(), polls_at_expiry, "retained, never polled");
     assert!(!probe.dropped(), "retained until the owner drops");
     assert_eq!(
-        owner.exit_outcome(),
+        owner.exit_report().disposition(),
         crate::AppServerExit::ShutdownIncomplete
     );
 
@@ -687,7 +732,7 @@ async fn intake_edge_bounds_a_stuck_processor_join_from_the_intake_instant() {
     assert_eq!(owner.deadline(), intake + SHUTDOWN_ACK_TIMEOUT);
     assert_eq!(outcome(&owner, "processor"), Some(StageOutcome::TimedOut));
     assert_eq!(
-        owner.exit_outcome(),
+        owner.exit_report().disposition(),
         crate::AppServerExit::ShutdownIncomplete
     );
     let polls_at_deadline = probe.polls();
@@ -732,7 +777,7 @@ async fn panicked_processor_join_is_incomplete() {
     let owner = outcome_owner(join_processor(&latch, Some(custody), join).await);
     assert_eq!(outcome(&owner, "processor"), Some(StageOutcome::Incomplete));
     assert_eq!(
-        owner.exit_outcome(),
+        owner.exit_report().disposition(),
         crate::AppServerExit::ShutdownIncomplete
     );
 }
@@ -763,7 +808,7 @@ async fn close_all_with_a_full_control_queue_returns_at_the_owner_deadline() {
     assert_eq!(Instant::now(), start + SHUTDOWN_ACK_TIMEOUT);
     assert_eq!(outcome(&owner, "close_all"), Some(StageOutcome::TimedOut));
     assert_eq!(
-        owner.exit_outcome(),
+        owner.exit_report().disposition(),
         crate::AppServerExit::ShutdownIncomplete
     );
     tokio::time::advance(Duration::from_secs(600)).await;
@@ -813,7 +858,7 @@ async fn shutdown_sends_wait_for_the_edge_then_expire_at_the_original_deadline()
         Some(StageOutcome::TimedOut)
     );
     assert_eq!(
-        owner.exit_outcome(),
+        owner.exit_report().disposition(),
         crate::AppServerExit::ShutdownIncomplete
     );
     assert_eq!(control.strong_count(), 2, "retained by the owner");
@@ -892,7 +937,7 @@ async fn fenced_processor_driver_is_never_polled_after_the_deadline() {
     assert_eq!(Instant::now(), intake + SHUTDOWN_ACK_TIMEOUT);
     assert_eq!(outcome(&owner, "processor"), Some(StageOutcome::TimedOut));
     assert_eq!(
-        owner.exit_outcome(),
+        owner.exit_report().disposition(),
         crate::AppServerExit::ShutdownIncomplete
     );
 
@@ -950,7 +995,7 @@ async fn unbound_runtime_makes_the_shutdown_incomplete() {
         Some(StageOutcome::Incomplete)
     );
     assert_eq!(
-        owner.exit_outcome(),
+        owner.exit_report().disposition(),
         crate::AppServerExit::ShutdownIncomplete
     );
 }

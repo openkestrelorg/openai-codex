@@ -399,17 +399,32 @@ impl StandaloneShutdownOwner {
             .any(|record| record.outcome == StageOutcome::TimedOut)
     }
 
+    fn first_unproven(&self) -> Option<(&'static str, &'static str)> {
+        for record in &self.stages {
+            match record.outcome {
+                StageOutcome::Complete => {}
+                StageOutcome::Incomplete => return Some(("incomplete_stage", record.stage)),
+                StageOutcome::TimedOut => return Some(("timed_out_stage", record.stage)),
+            }
+        }
+        if let Some(task) = self.expiry.returned_tasks().first() {
+            return Some(("returned_owner", task));
+        }
+        if let Some(task) = self.expiry.refused_tasks().first() {
+            return Some(("refused_owner", task));
+        }
+        if let Some(task) = self.expiry.stopped_by_owner_release().first() {
+            return Some(("released_owner", task));
+        }
+        if let Some(task) = self.expiry.incomplete_blocking().first() {
+            return Some(("incomplete_blocking", task));
+        }
+        (self.expiry.abandoned_output() != AbandonedOutput::default())
+            .then_some(("abandoned_output", "outbound"))
+    }
+
     pub(crate) fn is_complete(&self) -> bool {
-        self.stages
-            .iter()
-            .all(|record| record.outcome == StageOutcome::Complete)
-            && self.expiry.returned_tasks().is_empty()
-            && self.expiry.refused_tasks().is_empty()
-            && self.expiry.stopped_by_owner_release().is_empty()
-            && self.expiry.incomplete_blocking().is_empty()
-            // Delivery is separate from custody: dropped output is never
-            // successful completion, even when every thread joined cleanly.
-            && self.expiry.abandoned_output() == AbandonedOutput::default()
+        self.first_unproven().is_none()
     }
 
     /// Truthful report before the host returns. A returned host still drops
@@ -418,11 +433,12 @@ impl StandaloneShutdownOwner {
     /// Typed outcome for library and CLI callers. Anything short of positive
     /// proof (a TimedOut or incomplete stage, a handed-back owner, an
     /// unfinished blocking receipt) is `ShutdownIncomplete`, never `Graceful`.
-    pub(crate) fn exit_outcome(&self) -> crate::AppServerExit {
-        if self.is_complete() {
-            crate::AppServerExit::Graceful
-        } else {
-            crate::AppServerExit::ShutdownIncomplete
+    pub(crate) fn exit_report(&self) -> crate::AppServerExitReport {
+        // Sample again after report_before_release. Custody can change while
+        // that tracing report is being emitted.
+        match self.first_unproven() {
+            Some((obligation, label)) => crate::AppServerExitReport::incomplete(obligation, label),
+            None => crate::AppServerExit::Graceful.into(),
         }
     }
 
@@ -505,7 +521,7 @@ pub(crate) async fn finish_host_shutdown<O, T, R, A>(
     telemetry: T,
     telemetry_clean: impl FnOnce(&R) -> bool,
     acceptors: A,
-) -> crate::AppServerExit
+) -> crate::AppServerExitReport
 where
     O: Future<Output = Result<(), JoinError>> + Send + 'static,
     T: Future<Output = Result<R, JoinError>> + Send + 'static,
@@ -558,7 +574,7 @@ where
     owner.observe_blocking().await;
     // Truthful, typed report first; owners are released only when this host returns.
     owner.report_before_release();
-    owner.exit_outcome()
+    owner.exit_report()
 }
 
 /// The processor-side stages of the standalone drain, in historical order.
