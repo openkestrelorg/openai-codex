@@ -2971,15 +2971,17 @@ fn selected_and_resumed_threads_use_server_capability_for_v1_and_v2_children() -
             &app.config,
         ))
         .await?;
-        let root = Box::pin(app_server.resume_thread(
+        let (root, retention) = Box::pin(app_server.prepare_retained_resume(
             &app.local_settings,
             app.config.clone(),
             root_thread_id,
             crate::app_server_session::ResumeModelSettings::PreserveExistingThread,
+            crate::resume_permissions::ResumePermissions::default(),
         ))
         .await?;
         app.enqueue_primary_thread_session(root.session, root.turns)
             .await?;
+        retention.expect("installed primary thread has retention").commit();
         let mut tui = crate::tui::test_support::make_test_tui()?;
         for (index, (child_thread_id, multi_agent_version)) in child_thread_ids
             .iter()
@@ -3031,9 +3033,36 @@ fn selected_and_resumed_threads_use_server_capability_for_v1_and_v2_children() -
                 panic!("server event stream ended before the child closed");
             })
             .await?;
+            if multi_agent_version == MultiAgentVersion::V1 {
+                // Selecting a discovered V1 child observes it. An explicit resume owns the
+                // replacement runtime so zero-delay retirement cannot race the stale close.
+                let (_, retention) = Box::pin(app_server.prepare_retained_resume(
+                    &app.local_settings,
+                    app.config.clone(),
+                    child_thread_id,
+                    crate::app_server_session::ResumeModelSettings::PreserveExistingThread,
+                    crate::resume_permissions::ResumePermissions::default(),
+                ))
+                .await?;
+                retention.expect("retained V1 resume").commit();
+                // The fixture unsubscribed the picker from the old runtime above.
+                // Require the picker to attach again even though the new runtime is loaded.
+                app.thread_event_channels
+                    .get_mut(&child_thread_id)
+                    .expect("previous child channel")
+                    .mark_replay_only();
+            }
             while app_event_rx.try_recv().is_ok() {}
             app.select_agent_thread(&mut tui, &mut app_server, child_thread_id)
                 .await?;
+            assert!(!matches!(
+                app_server.thread_read(child_thread_id, /*include_turns*/ false).await?.status,
+                codex_app_server_protocol::ThreadStatus::NotLoaded
+            ), "the selected {multi_agent_version:?} child must be live before the old close is delivered");
+            assert_eq!(
+                app.thread_event_channels[&child_thread_id].attachment(),
+                ThreadEventAttachment::Live
+            );
             // A queued close from the old runtime must not undo the new attachment.
             app.handle_backend_event(&app_server, closed).await;
             app.drain_active_thread_events(&mut tui).await?;

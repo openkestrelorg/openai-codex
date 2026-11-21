@@ -4453,7 +4453,7 @@ impl ThreadRequestProcessor {
         }
         // Path-based resume can use an empty request thread ID. Coordinate once its real
         // identity is known; unrelated loaded threads never wait for this cold startup.
-        let _goal_resume_guard = if let InitialHistory::Resumed(resumed) = &thread_history {
+        let goal_resume_guard = if let InitialHistory::Resumed(resumed) = &thread_history {
             let guard = self
                 .thread_state_manager
                 .lock_goal_resume(resumed.conversation_id)
@@ -4522,6 +4522,9 @@ impl ThreadRequestProcessor {
                     )
                 })?;
 
+            // The parent has loaded the child. Running-thread recovery takes the same
+            // per-thread lock and rechecks retirement before attaching its listener.
+            drop(goal_resume_guard);
             let cold_resume_history = paginated_resume.then(|| thread_history.get_rollout_items());
             // Attach to the resolved child with only the caller's history-paging preferences.
             let attach_params = ThreadResumeParams {
@@ -4680,7 +4683,7 @@ impl ThreadRequestProcessor {
             Some(prepared) if prepared.state == config_state => prepared.config,
             _ => {
                 // Config loading can call back into Desktop; release both locks during host work.
-                drop(_goal_resume_guard);
+                drop(goal_resume_guard);
                 drop(_thread_list_state_permit);
                 let config = box_thread_start_future(|| {
                     self.config_manager.load_for_resume(
