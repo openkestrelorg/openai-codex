@@ -236,7 +236,7 @@ mod tests {
             vec![
                 (
                     AMAZON_BEDROCK_GPT_6_1_SOL_MODEL_ID,
-                    Some(GPT_5_BEDROCK_CONTEXT_WINDOW),
+                    Some(500_000),
                     Some(872_000),
                     WebSearchToolType::Text,
                 ),
