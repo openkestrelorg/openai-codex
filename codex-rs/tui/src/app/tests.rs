@@ -3389,6 +3389,42 @@ enum DuringOpen {
     Fork,
 }
 
+// These fixtures send turns to idle threads with zero unload delay.
+async fn start_retained_test_thread(
+    server: &mut AppServerSession,
+    app: &App,
+) -> Result<AppServerStartedThread> {
+    let (started, retention) = Box::pin(server.prepare_retained_thread_start(
+        &app.local_settings,
+        &app.config,
+        /*session_start_source*/ None,
+        /*clear_predecessor_thread_id*/ None,
+        /*remote_cwd_override*/ None,
+        /*selected_profile*/ None,
+        /*host_project_cwd*/ None,
+    ))
+    .await?;
+    retention.expect("retained fixture start").commit();
+    Ok(started)
+}
+
+async fn resume_retained_test_thread(
+    server: &mut AppServerSession,
+    app: &App,
+    id: ThreadId,
+) -> Result<AppServerStartedThread> {
+    let (started, retention) = Box::pin(server.prepare_retained_resume(
+        &app.local_settings,
+        app.config.clone(),
+        id,
+        crate::app_server_session::ResumeModelSettings::PreserveExistingThread,
+        crate::resume_permissions::ResumePermissions::default(),
+    ))
+    .await?;
+    retention.expect("retained fixture resume").commit();
+    Ok(started)
+}
+
 async fn reopen_saved_side_chat(during: DuringOpen) -> Result<()> {
     use crate::app_server_session::ResumeModelSettings;
     use crate::app_server_session::SideChatStorage;
@@ -3405,7 +3441,10 @@ async fn reopen_saved_side_chat(during: DuringOpen) -> Result<()> {
         .await?;
     let config = app.config.clone();
     let mut server = Box::pin(crate::start_embedded_app_server_for_picker(&config)).await?;
-    let parent = server.start_thread(&config).await?.session.thread_id;
+    let parent = start_retained_test_thread(&mut server, &app)
+        .await?
+        .session
+        .thread_id;
     side_chat_policy_tests::ask(&mut server, &model, parent, "Parent-only prompt").await?;
     server.thread_set_name(parent, "New name".into()).await?;
     let incomplete = server
@@ -3429,17 +3468,17 @@ async fn reopen_saved_side_chat(during: DuringOpen) -> Result<()> {
         )
         .await?;
     assert_eq!(fork.boundary, Ok(()));
-    let child = server
-        .fork_side_thread(
+    let (child, retention) = server
+        .prepare_retained_side_fork(
             &app.local_settings,
             config.clone(),
             parent,
             /*selected_profile*/ None,
             SideChatStorage::Attached,
         )
-        .await?
-        .session
-        .thread_id;
+        .await?;
+    retention.expect("retained fixture fork").commit();
+    let child = child.session.thread_id;
     // Older daemons copy the parent's name before the client can write the side-chat boundary.
     server.thread_set_name(child, "New name".into()).await?;
     server
@@ -3464,14 +3503,7 @@ async fn reopen_saved_side_chat(during: DuringOpen) -> Result<()> {
     let child_id = child.to_string();
     // A cold resume before the first prompt can seed the summary from the parent's history.
     let mut server = Box::pin(crate::start_embedded_app_server_for_picker(&config)).await?;
-    let started = server
-        .resume_thread(
-            &app.local_settings,
-            config.clone(),
-            child,
-            ResumeModelSettings::PreserveExistingThread,
-        )
-        .await?;
+    let started = resume_retained_test_thread(&mut server, &app, child).await?;
     assert!(
         started.turns.is_empty(),
         "inherited turns should stay hidden"
@@ -3505,14 +3537,7 @@ async fn reopen_saved_side_chat(during: DuringOpen) -> Result<()> {
     proxy.await??;
 
     let mut server = Box::pin(crate::start_embedded_app_server_for_picker(&config)).await?;
-    let started = server
-        .resume_thread(
-            &app.local_settings,
-            config,
-            parent,
-            ResumeModelSettings::PreserveExistingThread,
-        )
-        .await?;
+    let started = resume_retained_test_thread(&mut server, &app, parent).await?;
     app.enqueue_primary_thread_session(started.session, started.turns)
         .await?;
     while events.try_recv().is_ok() {}
@@ -3630,14 +3655,7 @@ async fn reopen_saved_side_chat(during: DuringOpen) -> Result<()> {
 
     // Another client writes to the first chat while this chooser stays open.
     let sibling = children[0];
-    server
-        .resume_thread(
-            &app.local_settings,
-            app.config.clone(),
-            sibling,
-            ResumeModelSettings::PreserveExistingThread,
-        )
-        .await?;
+    resume_retained_test_thread(&mut server, &app, sibling).await?;
     server
         .thread_set_name(sibling, "Named sibling".into())
         .await?;

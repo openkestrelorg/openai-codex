@@ -339,7 +339,18 @@ async fn disconnected_v2_child_lifecycle(unload_delay_secs: u64, ephemeral: bool
     let (processor, mut outgoing) = build_test_processor(config, auth).await;
     let mut created = processor.thread_created_receiver();
     let owner_id = ConnectionId(1);
-    let owner = Arc::new(ConnectionSessionState::new(ConnectionOrigin::WebSocket));
+    // The parent must survive the idle interval between start and its first turn.
+    // Its grant is revoked by the real disconnect before the gated child spawn.
+    let retain_parent = unload_delay_secs == 0;
+    let owner = Arc::new(if retain_parent {
+        ConnectionSessionState::with_provenance(
+            ConnectionOrigin::InProcess,
+            crate::transport::ConnectionProvenance::InProcess,
+            crate::thread_state::RetentionPrincipalId::connection_owned(),
+        )
+    } else {
+        ConnectionSessionState::new(ConnectionOrigin::WebSocket)
+    });
     let result: Result<()> = async {
         send_request(
             &processor,
@@ -358,11 +369,17 @@ async fn disconnected_v2_child_lifecycle(unload_delay_secs: u64, ephemeral: bool
             &processor,
             owner_id,
             &owner,
-            json!({"id": 2, "method": "thread/start", "params": {"ephemeral": ephemeral}}),
+            json!({"id": 2, "method": "thread/start", "params": {"ephemeral": ephemeral, "retainForConnection": retain_parent}}),
         )
         .await;
         let parent: ThreadStartResponse =
             read_response_from(&mut outgoing, owner_id, /*request_id*/ 2).await;
+        if retain_parent {
+            assert!(matches!(
+                parent.retention,
+                Some(codex_app_server_protocol::ThreadRetentionAcquireResponse::Acquired { .. })
+            ));
+        }
         send_request(
             &processor,
             owner_id,

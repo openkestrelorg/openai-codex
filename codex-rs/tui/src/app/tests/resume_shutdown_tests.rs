@@ -16,7 +16,7 @@ async fn thread_close_exits_only_when_displayed_thread_is_unloaded() -> Result<(
         "thread_unload_delay_secs = 0\n",
     )?;
     let mut server = Box::pin(crate::start_embedded_app_server_for_picker(&app.config)).await?;
-    let started = server.start_thread(&app.config).await?;
+    let started = start_retained_test_thread(&mut server, &app).await?;
     let thread_id = started.session.thread_id;
     app.enqueue_primary_thread_session(started.session, started.turns)
         .await?;
