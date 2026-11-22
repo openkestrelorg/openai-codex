@@ -5,6 +5,7 @@ use codex_extension_api::ExtensionData;
 use codex_extension_api::ThreadIdleCause;
 use codex_extension_api::TurnStartPhase;
 use codex_protocol::error::CodexErr;
+use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::TokenUsage;
@@ -32,6 +33,7 @@ impl Session {
         }
     }
 
+    #[tracing::instrument(level = "trace", skip_all, fields(turn_id = %turn_context.sub_id, phase = ?phase))]
     pub(super) async fn emit_turn_start_lifecycle(
         self: &Arc<Self>,
         turn_context: &TurnContext,
@@ -40,34 +42,43 @@ impl Session {
     ) -> CodexResult<()> {
         let metadata: Arc<dyn TurnAnalyticsMetadata> = turn_context.turn_metadata_state.clone();
         turn_context.extension_data.insert(metadata);
+        turn_context
+            .extension_data
+            .insert(turn_context.session_telemetry.clone());
         let collaboration_mode = turn_context.collaboration_mode();
         for contributor in self.services.extensions.turn_lifecycle_contributors() {
             if contributor.turn_start_phase(&self.services.thread_extension_data) != phase {
                 continue;
             }
-            let work = if phase == TurnStartPhase::RegularTaskStart
-                && contributor.requires_mcp_runtime(&self.services.thread_extension_data)
-            {
-                // Only this post-install phase has a bound turn entry.
+            let needs_mcp = phase == TurnStartPhase::RegularTaskStart
+                && contributor.requires_mcp_runtime(&self.services.thread_extension_data);
+            let work = if needs_mcp {
                 self.turn_mcp_work(turn_context)
                     .map_err(|err| CodexErr::Fatal(err.to_string()))?
             } else {
                 None
             };
-            let access = work.as_deref().map_or(
-                codex_mcp::McpAttemptAccess::Unscoped,
-                codex_mcp::McpAttemptAccess::Admitted,
-            );
-            if phase == TurnStartPhase::RegularTaskStart
-                && contributor.requires_mcp_runtime(&self.services.thread_extension_data)
+            let access = if work.is_none()
+                && self
+                    .services
+                    .host_admission
+                    .as_ref()
+                    .is_some_and(|host| host.requires_account_work())
             {
-                self.refresh_mcp_if_dirty_with_authority(access)
-                    .await
-                    .map_err(|err| CodexErr::Fatal(err.to_string()))?;
+                Err(codex_mcp::McpAttemptRefused)
+            } else {
+                Ok(codex_mcp::McpAttemptAccess::from_work(work.as_deref()))
+            };
+            if needs_mcp {
+                self.refresh_mcp_if_dirty_with_authority(
+                    access.map_err(|err| CodexErr::Fatal(err.to_string()))?,
+                )
+                .await
+                .map_err(|err| CodexErr::Fatal(err.to_string()))?;
             }
             contributor
                 .on_turn_start(codex_extension_api::TurnStartInput {
-                    mcp_access: Ok(access),
+                    mcp_access: access,
                     turn_id: turn_context.sub_id.as_str(),
                     collaboration_mode: &collaboration_mode,
                     token_usage_at_turn_start,
@@ -94,6 +105,28 @@ impl Session {
     }
 
     pub(crate) async fn emit_thread_idle_lifecycle_if_idle(&self, cause: ThreadIdleCause) {
+        let contributors = self.services.extensions.thread_lifecycle_contributors();
+        if contributors.is_empty() {
+            return;
+        }
+        // An idle wake is new automatic work, not a surviving turn or request.
+        // Acquire once before any wait; a draining host can refuse the wake.
+        let captured = match &self.services.host_admission {
+            Some(host) => host.admit_operation_work().and_then(|work| {
+                if work.is_none() && host.requires_account_work() {
+                    Err(codex_extension_api::TurnWorkRefused::Unavailable)
+                } else {
+                    Ok(work)
+                }
+            }),
+            None => Ok(None),
+        };
+        // Never retain a retry future in a shared callback input or retry this
+        // wake after a generation change. Durable queued/Goal state remains.
+        let (work, refused) = match captured {
+            Ok(work) => (work, false),
+            Err(_) => (None, true),
+        };
         let cause = {
             let active_turn = self.active_turn.lock().await;
             if active_turn.is_some() {
@@ -109,9 +142,14 @@ impl Session {
             return;
         }
 
-        for contributor in self.services.extensions.thread_lifecycle_contributors() {
+        for contributor in contributors {
             contributor
                 .on_thread_idle(codex_extension_api::ThreadIdleInput {
+                    account_work: if refused {
+                        Err(codex_mcp::McpAttemptRefused)
+                    } else {
+                        Ok(work.as_deref())
+                    },
                     cause,
                     session_store: &self.services.session_extension_data,
                     thread_store: &self.services.thread_extension_data,
@@ -142,12 +180,14 @@ impl Session {
         &self,
         turn_context: &TurnContext,
         error: CodexErrorInfo,
+        error_details: &CodexErrorDetails,
     ) {
         for contributor in self.services.extensions.turn_lifecycle_contributors() {
             contributor
                 .on_turn_error(codex_extension_api::TurnErrorInput {
                     turn_id: turn_context.sub_id.as_str(),
                     error: error.clone(),
+                    error_details,
                     session_store: &self.services.session_extension_data,
                     thread_store: &self.services.thread_extension_data,
                     turn_store: turn_context.extension_data.as_ref(),
@@ -156,3 +196,11 @@ impl Session {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "turn_work_lifecycle_tests.rs"]
+mod turn_work_tests;
+
+#[cfg(test)]
+#[path = "lifecycle_authority_tests.rs"]
+mod authority_tests;

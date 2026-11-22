@@ -8,6 +8,7 @@ use crate::ToolSuggestPluginDiscoveryInput;
 use crate::installed_marketplaces::marketplace_install_root;
 use crate::loader::load_plugin_skill_inventory;
 use crate::loader::load_plugins_from_layer_stack;
+use crate::loader::plugin_capability_summary_from_root;
 use crate::loader::refresh_non_curated_plugin_cache;
 use crate::loader::refresh_non_curated_plugin_cache_force_reinstall;
 use crate::marketplace::MarketplacePluginInstallPolicy;
@@ -121,6 +122,9 @@ fn plugins_config_input_with_requirements(
 ) -> PluginsConfigInput {
     PluginsConfigInput::new(
         config_layer_stack_with_requirements(codex_home, user_config, requirements),
+        toml::from_str::<codex_config::config_toml::ConfigToml>(user_config)
+            .unwrap()
+            .plugins,
         String::new(),
         /*plugins_enabled*/ true,
         /*remote_plugin_enabled*/ false,
@@ -162,6 +166,7 @@ fn curated_repo_sync_stays_deferred_for_remote_chatgpt_catalog() {
     let tmp = TempDir::new().unwrap();
     let config = PluginsConfigInput::new(
         unrestricted_config_layer_stack(),
+        Default::default(),
         "openai".to_string(),
         /*plugins_enabled*/ true,
         /*remote_plugin_enabled*/ true,
@@ -523,6 +528,73 @@ async fn plugin_auth_projection_hides_matching_mcp_with_chatgpt_apps_route() {
         .expect("docs plugin summary should exist");
     assert_eq!(docs.mcp_server_names, vec!["docs".to_string()]);
     assert!(docs.app_connector_ids.is_empty());
+}
+
+#[tokio::test]
+async fn agent_plugin_app_routing_respects_marketplace_and_auth() {
+    for (marketplace, uses_apps, apps_enabled) in [
+        (REMOTE_GLOBAL_MARKETPLACE_NAME, true, true),
+        (REMOTE_GLOBAL_MARKETPLACE_NAME, true, false),
+        ("test", false, true),
+        ("test", false, false),
+    ] {
+        let codex_home = TempDir::new().unwrap();
+        let plugin_root = codex_home
+            .path()
+            .join("plugins/cache")
+            .join(marketplace)
+            .join("sample/local");
+        write_file(
+            &plugin_root.join("plugin.json"),
+            r#"{"$schema":"https://agent-plugins.org/schemas/1.0.0/plugin.schema.json","name":"sample","extensions":{"com.openai":{"apps":"./.app.json"}}}"#,
+        );
+        write_file(
+            &plugin_root.join(".app.json"),
+            r#"{"apps":{"sample":{"id":"connector_sample"}}}"#,
+        );
+        write_file(
+            &plugin_root.join("mcp.json"),
+            r#"{"$schema":"https://agent-plugins.org/schemas/1.0.0/mcp.schema.json","mcpServers":{"sample":{"type":"stdio","command":"sample-mcp"},"unrelated":{"type":"stdio","command":"other-mcp"}}}"#,
+        );
+        let outcome = load_plugins_from_config(
+            &format!(
+                "[features]\nplugins = true\napps = {apps_enabled}\n[plugins.\"sample@{marketplace}\"]\nenabled = true\n"
+            ),
+            codex_home.path(),
+            Some(AuthMode::Chatgpt),
+        )
+        .await;
+        let expected_apps = if uses_apps {
+            vec![AppConnectorId("connector_sample".to_string())]
+        } else {
+            Vec::new()
+        };
+        let expected_mcp = if uses_apps {
+            vec!["unrelated".to_string()]
+        } else {
+            vec!["sample".to_string(), "unrelated".to_string()]
+        };
+        assert_eq!(outcome.effective_apps(), expected_apps);
+        assert_eq!(sorted_effective_mcp_server_names(&outcome), expected_mcp);
+        let [summary] = outcome.capability_summaries() else {
+            panic!("expected one installed plugin");
+        };
+        assert_eq!(summary.app_connector_ids, expected_apps);
+        assert_eq!(summary.mcp_server_names, expected_mcp);
+
+        // Remote curated plugins are not selected in API-key mode, but the standalone
+        // loader must still preserve direct MCP when no app route is available.
+        let mut direct_servers = crate::loader::load_plugin_mcp_servers(
+            &plugin_root,
+            &PluginId::parse(&format!("sample@{marketplace}")).unwrap(),
+            Some(AuthMode::ApiKey),
+        )
+        .await
+        .into_keys()
+        .collect::<Vec<_>>();
+        direct_servers.sort();
+        assert_eq!(direct_servers, vec!["sample", "unrelated"]);
+    }
 }
 
 #[tokio::test]
@@ -982,9 +1054,9 @@ async fn load_plugins_loads_default_skills_and_mcp_servers() {
                     required: false,
                     startup_readiness: Default::default(),
                     supports_parallel_tool_calls: false,
-                    tool_input_schema_max_bytes: None,
                     thread_identity_eligible: false,
                     control_endpoint_eligible: false,
+                    tool_input_schema_max_bytes: None,
                     omit_tools_from: None,
                     disabled_reason: None,
                     startup_timeout_sec: None,
@@ -1088,9 +1160,9 @@ enabled = true
                 required: false,
                 startup_readiness: Default::default(),
                 supports_parallel_tool_calls: false,
-                tool_input_schema_max_bytes: None,
                 thread_identity_eligible: false,
                 control_endpoint_eligible: false,
+                tool_input_schema_max_bytes: None,
                 omit_tools_from: None,
                 disabled_reason: None,
                 startup_timeout_sec: None,
@@ -1780,6 +1852,79 @@ async fn build_remote_installed_plugin_marketplaces_from_cache_uses_remote_metad
     );
 }
 
+// A reduced snapshot remains usable for execution, but display callers must fetch enrichment.
+// Display-resolution changes alone must not invalidate effective runtime metadata.
+#[tokio::test]
+async fn unresolved_display_assets_does_not_satisfy_display_cache_reads() {
+    let codex_home = TempDir::new().unwrap();
+    let manager = test_plugins_manager(codex_home.path().to_path_buf());
+    let auth = manager.auth_manager.auth_cached();
+    let plugins = vec![remote_installed_linear_plugin()];
+    let generation = manager
+        .prepare_remote_installed_plugins_cache_generation(auth.as_ref())
+        .unwrap();
+    assert_eq!(
+        manager
+            .write_remote_installed_plugins_cache_snapshot(
+                generation,
+                plugins.clone(),
+                auth.as_ref(),
+                RemoteInstalledPluginsCachePublication::Refresh(InstalledPluginDisplayAssets::Skip),
+            )
+            .map(|update| update.metadata_change_id.is_some()),
+        Some(true)
+    );
+    assert!(
+        manager
+            .build_remote_installed_plugin_marketplaces_from_cache(&[
+                REMOTE_GLOBAL_MARKETPLACE_NAME
+            ],)
+            .is_none()
+    );
+    let runtime = manager
+        .build_remote_installed_plugin_marketplaces_from_cache_with_display_assets(
+            &[REMOTE_GLOBAL_MARKETPLACE_NAME],
+            InstalledPluginDisplayAssets::Skip,
+        )
+        .expect("runtime metadata is ready");
+    assert_eq!(runtime[0].plugins.len(), 1);
+    assert_eq!(
+        manager
+            .write_remote_installed_plugins_cache_snapshot(
+                generation,
+                plugins.clone(),
+                auth.as_ref(),
+                RemoteInstalledPluginsCachePublication::Refresh(
+                    InstalledPluginDisplayAssets::Include
+                ),
+            )
+            .map(|update| update.metadata_change_id.is_some()),
+        Some(false)
+    );
+    assert_eq!(
+        manager.build_remote_installed_plugin_marketplaces_from_cache(&[
+            REMOTE_GLOBAL_MARKETPLACE_NAME
+        ],),
+        Some(runtime)
+    );
+    assert_eq!(
+        manager
+            .write_remote_installed_plugins_cache_snapshot(
+                generation,
+                plugins,
+                auth.as_ref(),
+                RemoteInstalledPluginsCachePublication::Refresh(InstalledPluginDisplayAssets::Skip),
+            )
+            .map(|update| update.metadata_change_id.is_some()),
+        Some(false)
+    );
+    assert!(
+        manager
+            .build_remote_installed_plugin_marketplaces_from_cache(&[])
+            .is_none()
+    );
+}
+
 #[tokio::test]
 async fn build_remote_installed_plugin_marketplaces_from_cache_filters_by_marketplace_name() {
     let codex_home = TempDir::new().unwrap();
@@ -1847,7 +1992,7 @@ enabled = true
 
     assert_eq!(
         outcome.plugins()[0].disabled_skill_paths,
-        HashSet::from([skill_path])
+        HashSet::from([PathUri::from_abs_path(&skill_path)])
     );
     assert!(!outcome.plugins()[0].has_enabled_skills);
     assert!(outcome.capability_summaries().is_empty());
@@ -1929,6 +2074,7 @@ async fn plugin_telemetry_metadata_uses_default_mcp_config_path() {
         &PluginId::parse("sample@test").expect("plugin id should parse"),
         &plugin_root.abs(),
         test_skill_root_loader().as_ref(),
+        &crate::manifest::ManifestCache::disabled(),
     )
     .await;
 
@@ -1972,6 +2118,7 @@ async fn plugin_capability_summary_uses_manifest_mcp_server_objects() {
         &PluginId::parse("counter-sample@test").expect("plugin id should parse"),
         &plugin_root.abs(),
         test_skill_root_loader().as_ref(),
+        &crate::manifest::ManifestCache::disabled(),
     )
     .await;
 
@@ -2195,9 +2342,9 @@ async fn load_plugins_uses_manifest_configured_component_paths() {
                     required: false,
                     startup_readiness: Default::default(),
                     supports_parallel_tool_calls: false,
-                    tool_input_schema_max_bytes: None,
                     thread_identity_eligible: false,
                     control_endpoint_eligible: false,
+                    tool_input_schema_max_bytes: None,
                     omit_tools_from: None,
                     disabled_reason: None,
                     startup_timeout_sec: None,
@@ -2298,7 +2445,10 @@ async fn install_plugin_materializes_default_command_skills() {
         resolved
             .skills
             .iter()
-            .map(|skill| skill.path_to_skills_md.clone())
+            .map(|skill| skill
+                .path_to_skills_md
+                .to_abs_path()
+                .expect("host skill path"))
             .collect::<Vec<_>>(),
         vec![
             AbsolutePathBuf::from_absolute_path_checked(
@@ -2424,7 +2574,12 @@ async fn load_plugin_skills_dedupes_overlapping_manifest_roots() {
     let skill_paths = resolved
         .skills
         .iter()
-        .map(|skill| skill.path_to_skills_md.clone())
+        .map(|skill| {
+            skill
+                .path_to_skills_md
+                .to_abs_path()
+                .expect("host skill path")
+        })
         .collect::<Vec<_>>();
     let canonical_skill_path = |path| {
         AbsolutePathBuf::from_absolute_path_checked(
@@ -2538,9 +2693,9 @@ async fn load_plugins_ignores_manifest_component_paths_without_dot_slash() {
                 required: false,
                 startup_readiness: Default::default(),
                 supports_parallel_tool_calls: false,
-                tool_input_schema_max_bytes: None,
                 thread_identity_eligible: false,
                 control_endpoint_eligible: false,
+                tool_input_schema_max_bytes: None,
                 omit_tools_from: None,
                 disabled_reason: None,
                 startup_timeout_sec: None,
@@ -2797,9 +2952,9 @@ fn capability_index_filters_inactive_and_zero_capability_plugins() {
         required: false,
         startup_readiness: Default::default(),
         supports_parallel_tool_calls: false,
-        tool_input_schema_max_bytes: None,
         thread_identity_eligible: false,
         control_endpoint_eligible: false,
+        tool_input_schema_max_bytes: None,
         omit_tools_from: None,
         disabled_reason: None,
         startup_timeout_sec: None,
@@ -2986,6 +3141,11 @@ async fn plugin_cache_reuses_effective_configurations() {
     let config = |session_config| {
         PluginsConfigInput::new(
             stack(session_config),
+            stack(session_config)
+                .effective_config()
+                .try_into::<codex_config::config_toml::ConfigToml>()
+                .unwrap()
+                .plugins,
             String::new(),
             /*plugins_enabled*/ true,
             /*remote_plugin_enabled*/ false,
@@ -3017,7 +3177,11 @@ enabled = false"#,
     );
     assert_eq!(
         manager
-            .plugins_for_config(&config(r#"model = "second""#))
+            .plugins_for_config(&config(
+                r#"model = "second"
+[plugins."sample@test".apps.calendar.tools.list]
+approval_mode = "prompt""#
+            ))
             .await,
         first,
     );
@@ -3034,6 +3198,113 @@ enabled = false"#,
             .collect::<Vec<_>>(),
         vec![None, None],
     );
+}
+
+#[tokio::test]
+async fn plugin_defaults_resolve_remote_enablement_and_separate_cache_entries() {
+    let codex_home = TempDir::new().unwrap();
+    let cache_root = codex_home
+        .path()
+        .join("plugins/cache/openai-curated-remote");
+    for name in ["sample", "other"] {
+        write_plugin(&cache_root, &format!("{name}/local"), name);
+        write_file(
+            &cache_root.join(format!("{name}/local/.app.json")),
+            &format!(r#"{{"apps":{{"{name}":{{"id":"connector_{name}"}}}}}}"#),
+        );
+    }
+    let config_path = codex_home.path().join(CONFIG_TOML_FILE);
+    let manager = test_plugins_manager_with_options(
+        codex_home.path().to_path_buf(),
+        Some(Product::Codex),
+        Some(AuthMode::Chatgpt),
+    );
+    manager.write_remote_installed_plugins_cache(vec![
+        remote_installed_plugin("sample"),
+        remote_installed_plugin("other"),
+    ]);
+
+    let assert_active_plugins = |loaded: &PluginLoadOutcome, expected_names: Vec<&str>| {
+        assert_eq!(
+            loaded
+                .capability_summaries()
+                .iter()
+                .map(|summary| summary.config_name.as_str())
+                .collect::<Vec<_>>(),
+            expected_names
+        );
+        assert_eq!(
+            loaded.effective_plugin_skill_roots().len(),
+            expected_names.len()
+        );
+        assert_eq!(loaded.effective_apps().len(), expected_names.len());
+        assert!(loaded.plugins().iter().all(|plugin| plugin.error.is_none()));
+    };
+
+    let sample = "sample@openai-curated-remote";
+    let other = "other@openai-curated-remote";
+    for (policy, expected_names) in [
+        ("", vec![other, sample]),
+        ("[plugins._default]\nenabled = false", Vec::new()),
+        (
+            "[plugins._default]\nenabled = false\n[plugins.\"sample@openai-curated-remote\"]\nenabled = true",
+            vec![sample],
+        ),
+        (
+            "[plugins._default]\nenabled = true\n[plugins.\"sample@openai-curated-remote\"]\nenabled = false",
+            vec![other],
+        ),
+        (
+            "[plugins._default]\nenabled = false\n[plugins.\"sample@openai-curated-remote\".mcp_servers.example]\ndefault_tools_approval_mode = 'approve'",
+            Vec::new(),
+        ),
+        // Without the new default, legacy remote account enablement still wins.
+        (
+            "[plugins.\"sample@openai-curated-remote\"]\nenabled = false",
+            vec![other, sample],
+        ),
+    ] {
+        write_file(&config_path, policy);
+        let config = load_config(codex_home.path(), codex_home.path()).await;
+        let loaded = manager.plugins_for_config(&config).await;
+        assert_active_plugins(&loaded, expected_names);
+    }
+
+    // Marketplace filtering removes these raw entries from the configured map,
+    // but remote discovery still supplies the installed bundle. Its raw policy
+    // must distinguish cache entries as host enablement changes.
+    for enabled in [true, false] {
+        let mut restricted_config = plugins_config_input_with_requirements(
+            codex_home.path(),
+            &format!(
+                "[plugins._default]\nenabled = false\n[plugins.\"sample@openai-curated-remote\"]\nenabled = {enabled}"
+            ),
+            "[marketplaces]\nrestrict_to_allowed_sources = true",
+        );
+        restricted_config.remote_plugin_enabled = true;
+        assert!(
+            configured_plugins_from_stack(
+                &restricted_config.config_layer_stack,
+                codex_home.path(),
+            )
+            .is_empty()
+        );
+        let loaded = manager.plugins_for_config(&restricted_config).await;
+        let expected = if enabled { vec![sample] } else { Vec::new() };
+        assert_active_plugins(&loaded, expected);
+    }
+
+    let mut disabled_plugin = remote_installed_plugin("sample");
+    disabled_plugin.enabled = false;
+    disabled_plugin.availability = codex_app_server_protocol::PluginAvailability::DisabledByAdmin;
+    manager.write_remote_installed_plugins_cache(vec![disabled_plugin]);
+    write_file(
+        &config_path,
+        "[plugins._default]\nenabled = false\n[plugins.\"sample@openai-curated-remote\"]\nenabled = true",
+    );
+    let config = load_config(codex_home.path(), codex_home.path()).await;
+    let loaded = manager.plugins_for_config(&config).await;
+    assert_active_plugins(&loaded, Vec::new());
 }
 
 #[tokio::test]
@@ -3176,10 +3447,15 @@ fn loaded_plugins_cache_evicts_least_recently_used_configuration() {
             configured_plugins: HashMap::from([(
                 format!("plugin-{index}@test"),
                 PluginConfig {
-                    enabled: true,
+                    enabled: Some(true),
+                    remote_plugin_id: None,
+                    release_id: None,
+                    auto_provision: None,
                     mcp_servers: HashMap::new(),
+                    apps: HashMap::new(),
                 },
             )]),
+            plugin_policy: PluginsConfigToml::default(),
             skill_config_rules: SkillConfigRules::default(),
             remote_global_catalog_active: false,
             auth_identity: None,
@@ -3224,6 +3500,7 @@ fn loaded_plugins_cache_invalidation_rejects_stale_load_completion() {
     let manager = test_plugins_manager(codex_home.path().to_path_buf());
     let cache_key = PluginLoadCacheKey {
         configured_plugins: HashMap::new(),
+        plugin_policy: PluginsConfigToml::default(),
         skill_config_rules: SkillConfigRules::default(),
         remote_global_catalog_active: false,
         auth_identity: None,
@@ -3251,6 +3528,7 @@ async fn plugins_for_config_discards_in_flight_load_after_account_change() {
     );
     let config = PluginsConfigInput::new(
         unrestricted_config_layer_stack(),
+        Default::default(),
         String::new(),
         /*plugins_enabled*/ true,
         /*remote_plugin_enabled*/ true,
@@ -5883,7 +6161,9 @@ plugins = true
         .mount(&server)
         .await;
 
-    let mut config = load_config(tmp.path(), tmp.path()).await;
+    let mut config = load_config(tmp.path(), tmp.path())
+        .await
+        .with_plugin_recommendations_enabled(/*enabled*/ true);
     config.chatgpt_base_url = server.uri();
     let manager = std::sync::Arc::new(test_plugins_manager(tmp.path().to_path_buf()));
     let auth = CodexAuth::create_dummy_chatgpt_auth_for_testing();
@@ -6615,7 +6895,7 @@ enabled = true
             state.requested.as_ref().map(|request| request.git_mode),
             Some(PluginGitMode::Manual)
         ));
-        state.last_refreshed = state.requested.take();
+        state.last_refreshed = state.requested.take().map(|queued| queued.request);
         state.in_flight = false;
     }
 
@@ -6628,7 +6908,15 @@ enabled = true
             .expect("refresh state lock");
         assert!(!state.in_flight);
         assert!(state.requested.is_none());
-        state.requested = state.last_refreshed.clone();
+        state.requested = state
+            .last_refreshed
+            .clone()
+            .map(|request| QueuedPluginRequest {
+                request,
+                owner: None,
+                obligations: Vec::new(),
+                callback_owner: None,
+            });
         state.in_flight = true;
     }
 
@@ -7009,6 +7297,11 @@ async fn load_plugins_uses_project_config_files() {
 
     let plugins = load_plugins_from_layer_stack(
         &stack,
+        &stack
+            .effective_config()
+            .try_into::<codex_config::config_toml::ConfigToml>()
+            .unwrap()
+            .plugins,
         crate::remote_plugin_id_resolver::RemoteInstalledPluginsSnapshot::default(),
         &PluginStore::new(codex_home.path().to_path_buf()),
         /*plugin_skill_snapshots*/ None,
@@ -7189,6 +7482,7 @@ fn remote_installed_plugins_cache_refresh_coalesces_materializations() {
         authenticated_account_id: Some("account-123".to_string()),
     };
     let change = |name: &str| EffectivePluginsChange {
+        metadata_change_id: None,
         materialized_remote_plugins: vec![materialization(name)],
     };
     let callback = |count: std::sync::Arc<std::sync::atomic::AtomicUsize>| {
@@ -7203,7 +7497,6 @@ fn remote_installed_plugins_cache_refresh_coalesces_materializations() {
     let request =
         |change, on_effective_plugins_changed| RemoteInstalledPluginsCacheRefreshRequest {
             generation,
-            reset_generation: manager.remote_installed_plugins_generation(),
             service_config: RemotePluginServiceConfig::new(
                 "https://example.com".to_string(),
                 test_http_client_factory(),
@@ -7232,6 +7525,7 @@ fn remote_installed_plugins_cache_refresh_coalesces_materializations() {
     assert_eq!(
         request.change,
         EffectivePluginsChange {
+            metadata_change_id: None,
             materialized_remote_plugins: vec![materialization("alpha"), materialization("beta"),],
         }
     );
@@ -7250,48 +7544,107 @@ fn remote_installed_plugins_cache_refresh_coalesces_materializations() {
 }
 
 #[tokio::test]
-async fn rejected_remote_cache_refresh_admission_clears_queued_work() {
-    let tmp = TempDir::new().unwrap();
-    let manager = Arc::new(test_plugins_manager(tmp.path().to_path_buf()));
-    let drain = manager.shutdown_until(tokio::time::Instant::now()).await;
-    assert!(drain.is_clean());
-    let service_config = RemotePluginServiceConfig::new(
-        "https://example.com".to_string(),
-        test_http_client_factory(),
-        /*product_sku*/ None,
-    );
-
-    manager.schedule_remote_installed_plugins_cache_refresh(
-        RemoteInstalledPluginsCacheRefreshRequest {
-            generation: manager
-                .prepare_remote_installed_plugins_cache_generation(/*auth*/ None)
-                .expect("current unauthenticated generation"),
-            reset_generation: manager.remote_installed_plugins_generation(),
-            service_config: service_config.clone(),
-            auth: None,
-            notify: RemoteInstalledPluginsCacheRefreshNotify::IfCacheChanged,
-            on_effective_plugins_changed: None,
-            change: EffectivePluginsChange::default(),
-        },
-    );
-    manager.schedule_remote_catalog_cache_refresh(RemoteCatalogCacheRefreshRequest {
-        service_config,
-        auth: None,
-        scopes: BTreeSet::from([crate::remote::RemotePluginScope::Global]),
-        mode: RemoteCatalogCacheRefreshMode::Force,
-    });
-
-    let installed = manager
-        .remote_installed_plugins_cache_refresh_state
-        .read()
+async fn managed_async_plugin_reads_stop_without_publication_callback_or_auth_poisoning() {
+    for operation in ["installed", "catalog", "bundle"] {
+        let home = tempfile::tempdir().unwrap();
+        write_file(
+            &home.path().join(CONFIG_TOML_FILE),
+            "[features]\nplugins = true\nremote_plugin = true\n",
+        );
+        let server = MockServer::start().await;
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let request_entered = entered.clone();
+        Mock::given(method("GET"))
+            .respond_with(move |_: &wiremock::Request| {
+                request_entered.notify_one();
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_secs(30))
+                    .set_body_json(serde_json::json!({
+                        "plugins": [], "pagination": {"next_page_token": null}
+                    }))
+            })
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut config = load_config(home.path(), home.path()).await;
+        config.chatgpt_base_url = format!("{}/backend-api", server.uri());
+        let manager = Arc::new(test_plugins_manager_with_options(
+            home.path().to_path_buf(),
+            Some(Product::Codex),
+            Some(AuthMode::Chatgpt),
+        ));
+        let auth = CodexAuth::create_dummy_chatgpt_auth_for_testing();
+        let callbacks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = callbacks.clone();
+        let callback: EffectivePluginsChangedCallback = Arc::new(move |_| {
+            count.fetch_add(1, Ordering::SeqCst);
+        });
+        let host = QueuedTestHost::new(31);
+        codex_model_provider::with_auth_task_scope(host.access(), async {
+            match operation {
+                "installed" => manager
+                    .maybe_start_remote_installed_plugins_cache_refresh_after_mutation(
+                        &config,
+                        Some(auth.clone()),
+                        Some(callback),
+                    ),
+                "catalog" => manager.maybe_start_remote_catalog_cache_refresh(
+                    &config,
+                    Some(auth.clone()),
+                    BTreeSet::from([RemotePluginScope::Global]),
+                ),
+                "bundle" => manager.maybe_start_remote_installed_plugin_bundle_sync(
+                    &config,
+                    Some(auth.clone()),
+                    Some(callback),
+                    InstalledPluginSyncSource::Startup,
+                ),
+                _ => unreachable!(),
+            }
+        })
+        .await
         .unwrap();
-    assert!(!installed.in_flight);
-    assert!(installed.requested.is_none());
-    drop(installed);
-    let catalog = manager.remote_catalog_cache_refresh_state.read().unwrap();
-    assert!(!catalog.in_flight);
-    assert!(catalog.requests.is_empty());
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let report = manager.shutdown_until(deadline).await;
+        assert!(report.is_clean(), "{operation}: {report:?}");
+        assert!(tokio::time::Instant::now() < deadline, "{operation}");
+        host.joined().await;
+        assert_eq!(callbacks.load(Ordering::SeqCst), 0, "{operation}");
+        assert!(
+            manager
+                .remote_installed_plugins_cache
+                .read()
+                .unwrap()
+                .plugins
+                .is_none()
+        );
+        assert!(!crate::remote::has_fresh_cached_remote_plugin_catalog(
+            home.path(),
+            &manager.remote_plugin_service_config(&config),
+            Some(&auth),
+            RemotePluginScope::Global,
+        ));
+        assert!(
+            !manager
+                .remote_installed_plugins_cache_refresh_state
+                .read()
+                .unwrap()
+                .in_flight
+        );
+        assert!(
+            !manager
+                .remote_catalog_cache_refresh_state
+                .read()
+                .unwrap()
+                .in_flight
+        );
+        server.verify().await;
+    }
 }
+
 #[tokio::test]
 async fn background_remote_installed_bundle_sync_stays_deduped() {
     let codex_home = TempDir::new().unwrap();
@@ -7336,11 +7689,13 @@ remote_plugin = true
         &config,
         Some(auth.clone()),
         /*on_effective_plugins_changed*/ None,
+        InstalledPluginSyncSource::PluginInstalled,
     );
     second_manager.maybe_start_remote_installed_plugin_bundle_sync(
         &config,
         Some(auth),
         /*on_effective_plugins_changed*/ None,
+        InstalledPluginSyncSource::PluginInstalled,
     );
 
     let _guard = first_manager
@@ -7593,6 +7948,86 @@ remote_plugin = true
     assert!(!linear_metadata.exists());
 }
 
+#[tokio::test]
+async fn failed_installed_plugin_pagination_preserves_inventory_and_releases_mutation_gate() {
+    let codex_home = TempDir::new().unwrap();
+    write_file(
+        &codex_home.path().join(CONFIG_TOML_FILE),
+        "[features]\nplugins = true\nremote_plugin = true\n",
+    );
+    write_cached_plugin(
+        codex_home.path(),
+        REMOTE_GLOBAL_MARKETPLACE_NAME,
+        "retained",
+    );
+    let server = MockServer::start().await;
+    // Both bundle sync and its metadata fallback must reject the incomplete inventory.
+    Mock::given(method("GET"))
+        .and(path("/backend-api/ps/plugins/installed"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "plugins": [],
+            "pagination": {"next_page_token": "next"},
+        })))
+        .expect(4)
+        .mount(&server)
+        .await;
+    let mut config = load_config(codex_home.path(), codex_home.path()).await;
+    config.chatgpt_base_url = format!("{}/backend-api", server.uri());
+    let auth_manager = test_auth_manager(Some(AuthMode::Chatgpt));
+    let auth = auth_manager.auth_cached().expect("test ChatGPT auth");
+    let manager = Arc::new(test_plugins_manager_with_auth_manager(
+        codex_home.path().to_path_buf(),
+        Some(Product::Codex),
+        auth_manager,
+    ));
+    let previous_inventory = vec![remote_installed_plugin("retained")];
+    manager.write_remote_installed_plugins_cache(previous_inventory.clone());
+
+    manager.maybe_start_remote_installed_plugin_bundle_sync(
+        &config,
+        Some(auth),
+        /*on_effective_plugins_changed*/ None,
+        InstalledPluginSyncSource::PluginInstalled,
+    );
+    // Starting the sync acquires the gate synchronously, so this waits for its release.
+    let _guard = tokio::time::timeout(
+        Duration::from_secs(5),
+        manager.acquire_remote_installed_plugin_sync_guard(),
+    )
+    .await
+    .expect("failed pagination should promptly release the mutation gate")
+    .expect("mutation gate should remain available");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while manager
+            .remote_installed_plugins_cache_refresh_state
+            .read()
+            .expect("refresh state lock")
+            .in_flight
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("fallback metadata refresh should finish");
+
+    assert_eq!(
+        manager
+            .remote_installed_plugins_cache
+            .read()
+            .expect("installed cache lock")
+            .plugins
+            .clone(),
+        Some(previous_inventory),
+    );
+    assert!(
+        codex_home
+            .path()
+            .join("plugins/cache/openai-curated-remote/retained")
+            .exists()
+    );
+    server.verify().await;
+}
+
 #[test]
 fn reconciliation_fences_refresh_publication_and_recovers_after_cancellation() {
     let codex_home = TempDir::new().unwrap();
@@ -7605,21 +8040,27 @@ fn reconciliation_fences_refresh_publication_and_recovers_after_cancellation() {
         .expect("capture concurrent refresh generation");
 
     assert_eq!(
-        manager.write_remote_installed_plugins_cache_snapshot(
-            stale_refresh_generation,
-            Vec::new(),
-            /*auth*/ None,
-            RemoteInstalledPluginsCachePublication::Refresh,
-        ),
+        manager
+            .write_remote_installed_plugins_cache_snapshot(
+                stale_refresh_generation,
+                Vec::new(),
+                /*auth*/ None,
+                RemoteInstalledPluginsCachePublication::Refresh(
+                    InstalledPluginDisplayAssets::Include
+                ),
+            )
+            .map(|update| update.metadata_change_id.is_some()),
         None
     );
     assert_eq!(
-        manager.write_remote_installed_plugins_cache_snapshot(
-            reconcile_generation,
-            vec![remote_installed_linear_plugin()],
-            /*auth*/ None,
-            RemoteInstalledPluginsCachePublication::Reconcile,
-        ),
+        manager
+            .write_remote_installed_plugins_cache_snapshot(
+                reconcile_generation,
+                vec![remote_installed_linear_plugin()],
+                /*auth*/ None,
+                RemoteInstalledPluginsCachePublication::Reconcile,
+            )
+            .map(|update| update.metadata_change_id.is_some()),
         Some(true)
     );
     let cancelled_generation = manager
@@ -7637,313 +8078,31 @@ fn reconciliation_fences_refresh_publication_and_recovers_after_cancellation() {
         .remote_installed_plugins_cache_generation_if_current(/*auth*/ None)
         .expect("capture refresh generation after cancellation");
     assert_eq!(
-        manager.write_remote_installed_plugins_cache_snapshot(
-            refresh_generation,
-            vec![remote_installed_plugin("beta")],
-            /*auth*/ None,
-            RemoteInstalledPluginsCachePublication::Refresh,
-        ),
+        manager
+            .write_remote_installed_plugins_cache_snapshot(
+                refresh_generation,
+                vec![remote_installed_plugin("beta")],
+                /*auth*/ None,
+                RemoteInstalledPluginsCachePublication::Refresh(
+                    InstalledPluginDisplayAssets::Include
+                ),
+            )
+            .map(|update| update.metadata_change_id.is_some()),
         Some(true)
     );
     let retry_generation = manager
         .begin_remote_installed_plugins_reconcile(/*auth*/ None)
         .expect("begin retry after cancellation");
     assert_eq!(
-        manager.write_remote_installed_plugins_cache_snapshot(
-            retry_generation,
-            vec![remote_installed_plugin("beta")],
-            /*auth*/ None,
-            RemoteInstalledPluginsCachePublication::Reconcile,
-        ),
-        Some(true)
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn account_reset_fences_late_remote_installed_success_and_auth_errors() {
-    for outcome in [
-        Ok(vec![remote_installed_plugin("account-a")]),
-        Err(RemotePluginCatalogError::AuthRequired),
-        Err(RemotePluginCatalogError::UnsupportedAuthMode),
-    ] {
-        let tmp = TempDir::new().unwrap();
-        let manager = Arc::new(test_plugins_manager(tmp.path().to_path_buf()));
-        manager.write_remote_installed_plugins_cache(vec![remote_installed_plugin("account-a")]);
-        let callback_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let count = Arc::clone(&callback_count);
-        let request = RemoteInstalledPluginsCacheRefreshRequest {
-            generation: manager
-                .prepare_remote_installed_plugins_cache_generation(/*auth*/ None)
-                .unwrap(),
-            reset_generation: manager.remote_installed_plugins_generation(),
-            service_config: RemotePluginServiceConfig::new(
-                "https://example.com".to_string(),
-                test_http_client_factory(),
-                /*product_sku*/ None,
-            ),
-            auth: None,
-            notify: RemoteInstalledPluginsCacheRefreshNotify::AfterSuccessfulRefresh,
-            on_effective_plugins_changed: Some(Arc::new(move |_| {
-                count.fetch_add(1, Ordering::SeqCst);
-            })),
-            change: EffectivePluginsChange::default(),
-        };
-        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
-        let old_manager = Arc::clone(&manager);
-        let old_request = tokio::spawn(async move {
-            started_tx.send(()).unwrap();
-            resume_rx.await.unwrap();
-            // Exercise the exact production post-fetch commit, with A's source
-            // result held at the async boundary until B has reset and published.
-            old_manager.complete_remote_installed_plugins_cache_refresh(request, outcome);
-        });
-        started_rx.await.unwrap();
-        assert!(manager.clear_remote_installed_plugins_cache());
-        let current_callback_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let current_count = Arc::clone(&current_callback_count);
-        let callback_manager = Arc::downgrade(&manager);
-        manager.complete_remote_installed_plugins_cache_refresh(
-            RemoteInstalledPluginsCacheRefreshRequest {
-                generation: manager
-                    .prepare_remote_installed_plugins_cache_generation(/*auth*/ None)
-                    .unwrap(),
-                reset_generation: manager.remote_installed_plugins_generation(),
-                service_config: RemotePluginServiceConfig::new(
-                    "https://example.com".to_string(),
-                    test_http_client_factory(),
-                    /*product_sku*/ None,
-                ),
-                auth: None,
-                notify: RemoteInstalledPluginsCacheRefreshNotify::AfterSuccessfulRefresh,
-                on_effective_plugins_changed: Some(Arc::new(move |_| {
-                    // Pin the check-act boundary too: reset cannot finish
-                    // between the generation check and callback invocation.
-                    assert!(
-                        callback_manager
-                            .upgrade()
-                            .unwrap()
-                            .remote_installed_plugins_cache_refresh_state
-                            .try_write()
-                            .is_err()
-                    );
-                    current_count.fetch_add(1, Ordering::SeqCst);
-                })),
-                change: EffectivePluginsChange::default(),
-            },
-            Ok(vec![remote_installed_plugin("account-b")]),
-        );
-        resume_tx.send(()).unwrap();
-        old_request.await.unwrap();
-        assert_eq!(
-            manager
-                .remote_installed_plugins_cache
-                .read()
-                .unwrap()
-                .plugins,
-            Some(vec![remote_installed_plugin("account-b")])
-        );
-        assert_eq!(callback_count.load(Ordering::SeqCst), 0);
-        assert_eq!(current_callback_count.load(Ordering::SeqCst), 1);
-    }
-}
-
-#[test]
-fn account_reset_drops_pending_refresh_and_rejects_late_bundle_callback() {
-    let tmp = TempDir::new().unwrap();
-    let manager = Arc::new(test_plugins_manager(tmp.path().to_path_buf()));
-    let old_generation = manager.remote_installed_plugins_generation();
-    // A running fetch owns the loop while bundle-sync completions enqueue work.
-    manager
-        .remote_installed_plugins_cache_refresh_state
-        .write()
-        .unwrap()
-        .in_flight = true;
-    let request = |reset_generation| RemoteInstalledPluginsCacheRefreshRequest {
-        generation: manager
-            .prepare_remote_installed_plugins_cache_generation(/*auth*/ None)
-            .unwrap(),
-        reset_generation,
-        service_config: RemotePluginServiceConfig::new(
-            "https://example.com".to_string(),
-            test_http_client_factory(),
-            /*product_sku*/ None,
-        ),
-        auth: None,
-        notify: RemoteInstalledPluginsCacheRefreshNotify::AfterSuccessfulRefresh,
-        on_effective_plugins_changed: None,
-        change: EffectivePluginsChange::default(),
-    };
-    manager.schedule_remote_installed_plugins_cache_refresh(request(old_generation.clone()));
-    // An empty cache must still advance the generation and discard queued work.
-    assert!(!manager.clear_remote_installed_plugins_cache());
-    assert!(
         manager
-            .remote_installed_plugins_cache_refresh_state
-            .read()
-            .unwrap()
-            .requested
-            .is_none()
-    );
-    let new_generation = manager.remote_installed_plugins_generation();
-    manager.schedule_remote_installed_plugins_cache_refresh(request(new_generation.clone()));
-    // This is the same scheduling entry used by a late bundle-sync callback.
-    manager.schedule_remote_installed_plugins_cache_refresh(request(old_generation));
-    let state = manager
-        .remote_installed_plugins_cache_refresh_state
-        .read()
-        .unwrap();
-    assert!(
-        state
-            .requested
-            .as_ref()
-            .unwrap()
-            .reset_generation
-            .is_current(&new_generation)
-    );
-}
-
-#[tokio::test]
-async fn account_reset_rejects_synchronous_remote_marketplace_result_in_flight() {
-    let tmp = TempDir::new().unwrap();
-    let auth_manager = test_auth_manager(Some(AuthMode::Chatgpt));
-    let auth = auth_manager.auth_cached().expect("fixture auth");
-    let manager = Arc::new(test_plugins_manager_with_auth_manager(
-        tmp.path().to_path_buf(),
-        /*restriction_product*/ None,
-        auth_manager,
-    ));
-    let server = MockServer::start().await;
-    let reset_manager = Arc::clone(&manager);
-    Mock::given(method("GET"))
-        .and(path("/backend-api/ps/plugins/installed"))
-        .respond_with(move |_: &wiremock::Request| {
-            // The request has captured A's generation and is waiting on HTTP.
-            // Finish reset and install B's cache before returning A's response.
-            reset_manager.clear_remote_installed_plugins_cache();
-            reset_manager
-                .write_remote_installed_plugins_cache(vec![remote_installed_plugin("account-b")]);
-            ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "plugins": [], "pagination": {"next_page_token": null}
-            }))
-        })
-        .expect(1)
-        .mount(&server)
-        .await;
-    let mut config = load_config(tmp.path(), tmp.path()).await;
-    config.chatgpt_base_url = format!("{}/backend-api", server.uri());
-    let callbacks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let callback_count = Arc::clone(&callbacks);
-    let result = manager
-        .build_and_cache_remote_installed_plugin_marketplaces(
-            &config,
-            Some(&auth),
-            &[REMOTE_GLOBAL_MARKETPLACE_NAME],
-            Some(Arc::new(move |_| {
-                callback_count.fetch_add(1, Ordering::SeqCst);
-            })),
-        )
-        .await;
-    assert!(matches!(result, Err(RemotePluginCatalogError::AuthChanged)));
-    assert_eq!(
-        manager
-            .remote_installed_plugins_cache
-            .read()
-            .unwrap()
-            .plugins,
-        Some(vec![remote_installed_plugin("account-b")])
-    );
-    assert_eq!(callbacks.load(Ordering::SeqCst), 0);
-}
-
-#[tokio::test(start_paused = true)]
-async fn account_reset_waits_for_filesystem_commits_and_retry_preserves_the_wait() {
-    let tmp = TempDir::new().unwrap();
-    let manager = test_plugins_manager(tmp.path().to_path_buf());
-    let generation = crate::remote::RemotePluginBundleSyncGeneration::capture(tmp.path());
-    let lease = generation.begin_commit().unwrap();
-    let reset = manager.reset_remote_installed_plugins();
-    tokio::pin!(reset);
-    tokio::select! {
-        biased;
-        result = &mut reset => panic!("reset completed with live filesystem commit: {result:?}"),
-        _ = std::future::ready(()) => {}
-    }
-    assert!(generation.begin_commit().is_none());
-    tokio::time::advance(Duration::from_secs(10)).await;
-    assert_eq!(
-        reset.await.unwrap_err().kind(),
-        std::io::ErrorKind::TimedOut
-    );
-    let retry = manager.reset_remote_installed_plugins();
-    tokio::pin!(retry);
-    tokio::select! {
-        biased;
-        result = &mut retry => panic!("retry forgot earlier retired commit: {result:?}"),
-        _ = std::future::ready(()) => {}
-    }
-    drop(lease);
-    retry.await.unwrap();
-}
-
-#[tokio::test]
-async fn account_reset_refuses_queued_reconcile_and_same_owner_fallback() {
-    let home = TempDir::new().unwrap();
-    let manager = Arc::new(test_plugins_manager(home.path().to_path_buf()));
-    let config = load_config(home.path(), home.path()).await;
-    let reset_generation = manager.remote_installed_plugins_generation();
-    let bundle_generation = crate::remote::RemotePluginBundleSyncGeneration::capture(home.path());
-    manager.reset_remote_installed_plugins().await.unwrap();
-    // Auth is still the same (None). A generation freshly obtained inside the
-    // delayed task would therefore be admitted without the birth-time check.
-    assert!(matches!(
-        manager
-            .reconcile_remote_installed_plugins_after_acquiring_gate(
-                &config,
+            .write_remote_installed_plugins_cache_snapshot(
+                retry_generation,
+                vec![remote_installed_plugin("beta")],
                 /*auth*/ None,
-                &reset_generation,
-                bundle_generation,
+                RemoteInstalledPluginsCachePublication::Reconcile,
             )
-            .await,
-        Err(crate::remote::RemoteInstalledPluginBundleSyncError::Superseded)
-    ));
-    manager
-        .remote_installed_plugins_cache_refresh_state
-        .write()
-        .unwrap()
-        .in_flight = true;
-    manager.maybe_start_remote_installed_plugins_cache_refresh_for_generation(
-        &config,
-        /*auth*/ None,
-        RemoteInstalledPluginsCacheRefreshNotify::IfCacheChanged,
-        /*on_effective_plugins_changed*/ None,
-        EffectivePluginsChange::default(),
-        reset_generation,
-    );
-    assert!(
-        manager
-            .remote_installed_plugins_cache_refresh_state
-            .read()
-            .unwrap()
-            .requested
-            .is_none()
-    );
-    let current = manager.remote_installed_plugins_generation();
-    manager.maybe_start_remote_installed_plugins_cache_refresh_for_generation(
-        &config,
-        /*auth*/ None,
-        RemoteInstalledPluginsCacheRefreshNotify::IfCacheChanged,
-        /*on_effective_plugins_changed*/ None,
-        EffectivePluginsChange::default(),
-        current,
-    );
-    assert!(
-        manager
-            .remote_installed_plugins_cache_refresh_state
-            .read()
-            .unwrap()
-            .requested
-            .is_some()
+            .map(|update| update.metadata_change_id.is_some()),
+        Some(true)
     );
 }
 
@@ -7958,4 +8117,1956 @@ fn plugin_install_error_preserves_store_io_sub_error_type() {
         error.sub_error_type(),
         Some("failed_to_copy_plugin_file".to_string())
     );
+}
+
+#[tokio::test]
+async fn owned_recommendation_original_is_pending_until_actual_http_completion() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_file(
+        &tmp.path().join(CONFIG_TOML_FILE),
+        "[features]\nplugins = true\n",
+    );
+    let server = MockServer::start().await;
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let request_entered = entered.clone();
+    let (release, released) = std::sync::mpsc::channel();
+    let released = std::sync::Mutex::new(released);
+    Mock::given(method("GET"))
+        .and(path("/ps/plugins/suggested/codex"))
+        .respond_with(move |_: &wiremock::Request| {
+            request_entered.notify_one();
+            // Wiremock's own server thread, released on assertion unwinding too.
+            let _ = released.lock().unwrap().recv();
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"enabled":true,"plugins":[]}))
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut config = load_config(tmp.path(), tmp.path())
+        .await
+        .with_plugin_recommendations_enabled(true);
+    config.chatgpt_base_url = server.uri();
+    let manager = Arc::new(test_plugins_manager(tmp.path().to_path_buf()));
+    let auth = CodexAuth::create_dummy_chatgpt_auth_for_testing();
+    manager.maybe_start_remote_plugin_caches_refresh(&config, Some(auth), None);
+    tokio::time::timeout(Duration::from_secs(2), entered.notified())
+        .await
+        .unwrap();
+    let report = manager.shutdown_until(tokio::time::Instant::now()).await;
+    assert!(
+        !report.terminal && !report.is_clean(),
+        "actual recommendation still holds HTTP"
+    );
+    release.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let report = manager
+                .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(30))
+                .await;
+            if report.terminal {
+                assert!(report.is_clean(), "real plugin original joins: {report:?}");
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        manager.cached_recommended_plugins_mode(&recommended_plugins_cache_key(&config)),
+        Some(RecommendedPluginsMode::Endpoint {
+            plugins: Vec::new()
+        })
+    );
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn closed_plugin_owner_refuses_all_async_worker_births_and_clears_queue_flags() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_file(
+        &tmp.path().join(CONFIG_TOML_FILE),
+        "[features]\nplugins = true\n",
+    );
+    let server = MockServer::start().await;
+    let mut config = load_config(tmp.path(), tmp.path())
+        .await
+        .with_plugin_recommendations_enabled(true);
+    config.chatgpt_base_url = server.uri();
+    let manager = Arc::new(test_plugins_manager(tmp.path().to_path_buf()));
+    let auth = CodexAuth::create_dummy_chatgpt_auth_for_testing();
+    assert!(
+        manager
+            .shutdown_until(tokio::time::Instant::now())
+            .await
+            .is_clean()
+    );
+    manager.maybe_start_remote_plugin_caches_refresh(&config, Some(auth.clone()), None);
+    manager.maybe_start_remote_catalog_cache_refresh(
+        &config,
+        Some(auth.clone()),
+        [RemotePluginScope::Global].into_iter().collect(),
+    );
+    manager.maybe_start_remote_installed_plugin_bundle_sync(
+        &config,
+        Some(auth),
+        None,
+        InstalledPluginSyncSource::PluginList,
+    );
+    {
+        let installed = manager
+            .remote_installed_plugins_cache_refresh_state
+            .read()
+            .unwrap();
+        assert!(!installed.in_flight && installed.requested.is_none());
+    }
+    {
+        let catalog = manager.remote_catalog_cache_refresh_state.read().unwrap();
+        assert!(!catalog.in_flight && catalog.requests.is_empty());
+    }
+    assert!(
+        manager
+            .remote_installed_plugin_bundle_sync_gate
+            .clone()
+            .try_acquire_owned()
+            .is_ok()
+    );
+    assert!(
+        manager
+            .shutdown_until(tokio::time::Instant::now())
+            .await
+            .is_clean()
+    );
+    assert!(
+        server.received_requests().await.unwrap().is_empty(),
+        "refused before any HTTP"
+    );
+}
+
+#[test]
+fn curated_worker_missing_runtime_refuses_before_read_and_releases_start_gate() {
+    static STARTED: AtomicBool = AtomicBool::new(false);
+    let home = tempfile::tempdir().unwrap();
+    let manager = Arc::new(test_plugins_manager(home.path().to_owned()));
+    let polled = Arc::new(AtomicBool::new(false));
+    let read_polled = polled.clone();
+    let start = CuratedSyncStart::begin(&STARTED).unwrap();
+    assert!(
+        manager
+            .start_curated_repo_sync_with(
+                test_http_client_factory(),
+                None,
+                start,
+                move |_, _, _| {
+                    read_polled.store(true, Ordering::SeqCst);
+                    Ok(TEST_CURATED_PLUGIN_SHA.into())
+                }
+            )
+            .is_none()
+    );
+    assert!(!polled.load(Ordering::SeqCst));
+    assert!(!STARTED.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn curated_worker_closed_owner_refuses_before_read_and_releases_start_gate() {
+    static STARTED: AtomicBool = AtomicBool::new(false);
+    let home = tempfile::tempdir().unwrap();
+    let manager = Arc::new(test_plugins_manager(home.path().to_owned()));
+    assert!(
+        manager
+            .shutdown_until(tokio::time::Instant::now())
+            .await
+            .is_clean()
+    );
+    let polled = Arc::new(AtomicBool::new(false));
+    let read_polled = polled.clone();
+    let start = CuratedSyncStart::begin(&STARTED).unwrap();
+    assert!(
+        manager
+            .start_curated_repo_sync_with(
+                test_http_client_factory(),
+                None,
+                start,
+                move |_, _, _| {
+                    read_polled.store(true, Ordering::SeqCst);
+                    Ok(TEST_CURATED_PLUGIN_SHA.into())
+                }
+            )
+            .is_none()
+    );
+    assert!(!polled.load(Ordering::SeqCst));
+    assert!(!STARTED.load(Ordering::SeqCst));
+    assert!(
+        manager
+            .shutdown_until(tokio::time::Instant::now())
+            .await
+            .is_clean()
+    );
+}
+
+#[tokio::test]
+async fn curated_worker_panic_is_nonclean_and_releases_start_gate() {
+    static STARTED: AtomicBool = AtomicBool::new(false);
+    let home = tempfile::tempdir().unwrap();
+    let manager = Arc::new(test_plugins_manager(home.path().to_owned()));
+    let receipt = manager
+        .start_curated_repo_sync_with(
+            test_http_client_factory(),
+            None,
+            CuratedSyncStart::begin(&STARTED).unwrap(),
+            |_, _, _| panic!("synthetic curated read panic"),
+        )
+        .unwrap();
+    assert_eq!(receipt.await, crate::retirement::JoinOutcome::Panicked);
+    let report = manager
+        .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(2))
+        .await;
+    assert!(report.terminal && report.panicked && !report.is_clean());
+    assert!(!STARTED.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn curated_worker_survives_observer_cancel_and_keeps_its_exact_stop_owner() {
+    static STARTED: AtomicBool = AtomicBool::new(false);
+    let home = tempfile::tempdir().unwrap();
+    let manager = Arc::new(test_plugins_manager(home.path().to_owned()));
+    let (entered, started) = tokio::sync::oneshot::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let stop_seen = Arc::new(AtomicBool::new(false));
+    let read_stop_seen = stop_seen.clone();
+    let receipt = manager
+        .start_curated_repo_sync_with(
+            test_http_client_factory(),
+            None,
+            CuratedSyncStart::begin(&STARTED).unwrap(),
+            move |_, _, stop| {
+                assert_eq!(
+                    std::thread::current().name(),
+                    Some("plugins-curated-repo-sync")
+                );
+                let _ = entered.send(());
+                released.recv().unwrap();
+                read_stop_seen.store(stop.is_stopped(), Ordering::SeqCst);
+                Err("synthetic owned read stopped".into())
+            },
+        )
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), started)
+        .await
+        .unwrap()
+        .unwrap();
+    let observer = tokio::spawn(receipt);
+    observer.abort();
+    assert!(observer.await.unwrap_err().is_cancelled());
+    assert!(
+        !manager
+            .shutdown_until(tokio::time::Instant::now())
+            .await
+            .terminal
+    );
+    release.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let report = manager
+                .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(30))
+                .await;
+            if report.terminal {
+                assert!(report.is_clean());
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        stop_seen.load(Ordering::SeqCst),
+        "worker received this registry's actual stop"
+    );
+    assert!(!STARTED.load(Ordering::SeqCst));
+}
+
+struct CallbackDropRuntimeProbe {
+    dropped: Arc<AtomicBool>,
+    runtime_present: Arc<AtomicBool>,
+}
+impl Drop for CallbackDropRuntimeProbe {
+    fn drop(&mut self) {
+        self.runtime_present.store(
+            tokio::runtime::Handle::try_current().is_ok(),
+            Ordering::SeqCst,
+        );
+        self.dropped.store(true, Ordering::SeqCst);
+    }
+}
+
+// This new synchronous callback fixture holds one runtime worker deliberately;
+// the second worker observes/releases it. Existing test settings are unchanged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn curated_worker_join_cannot_hide_a_pending_runtime_callback_original() {
+    static STARTED: AtomicBool = AtomicBool::new(false);
+    let home = tempfile::tempdir().unwrap();
+    let source = curated_plugins_repo_path(home.path());
+    write_curated_plugin(&source, "gmail");
+    write_openai_curated_marketplace(&source, &["gmail"]);
+    write_file(
+        &home.path().join(CONFIG_TOML_FILE),
+        "[plugins.\"gmail@openai-curated\"]\nenabled = true\n",
+    );
+    let manager = Arc::new(test_plugins_manager(home.path().to_owned()));
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let callback_entered = entered.clone();
+    let (release, released) = std::sync::mpsc::channel();
+    let released = std::sync::Mutex::new(released);
+    let finished = Arc::new(AtomicBool::new(false));
+    let callback_finished = finished.clone();
+    let dropped = Arc::new(AtomicBool::new(false));
+    let runtime_present = Arc::new(AtomicBool::new(false));
+    let probe = CallbackDropRuntimeProbe {
+        dropped: dropped.clone(),
+        runtime_present: runtime_present.clone(),
+    };
+    let callback: EffectivePluginsChangedCallback = Arc::new(move |_| {
+        let _probe_lifetime = &probe;
+        assert!(tokio::runtime::Handle::try_current().is_ok());
+        assert!(
+            tokio::task::try_id().is_some(),
+            "callback is a real Tokio task"
+        );
+        assert_ne!(
+            std::thread::current().name(),
+            Some("plugins-curated-repo-sync")
+        );
+        callback_entered.notify_one();
+        let _ = released.lock().unwrap().recv();
+        callback_finished.store(true, Ordering::SeqCst);
+    });
+    let receipt = manager
+        .start_curated_repo_sync_with(
+            test_http_client_factory(),
+            Some(callback),
+            CuratedSyncStart::begin(&STARTED).unwrap(),
+            |_, _, _| Ok(TEST_CURATED_PLUGIN_SHA.into()),
+        )
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), entered.notified())
+        .await
+        .unwrap();
+    assert_eq!(receipt.await, crate::retirement::JoinOutcome::Joined);
+    assert!(
+        STARTED.load(Ordering::SeqCst),
+        "successful sync preserves global deduplication"
+    );
+    assert!(!finished.load(Ordering::SeqCst));
+    assert!(
+        !manager
+            .shutdown_until(tokio::time::Instant::now())
+            .await
+            .terminal,
+        "the worker joined but its actual callback original is still running"
+    );
+    release.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let report = manager
+                .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(30))
+                .await;
+            if report.terminal {
+                assert!(report.is_clean());
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(finished.load(Ordering::SeqCst));
+    assert!(dropped.load(Ordering::SeqCst) && runtime_present.load(Ordering::SeqCst));
+}
+
+#[test]
+fn curated_callback_closed_owner_refuses_body_and_drops_captures_in_runtime_context() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let registry = crate::PluginTaskRegistry::default();
+    registry.close();
+    let called = Arc::new(AtomicBool::new(false));
+    let callback_called = called.clone();
+    let dropped = Arc::new(AtomicBool::new(false));
+    let runtime_present = Arc::new(AtomicBool::new(false));
+    let probe = CallbackDropRuntimeProbe {
+        dropped: dropped.clone(),
+        runtime_present: runtime_present.clone(),
+    };
+    let callback: EffectivePluginsChangedCallback = Arc::new(move |_| {
+        let _probe_lifetime = &probe;
+        callback_called.store(true, Ordering::SeqCst);
+    });
+    let wrapped = dispatch_on_runtime(registry.clone(), runtime.handle().clone(), callback);
+    std::thread::spawn(move || wrapped(EffectivePluginsChange::default()))
+        .join()
+        .unwrap();
+    assert!(!called.load(Ordering::SeqCst));
+    assert!(dropped.load(Ordering::SeqCst) && runtime_present.load(Ordering::SeqCst));
+    assert!(
+        runtime
+            .block_on(registry.shutdown_until(tokio::time::Instant::now()))
+            .is_clean()
+    );
+}
+
+#[test]
+fn curated_callback_dead_runtime_is_cancelled_not_successful_delivery() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let handle = runtime.handle().clone();
+    let registry = crate::PluginTaskRegistry::default();
+    let called = Arc::new(AtomicBool::new(false));
+    let callback_called = called.clone();
+    let dropped = Arc::new(AtomicBool::new(false));
+    let runtime_present = Arc::new(AtomicBool::new(false));
+    let probe = CallbackDropRuntimeProbe {
+        dropped: dropped.clone(),
+        runtime_present: runtime_present.clone(),
+    };
+    let callback: EffectivePluginsChangedCallback = Arc::new(move |_| {
+        let _probe_lifetime = &probe;
+        callback_called.store(true, Ordering::SeqCst);
+    });
+    let wrapped = dispatch_on_runtime(registry.clone(), handle, callback);
+    drop(runtime);
+    std::thread::spawn(move || wrapped(EffectivePluginsChange::default()))
+        .join()
+        .unwrap();
+    assert!(!called.load(Ordering::SeqCst));
+    assert!(dropped.load(Ordering::SeqCst) && runtime_present.load(Ordering::SeqCst));
+    let observer = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let report = observer
+        .block_on(registry.shutdown_until(tokio::time::Instant::now() + Duration::from_secs(2)));
+    assert!(report.terminal && report.cancelled && !report.is_clean());
+}
+
+#[test]
+fn curated_start_gate_duplicate_preserves_active_and_committed_deduplication() {
+    static STARTED: AtomicBool = AtomicBool::new(false);
+    let start = CuratedSyncStart::begin(&STARTED).unwrap();
+    assert!(CuratedSyncStart::begin(&STARTED).is_none());
+    assert!(STARTED.load(Ordering::SeqCst));
+    drop(start);
+    assert!(!STARTED.load(Ordering::SeqCst));
+    let mut start = CuratedSyncStart::begin(&STARTED).unwrap();
+    start.committed = true;
+    drop(start);
+    assert!(CuratedSyncStart::begin(&STARTED).is_none());
+    assert!(STARTED.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn curated_runtime_callback_panic_is_sticky_nonclean() {
+    let registry = crate::PluginTaskRegistry::default();
+    let (entered, started) = tokio::sync::oneshot::channel();
+    let entered = std::sync::Mutex::new(Some(entered));
+    let callback: EffectivePluginsChangedCallback = Arc::new(move |_| {
+        let _ = entered.lock().unwrap().take().unwrap().send(());
+        panic!("synthetic actual curated runtime callback panic");
+    });
+    let wrapped = dispatch_on_runtime(
+        registry.clone(),
+        tokio::runtime::Handle::current(),
+        callback,
+    );
+    std::thread::spawn(move || wrapped(EffectivePluginsChange::default()))
+        .join()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), started)
+        .await
+        .unwrap()
+        .unwrap();
+    let report = registry
+        .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(2))
+        .await;
+    assert!(report.terminal && report.panicked && !report.is_clean());
+    assert!(
+        registry
+            .shutdown_until(tokio::time::Instant::now())
+            .await
+            .panicked
+    );
+}
+
+// Occupy the only blocking worker so the admitted original cannot begin until
+// its owner has already latched an expired deadline.
+#[test]
+fn curated_worker_delayed_start_does_not_poll_read_after_deadline() {
+    static STARTED: AtomicBool = AtomicBool::new(false);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let blocker = tokio::task::spawn_blocking(move || {
+            entered.send(()).unwrap();
+            released.recv().unwrap();
+        });
+        tokio::time::timeout(Duration::from_secs(2), started)
+            .await
+            .unwrap()
+            .unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let manager = Arc::new(test_plugins_manager(home.path().to_owned()));
+        let polled = Arc::new(AtomicBool::new(false));
+        let read_polled = polled.clone();
+        let receipt = manager
+            .start_curated_repo_sync_with(
+                test_http_client_factory(),
+                None,
+                CuratedSyncStart::begin(&STARTED).unwrap(),
+                move |_, _, _| {
+                    read_polled.store(true, Ordering::SeqCst);
+                    Err("read must not begin after deadline".into())
+                },
+            )
+            .unwrap();
+        let report = manager.shutdown_until(tokio::time::Instant::now()).await;
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), blocker)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!report.terminal);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), receipt)
+                .await
+                .unwrap(),
+            crate::retirement::JoinOutcome::Joined
+        );
+        assert!(!polled.load(Ordering::SeqCst));
+        assert!(!STARTED.load(Ordering::SeqCst));
+        assert!(
+            manager
+                .shutdown_until(tokio::time::Instant::now())
+                .await
+                .is_clean()
+        );
+    });
+}
+
+#[tokio::test]
+async fn curated_worker_shutdown_interrupts_read_and_joins_before_deadline() {
+    static STARTED: AtomicBool = AtomicBool::new(false);
+    let home = tempfile::tempdir().unwrap();
+    let manager = Arc::new(test_plugins_manager(home.path().to_owned()));
+    let (entered, started) = tokio::sync::oneshot::channel();
+    let receipt = manager
+        .start_curated_repo_sync_with(
+            test_http_client_factory(),
+            None,
+            CuratedSyncStart::begin(&STARTED).unwrap(),
+            move |_, _, stop| {
+                let result = tokio::runtime::Handle::current().block_on(stop.run_until(
+                    Duration::from_secs(30),
+                    async move {
+                        let _ = entered.send(());
+                        std::future::pending::<String>().await
+                    },
+                ));
+                result.ok_or_else(|| "synthetic read interrupted by shutdown".into())
+            },
+        )
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), started)
+        .await
+        .unwrap()
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    assert!(manager.shutdown_until(deadline).await.is_clean());
+    assert!(tokio::time::Instant::now() < deadline);
+    assert_eq!(receipt.await, crate::retirement::JoinOutcome::Joined);
+    assert!(
+        !STARTED.load(Ordering::SeqCst),
+        "interrupted sync remains retryable"
+    );
+    assert!(!curated_plugins_repo_path(home.path()).exists());
+}
+
+#[tokio::test]
+async fn curated_worker_late_sync_success_does_not_begin_cache_publication() {
+    static STARTED: AtomicBool = AtomicBool::new(false);
+    fn snapshot(
+        root: &std::path::Path,
+    ) -> std::collections::BTreeMap<std::path::PathBuf, Option<Vec<u8>>> {
+        fn walk(
+            root: &std::path::Path,
+            path: &std::path::Path,
+            rows: &mut std::collections::BTreeMap<std::path::PathBuf, Option<Vec<u8>>>,
+        ) {
+            for entry in std::fs::read_dir(path).unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                let kind = entry.file_type().unwrap();
+                assert!(!kind.is_symlink());
+                let key = path.strip_prefix(root).unwrap().to_owned();
+                if kind.is_dir() {
+                    rows.insert(key, None);
+                    walk(root, &path, rows);
+                } else {
+                    assert!(kind.is_file());
+                    rows.insert(key, Some(std::fs::read(path).unwrap()));
+                }
+            }
+        }
+        let mut rows = std::collections::BTreeMap::new();
+        walk(root, root, &mut rows);
+        rows
+    }
+    let home = tempfile::tempdir().unwrap();
+    let source = curated_plugins_repo_path(home.path());
+    write_curated_plugin(&source, "gmail");
+    write_openai_curated_marketplace(&source, &["gmail"]);
+    write_file(
+        &home.path().join(CONFIG_TOML_FILE),
+        "[plugins.\"gmail@openai-curated\"]\nenabled = true\n",
+    );
+    let manager = Arc::new(test_plugins_manager(home.path().to_owned()));
+    let before = snapshot(home.path());
+    let (entered, started) = tokio::sync::oneshot::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let called = Arc::new(AtomicBool::new(false));
+    let callback_called = called.clone();
+    let callback: EffectivePluginsChangedCallback = Arc::new(move |_| {
+        callback_called.store(true, Ordering::SeqCst);
+    });
+    let receipt = manager
+        .start_curated_repo_sync_with(
+            test_http_client_factory(),
+            Some(callback),
+            CuratedSyncStart::begin(&STARTED).unwrap(),
+            move |_, _, _| {
+                entered.send(()).unwrap();
+                released.recv().unwrap();
+                Ok(TEST_CURATED_PLUGIN_SHA.into())
+            },
+        )
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), started)
+        .await
+        .unwrap()
+        .unwrap();
+    let report = manager.shutdown_until(tokio::time::Instant::now()).await;
+    release.send(()).unwrap();
+    assert!(!report.terminal);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), receipt)
+            .await
+            .unwrap(),
+        crate::retirement::JoinOutcome::Joined
+    );
+    assert!(
+        manager
+            .shutdown_until(tokio::time::Instant::now())
+            .await
+            .is_clean()
+    );
+    assert_eq!(
+        snapshot(home.path()),
+        before,
+        "no new cache publication after the deadline"
+    );
+    assert!(!called.load(Ordering::SeqCst));
+    assert!(
+        !STARTED.load(Ordering::SeqCst),
+        "uncommitted sync remains retryable"
+    );
+}
+
+#[tokio::test]
+async fn closed_owner_refuses_blocking_plugin_workers_and_releases_queue_flags() {
+    let home = tempfile::tempdir().unwrap();
+    let unused_remote = home.path().join("unused-remote");
+    fs::create_dir_all(&unused_remote).unwrap();
+    let remote = url::Url::from_directory_path(&unused_remote).unwrap();
+    write_file(
+        &home.path().join(CONFIG_TOML_FILE),
+        &format!(
+            "[features]\nplugins = true\n[marketplaces.debug]\nsource_type = \"git\"\nsource = \"{remote}\"\n"
+        ),
+    );
+    let config = load_config(home.path(), home.path()).await;
+    let manager = Arc::new(test_plugins_manager(home.path().to_owned()));
+    assert!(
+        manager
+            .shutdown_until(tokio::time::Instant::now())
+            .await
+            .is_clean()
+    );
+    let stack = config.config_layer_stack.clone();
+    let reload: ConfigLayerReload = Arc::new(move || Ok(stack.clone()));
+    let (warnings, mut received) = mpsc::unbounded_channel();
+    manager.maybe_start_plugin_startup_tasks_for_config(&config, reload, None, warnings);
+    assert!(
+        !manager
+            .configured_marketplace_upgrade_state
+            .read()
+            .unwrap()
+            .in_flight
+    );
+    assert!(
+        received
+            .try_recv()
+            .unwrap()
+            .contains("task owner unavailable")
+    );
+    manager.schedule_non_curated_plugin_cache_refresh(NonCuratedCacheRefreshRequest {
+        roots: Vec::new(),
+        configured_plugin_keys: Vec::new(),
+        configured_plugin_sources: Vec::new(),
+        mode: NonCuratedCacheRefreshMode::IfVersionChanged,
+        git_mode: PluginGitMode::Automatic,
+    });
+    {
+        let state = manager.non_curated_cache_refresh_state.read().unwrap();
+        assert!(!state.in_flight && state.requested.is_none() && state.last_refreshed.is_none());
+    }
+    assert!(
+        !crate::installed_marketplaces::marketplace_install_root(home.path())
+            .join(".staging")
+            .exists()
+    );
+    assert!(
+        manager
+            .shutdown_until(tokio::time::Instant::now())
+            .await
+            .is_clean()
+    );
+}
+
+#[tokio::test]
+async fn blocking_plugin_panic_resets_pending_cache_request_without_clean_join() {
+    let home = tempfile::tempdir().unwrap();
+    let manager = Arc::new(test_plugins_manager(home.path().to_owned()));
+    {
+        let mut state = manager.non_curated_cache_refresh_state.write().unwrap();
+        state.in_flight = true;
+        state.requested = Some(QueuedPluginRequest {
+            request: NonCuratedCacheRefreshRequest {
+                roots: Vec::new(),
+                configured_plugin_keys: Vec::new(),
+                configured_plugin_sources: Vec::new(),
+                mode: NonCuratedCacheRefreshMode::IfVersionChanged,
+                git_mode: PluginGitMode::Automatic,
+            },
+            owner: None,
+            obligations: Vec::new(),
+            callback_owner: None,
+        });
+    }
+    let completion = BlockingPluginWorkerReset {
+        manager: manager.clone(),
+        kind: BlockingPluginWorkerKind::NonCuratedRefresh,
+        armed: true,
+    };
+    let receipt = manager
+        .task_registry
+        .spawn_thread("non-curated-panic-probe", move || {
+            let _completion = completion;
+            panic!("synthetic actual blocking plugin worker panic");
+        })
+        .unwrap();
+    assert_eq!(receipt.await, crate::retirement::JoinOutcome::Panicked);
+    {
+        let state = manager.non_curated_cache_refresh_state.read().unwrap();
+        assert!(!state.in_flight && state.requested.is_none() && state.last_refreshed.is_none());
+    }
+    let report = manager.shutdown_until(tokio::time::Instant::now()).await;
+    assert!(report.terminal && report.panicked && !report.is_clean());
+}
+
+#[test]
+fn missing_runtime_refuses_both_blocking_workers_without_stuck_gates() {
+    let home = tempfile::tempdir().unwrap();
+    write_file(
+        &home.path().join(CONFIG_TOML_FILE),
+        "[features]\nplugins = true\n",
+    );
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let config = runtime.block_on(load_config(home.path(), home.path()));
+    drop(runtime);
+    let manager = Arc::new(test_plugins_manager(home.path().to_owned()));
+    let stack = config.config_layer_stack.clone();
+    let reload: ConfigLayerReload = Arc::new(move || Ok(stack.clone()));
+    let (warnings, mut received) = mpsc::unbounded_channel();
+    manager.maybe_start_plugin_startup_tasks_for_config(&config, reload, None, warnings);
+    assert!(
+        !manager
+            .configured_marketplace_upgrade_state
+            .read()
+            .unwrap()
+            .in_flight
+    );
+    assert!(received.try_recv().unwrap().contains("runtime unavailable"));
+    let before = manager
+        .non_curated_cache_refresh_completion
+        .borrow()
+        .sequence;
+    manager.schedule_non_curated_plugin_cache_refresh(NonCuratedCacheRefreshRequest {
+        roots: Vec::new(),
+        configured_plugin_keys: Vec::new(),
+        configured_plugin_sources: Vec::new(),
+        mode: NonCuratedCacheRefreshMode::IfVersionChanged,
+        git_mode: PluginGitMode::Automatic,
+    });
+    let state = manager.non_curated_cache_refresh_state.read().unwrap();
+    assert!(!state.in_flight && state.requested.is_none() && state.last_refreshed.is_none());
+    drop(state);
+    assert_eq!(
+        manager
+            .non_curated_cache_refresh_completion
+            .borrow()
+            .sequence,
+        before.wrapping_add(1)
+    );
+    let observer = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    assert!(
+        observer
+            .block_on(manager.shutdown_until(tokio::time::Instant::now()))
+            .is_clean()
+    );
+}
+
+// These hosts retain actual original Tokio joins. Their marker is read by the
+// real HTTP selector / physical body, not used as an account-work counter.
+tokio::task_local! { static QUEUED_TEST_ORIGIN: u64; }
+type QueuedTestReceipt = futures::future::Shared<
+    futures::future::BoxFuture<'static, Result<(), codex_model_provider::AuthTaskFailure>>,
+>;
+struct QueuedTestHost {
+    origin: u64,
+    originals: std::sync::Mutex<Vec<QueuedTestReceipt>>,
+    physical: Arc<std::sync::Mutex<Vec<u64>>>,
+    gate: std::sync::Mutex<Option<(Arc<tokio::sync::Semaphore>, std::sync::mpsc::Receiver<()>)>>,
+}
+impl std::fmt::Debug for QueuedTestHost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("QueuedTestHost").field(&self.origin).finish()
+    }
+}
+impl QueuedTestHost {
+    fn new(origin: u64) -> Arc<Self> {
+        Arc::new(Self {
+            origin,
+            originals: Default::default(),
+            physical: Default::default(),
+            gate: Default::default(),
+        })
+    }
+    fn access(self: &Arc<Self>) -> codex_model_provider::AuthTaskAccess {
+        codex_model_provider::AuthTaskAccess::Admitted(self.clone())
+    }
+    fn track(
+        &self,
+        original: tokio::task::JoinHandle<()>,
+    ) -> codex_model_provider::AuthTaskObservation {
+        use futures::FutureExt;
+        let receipt = async move {
+            original.await.map_err(|error| {
+                if error.is_cancelled() {
+                    codex_model_provider::AuthTaskFailure::Cancelled
+                } else {
+                    codex_model_provider::AuthTaskFailure::Panicked
+                }
+            })
+        }
+        .boxed()
+        .shared();
+        self.originals.lock().unwrap().push(receipt.clone());
+        Box::pin(receipt)
+    }
+    fn pending(&self) -> usize {
+        use futures::FutureExt;
+        let originals = self.originals.lock().unwrap().clone();
+        originals
+            .into_iter()
+            .filter(|receipt| receipt.clone().now_or_never().is_none())
+            .count()
+    }
+    async fn joined(&self) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let originals = self.originals.lock().unwrap().clone();
+            let count = originals.len();
+            let results = tokio::time::timeout_at(deadline, futures::future::join_all(originals))
+                .await
+                .expect("actual host originals still pending");
+            assert!(
+                results.iter().all(Result::is_ok),
+                "actual host join failure: {results:?}"
+            );
+            if count == self.originals.lock().unwrap().len() {
+                return;
+            }
+        }
+    }
+    fn hold_physical(&self) -> (Arc<tokio::sync::Semaphore>, std::sync::mpsc::Sender<()>) {
+        let entered = Arc::new(tokio::sync::Semaphore::new(0));
+        let (release, wait) = std::sync::mpsc::channel();
+        *self.gate.lock().unwrap() = Some((entered.clone(), wait));
+        (entered, release)
+    }
+}
+impl codex_model_provider::AuthTaskSpawner for QueuedTestHost {
+    fn spawn(
+        &self,
+        future: codex_model_provider::AuthTaskFuture,
+    ) -> Result<codex_model_provider::AuthTaskObservation, codex_model_provider::AuthTaskFailure>
+    {
+        Ok(self.track(tokio::spawn(QUEUED_TEST_ORIGIN.scope(self.origin, future))))
+    }
+    fn spawn_blocking(
+        &self,
+        task: codex_model_provider::AuthTaskBlocking,
+    ) -> Result<codex_model_provider::AuthTaskObservation, codex_model_provider::AuthTaskFailure>
+    {
+        let origin = self.origin;
+        let physical = self.physical.clone();
+        let gate = self.gate.lock().unwrap().take();
+        Ok(self.track(tokio::task::spawn_blocking(move || {
+            QUEUED_TEST_ORIGIN.sync_scope(origin, || {
+                physical.lock().unwrap().push(origin);
+                if let Some((entered, wait)) = gate {
+                    entered.add_permits(1);
+                    let _ = wait.recv(); // Sender drop releases this test-only gate on failure too.
+                }
+                task();
+            })
+        })))
+    }
+}
+
+type BackendRecords = Arc<std::sync::Mutex<Vec<(String, Option<u64>)>>>;
+
+#[derive(Debug)]
+struct QueuedOriginSelector {
+    delegate: Arc<dyn crate::http_client_selector::HttpClientSelector>,
+    records: BackendRecords,
+}
+impl QueuedOriginSelector {
+    fn record(&self, url: &str) {
+        self.records.lock().unwrap().push((
+            url.to_owned(),
+            QUEUED_TEST_ORIGIN.try_with(|origin| *origin).ok(),
+        ));
+    }
+}
+impl crate::http_client_selector::HttpClientSelector for QueuedOriginSelector {
+    fn for_current_account(&self) -> Arc<dyn crate::http_client_selector::HttpClientSelector> {
+        Arc::new(Self {
+            delegate: self.delegate.for_current_account(),
+            records: self.records.clone(),
+        })
+    }
+    fn request(&self, method: http::Method, url: &str) -> codex_http_client::RequestBuilder {
+        self.record(url);
+        self.delegate.request(method, url)
+    }
+    fn request_for_account(
+        &self,
+        method: http::Method,
+        url: &str,
+        binding: &codex_http_client::NetworkPolicy,
+    ) -> Option<codex_http_client::RequestBuilder> {
+        self.record(url);
+        self.delegate.request_for_account(method, url, binding)
+    }
+    fn outbound_proxy_policy(&self) -> codex_http_client::OutboundProxyPolicy {
+        self.delegate.outbound_proxy_policy()
+    }
+}
+fn queued_recording_config(base: &str) -> (RemotePluginServiceConfig, BackendRecords) {
+    let mut config =
+        RemotePluginServiceConfig::new(base.to_owned(), test_http_client_factory(), None);
+    let records = Arc::new(std::sync::Mutex::new(Vec::new()));
+    config.http_clients = Arc::new(QueuedOriginSelector {
+        delegate: config.http_clients,
+        records: records.clone(),
+    });
+    (config, records)
+}
+fn queued_auth(token: &str) -> CodexAuth {
+    CodexAuth::from_external_chatgpt_tokens(token, "queue-account", None).unwrap()
+}
+async fn queued_wait(entered: &tokio::sync::Semaphore) {
+    tokio::time::timeout(Duration::from_secs(2), entered.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn catalog_queue_coalesces_scopes_under_latest_request_original_and_auth() {
+    let home = TempDir::new().unwrap();
+    let manager = Arc::new(test_plugins_manager(home.path().to_owned()));
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/ps/plugins/list"))
+        .and(header("authorization", "Bearer header.e30.catalog-new"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"plugins":[],"pagination":{"next_page_token":null}}),
+            ),
+        )
+        .expect(2)
+        .mount(&server)
+        .await;
+    let (config, records) = queued_recording_config(&server.uri());
+    let a = QueuedTestHost::new(1);
+    let b = QueuedTestHost::new(2);
+    // No yield between scheduler calls: both real pending requests coalesce
+    // before the actual coordinator's first poll on this current-thread runtime.
+    codex_model_provider::with_auth_task_scope(a.access(), async {
+        manager.schedule_remote_catalog_cache_refresh(RemoteCatalogCacheRefreshRequest {
+            service_config: config.clone(),
+            auth: Some(queued_auth("header.e30.catalog-old")),
+            scopes: [RemotePluginScope::Global].into(),
+        });
+    })
+    .await
+    .unwrap();
+    codex_model_provider::with_auth_task_scope(b.access(), async {
+        manager.schedule_remote_catalog_cache_refresh(RemoteCatalogCacheRefreshRequest {
+            service_config: config,
+            auth: Some(queued_auth("header.e30.catalog-new")),
+            scopes: [RemotePluginScope::Workspace].into(),
+        });
+    })
+    .await
+    .unwrap();
+    {
+        let state = manager.remote_catalog_cache_refresh_state.read().unwrap();
+        assert_eq!(state.requests.len(), 1);
+        assert_eq!(
+            state.requests[0].scopes,
+            [RemotePluginScope::Global, RemotePluginScope::Workspace].into()
+        );
+        assert_eq!(state.requests[0].obligations.len(), 1);
+    }
+    assert!(a.pending() > 0 && b.pending() > 0);
+    // Let the coalesced request finish under its owners. Shutdown stops new reads.
+    a.joined().await;
+    b.joined().await;
+    assert!(
+        manager
+            .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(2))
+            .await
+            .is_clean()
+    );
+    {
+        let records = records.lock().unwrap();
+        assert_eq!(records.len(), 2);
+        assert!(
+            records.iter().all(|(_, origin)| *origin == Some(2)),
+            "actual HTTP must execute in B, not an unscoped worker: {records:?}"
+        );
+    }
+    server.verify().await;
+}
+
+struct ReenterInstalledQueueOnDrop {
+    manager: std::sync::Weak<PluginsManager>,
+    dropped: Arc<std::sync::atomic::AtomicBool>,
+}
+impl Drop for ReenterInstalledQueueOnDrop {
+    fn drop(&mut self) {
+        if let Some(manager) = self.manager.upgrade() {
+            drop(
+                manager
+                    .remote_installed_plugins_cache_refresh_state
+                    .write()
+                    .unwrap(),
+            );
+        }
+        self.dropped.store(true, Ordering::SeqCst);
+    }
+}
+
+async fn installed_queue_keeps_prior_callback_original_and_latest_backend(independent: bool) {
+    let home = TempDir::new().unwrap();
+    let auth_manager = test_auth_manager(None);
+    set_test_auth(&auth_manager, Some(queued_auth("header.e30.installed-old"))).await;
+    let manager = Arc::new(test_plugins_manager_with_auth_manager(
+        home.path().to_owned(),
+        None,
+        auth_manager,
+    ));
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/ps/plugins/installed"))
+        .and(wiremock::matchers::query_param_is_missing("pageToken"))
+        .and(header("authorization", "Bearer header.e30.installed-new"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            serde_json::json!({"plugins":[],"pagination":{"next_page_token":"queue-page-2"}}),
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/ps/plugins/installed"))
+        .and(wiremock::matchers::query_param("pageToken", "queue-page-2"))
+        .and(header("authorization", "Bearer header.e30.installed-new"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"plugins":[],"pagination":{"next_page_token":null}}),
+            ),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let (config, records) = queued_recording_config(&server.uri());
+    let a = QueuedTestHost::new(1);
+    let b = QueuedTestHost::new(2);
+    let generation = manager
+        .prepare_remote_installed_plugins_cache_generation(Some(&queued_auth(
+            "header.e30.installed-old",
+        )))
+        .unwrap();
+    let entered = Arc::new(tokio::sync::Semaphore::new(0));
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let callback_origins = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen_changes = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let callback: EffectivePluginsChangedCallback = {
+        let (entered, release, origins, changes) = (
+            entered.clone(),
+            release.clone(),
+            callback_origins.clone(),
+            seen_changes.clone(),
+        );
+        Arc::new(move |change| {
+            origins
+                .lock()
+                .unwrap()
+                .push(QUEUED_TEST_ORIGIN.try_with(|origin| *origin).ok());
+            changes.lock().unwrap().push(change);
+            let (entered, release) = (entered.clone(), release.clone());
+            let original = codex_model_provider::spawn_provider_task(Box::pin(async move {
+                entered.add_permits(1);
+                release.acquire().await.unwrap().forget();
+            }))
+            .unwrap();
+            assert!(
+                original.is_some(),
+                "callback descendant must have A's actual host original"
+            );
+            drop(original);
+        })
+    };
+    let materialization = RemotePluginMaterialization {
+        plugin_id: PluginId::new("retained".into(), "workspace".into()).unwrap(),
+        scope: RemotePluginScope::Workspace,
+        discoverability: Some(crate::remote::RemotePluginShareDiscoverability::Listed),
+        authenticated_account_id: Some("queue-account".into()),
+    };
+    codex_model_provider::with_auth_task_scope(a.access(), async {
+        manager.schedule_remote_installed_plugins_cache_refresh(
+            RemoteInstalledPluginsCacheRefreshRequest {
+                generation,
+                service_config: config.clone(),
+                auth: Some(queued_auth("header.e30.installed-old")),
+                notify: RemoteInstalledPluginsCacheRefreshNotify::IfCacheChanged,
+                on_effective_plugins_changed: Some(callback),
+                change: EffectivePluginsChange {
+                    metadata_change_id: None,
+                    materialized_remote_plugins: vec![materialization],
+                },
+            },
+        );
+    })
+    .await
+    .unwrap();
+    let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let wrong_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let guard = ReenterInstalledQueueOnDrop {
+        manager: Arc::downgrade(&manager),
+        dropped: dropped.clone(),
+    };
+    let wrong = wrong_called.clone();
+    let replacement: EffectivePluginsChangedCallback = Arc::new(move |_| {
+        std::hint::black_box(&guard);
+        wrong.store(true, Ordering::SeqCst);
+    });
+    let schedule = async {
+        manager.schedule_remote_installed_plugins_cache_refresh(
+            RemoteInstalledPluginsCacheRefreshRequest {
+                generation,
+                service_config: config,
+                auth: Some(queued_auth("header.e30.installed-new")),
+                notify: RemoteInstalledPluginsCacheRefreshNotify::AfterSuccessfulRefresh,
+                on_effective_plugins_changed: Some(replacement),
+                change: Default::default(),
+            },
+        );
+    };
+    if independent {
+        schedule.await;
+    } else {
+        codex_model_provider::with_auth_task_scope(b.access(), schedule)
+            .await
+            .unwrap();
+    }
+    assert!(
+        dropped.load(Ordering::SeqCst),
+        "superseded capture dropped outside queue lock"
+    );
+    queued_wait(&entered).await;
+    // Callback A and its descendant outlive B's body; B never owns that child.
+    b.joined().await;
+    assert!(a.pending() > 0);
+    assert_eq!(*callback_origins.lock().unwrap(), vec![Some(1)]);
+    assert!(!wrong_called.load(Ordering::SeqCst));
+    assert_eq!(
+        seen_changes.lock().unwrap()[0]
+            .materialized_remote_plugins
+            .len(),
+        1
+    );
+    release.add_permits(1);
+    assert!(
+        manager
+            .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(2))
+            .await
+            .is_clean()
+    );
+    a.joined().await;
+    {
+        let records = records.lock().unwrap();
+        assert_eq!(records.len(), 2);
+        assert!(
+            records
+                .iter()
+                .all(|(_, origin)| *origin == Some(if independent { 1 } else { 2 })),
+            "actual backend lineage: {records:?}"
+        );
+    }
+    server.verify().await;
+}
+
+fn queued_local_marketplace(
+    home: &Path,
+    root: &Path,
+    version: &str,
+) -> NonCuratedCacheRefreshRequest {
+    fs::create_dir_all(root.join(".git")).unwrap();
+    write_plugin_with_version(root, "sample-plugin", "sample-plugin", Some(version));
+    write_file(
+        &root.join(".agents/plugins/marketplace.json"),
+        r#"{"name":"debug","plugins":[{"name":"sample-plugin","source":{"source":"local","path":"./sample-plugin"}}]}"#,
+    );
+    write_file(
+        &home.join(CONFIG_TOML_FILE),
+        "[features]\nplugins = true\n[plugins.\"sample-plugin@debug\"]\nenabled = true\n",
+    );
+    NonCuratedCacheRefreshRequest {
+        roots: vec![AbsolutePathBuf::try_from(root.to_owned()).unwrap()],
+        configured_plugin_keys: vec!["sample-plugin@debug".into()],
+        configured_plugin_sources: Vec::new(),
+        mode: NonCuratedCacheRefreshMode::ForceReinstall,
+        git_mode: PluginGitMode::Automatic,
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn non_curated_queue_owns_each_actual_physical_body_without_caching_roots() {
+    let home = TempDir::new().unwrap();
+    let manager = Arc::new(test_plugins_manager(home.path().to_owned()));
+    let a = QueuedTestHost::new(1);
+    let b = QueuedTestHost::new(2);
+    let (a_started, a_release) = a.hold_physical();
+    let (b_started, b_release) = b.hold_physical();
+    let first = queued_local_marketplace(home.path(), &home.path().join("first"), "1.0.0");
+    let second = queued_local_marketplace(home.path(), &home.path().join("second"), "2.0.0");
+    let expected_roots = second.roots.clone();
+    codex_model_provider::with_auth_task_scope(a.access(), async {
+        manager.schedule_non_curated_plugin_cache_refresh(first);
+    })
+    .await
+    .unwrap();
+    queued_wait(&a_started).await;
+    codex_model_provider::with_auth_task_scope(b.access(), async {
+        manager.schedule_non_curated_plugin_cache_refresh(second);
+    })
+    .await
+    .unwrap();
+    assert!(a.pending() > 0 && b.pending() > 0);
+    a_release.send(()).unwrap();
+    queued_wait(&b_started).await;
+    a.joined().await;
+    assert!(b.pending() > 0);
+    assert!(
+        home.path()
+            .join("plugins/cache/debug/sample-plugin/1.0.0")
+            .is_dir()
+    );
+    assert!(
+        !home
+            .path()
+            .join("plugins/cache/debug/sample-plugin/2.0.0")
+            .exists()
+    );
+    b_release.send(()).unwrap();
+    assert!(
+        manager
+            .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(2))
+            .await
+            .is_clean()
+    );
+    b.joined().await;
+    assert!(
+        home.path()
+            .join("plugins/cache/debug/sample-plugin/2.0.0")
+            .is_dir()
+    );
+    assert_eq!(*a.physical.lock().unwrap(), vec![1]);
+    assert_eq!(*b.physical.lock().unwrap(), vec![2]);
+    let state = manager.non_curated_cache_refresh_state.read().unwrap();
+    assert_eq!(state.last_refreshed.as_ref().unwrap().roots, expected_roots);
+    assert!(!state.in_flight && state.requested.is_none());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn non_curated_queue_dedup_releases_unused_request_without_borrowing_active_root() {
+    let home = TempDir::new().unwrap();
+    let manager = Arc::new(test_plugins_manager(home.path().to_owned()));
+    let a = QueuedTestHost::new(1);
+    let b = QueuedTestHost::new(2);
+    let (started, release) = a.hold_physical();
+    let request = queued_local_marketplace(home.path(), &home.path().join("repo"), "1.0.0");
+    codex_model_provider::with_auth_task_scope(a.access(), async {
+        manager.schedule_non_curated_plugin_cache_refresh(request.clone());
+    })
+    .await
+    .unwrap();
+    queued_wait(&started).await;
+    codex_model_provider::with_auth_task_scope(b.access(), async {
+        manager.schedule_non_curated_plugin_cache_refresh(request);
+    })
+    .await
+    .unwrap();
+    b.joined().await;
+    assert!(a.pending() > 0);
+    assert!(b.physical.lock().unwrap().is_empty());
+    release.send(()).unwrap();
+    assert!(
+        manager
+            .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(2))
+            .await
+            .is_clean()
+    );
+    a.joined().await;
+    assert!(
+        home.path()
+            .join("plugins/cache/debug/sample-plugin/1.0.0")
+            .is_dir()
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn runtime_callback_hop_uses_invoking_original_for_body_and_descendant() {
+    let registry = crate::PluginTaskRegistry::default();
+    let host = QueuedTestHost::new(7);
+    let entered = Arc::new(tokio::sync::Semaphore::new(0));
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let callback: EffectivePluginsChangedCallback = {
+        let (entered, release, observed) = (entered.clone(), release.clone(), observed.clone());
+        Arc::new(move |_| {
+            observed
+                .lock()
+                .unwrap()
+                .push(QUEUED_TEST_ORIGIN.try_with(|origin| *origin).ok());
+            let (entered, release) = (entered.clone(), release.clone());
+            let child = codex_model_provider::spawn_provider_task(Box::pin(async move {
+                entered.add_permits(1);
+                release.acquire().await.unwrap().forget();
+            }))
+            .unwrap();
+            assert!(child.is_some());
+            drop(child);
+        })
+    };
+    let callback = dispatch_on_runtime(
+        registry.clone(),
+        tokio::runtime::Handle::current(),
+        callback,
+    );
+    let weak_host = Arc::downgrade(&host);
+    codex_model_provider::with_auth_task_scope(host.access(), async {
+        callback(Default::default());
+    })
+    .await
+    .unwrap();
+    queued_wait(&entered).await;
+    assert_eq!(*observed.lock().unwrap(), vec![Some(7)]);
+    assert!(host.pending() > 0);
+    release.add_permits(1);
+    host.joined().await;
+    assert!(
+        registry
+            .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(2))
+            .await
+            .is_clean()
+    );
+    drop(host);
+    assert!(
+        weak_host.upgrade().is_none(),
+        "reusable callback does not cache its invoking host/root"
+    );
+    drop(callback);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn inherited_queue_obligations_survive_coordinator_observer_abort() {
+    let registry = crate::PluginTaskRegistry::default();
+    let a = QueuedTestHost::new(1);
+    let b = QueuedTestHost::new(2);
+    let owner_a = codex_model_provider::with_auth_task_scope(a.access(), async {
+        registry.prepare_auth_request()
+    })
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+    let owner_b = codex_model_provider::with_auth_task_scope(b.access(), async {
+        registry.prepare_auth_request()
+    })
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+    let entered = Arc::new(tokio::sync::Semaphore::new(0));
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let (child_entered, child_release) = (entered.clone(), release.clone());
+    let observer = tokio::spawn(async move {
+        run_queued_plugin_work(&Some(owner_b), vec![owner_a], async move {
+            child_entered.add_permits(1);
+            child_release.acquire().await.unwrap().forget();
+        })
+        .await
+    });
+    queued_wait(&entered).await;
+    observer.abort();
+    assert!(observer.await.unwrap_err().is_cancelled());
+    assert!(
+        a.pending() > 0 && b.pending() > 0,
+        "actual accepted B command retains inherited A despite observer cancellation"
+    );
+    release.add_permits(1);
+    assert!(
+        registry
+            .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(2))
+            .await
+            .is_clean()
+    );
+    a.joined().await;
+    b.joined().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn disarmed_queue_cleanup_does_not_erase_a_newly_started_epoch() {
+    let home = TempDir::new().unwrap();
+    let manager = Arc::new(test_plugins_manager(home.path().to_owned()));
+    let host = QueuedTestHost::new(1);
+    let old = AsyncPluginWorkerReset {
+        manager: manager.clone(),
+        kind: AsyncPluginWorkerKind::CatalogRefresh,
+        armed: false,
+    };
+    let queued = codex_model_provider::with_auth_task_scope(host.access(), async {
+        QueuedPluginRequest::prepare(
+            &manager.task_registry,
+            RemoteCatalogCacheRefreshRequest {
+                service_config: RemotePluginServiceConfig::new(
+                    "http://127.0.0.1:1".into(),
+                    test_http_client_factory(),
+                    None,
+                ),
+                auth: None,
+                scopes: [RemotePluginScope::Global].into(),
+            },
+        )
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    {
+        let mut state = manager.remote_catalog_cache_refresh_state.write().unwrap();
+        state.in_flight = true;
+        state.requests.push_back(queued);
+    }
+    drop(old);
+    let queued = {
+        let mut state = manager.remote_catalog_cache_refresh_state.write().unwrap();
+        assert!(state.in_flight);
+        assert_eq!(state.requests.len(), 1);
+        state.in_flight = false;
+        state.requests.pop_front().unwrap()
+    };
+    drop(queued);
+    host.joined().await;
+    assert!(
+        manager
+            .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(2))
+            .await
+            .is_clean()
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn abandoned_async_queue_marks_pending_managed_originals_unavailable() {
+    let home = TempDir::new().unwrap();
+    let manager = Arc::new(test_plugins_manager(home.path().to_owned()));
+    let host = QueuedTestHost::new(1);
+    let queued = codex_model_provider::with_auth_task_scope(host.access(), async {
+        QueuedPluginRequest::prepare(
+            &manager.task_registry,
+            RemoteCatalogCacheRefreshRequest {
+                service_config: RemotePluginServiceConfig::new(
+                    "http://127.0.0.1:1".into(),
+                    test_http_client_factory(),
+                    None,
+                ),
+                auth: None,
+                scopes: [RemotePluginScope::Global].into(),
+            },
+        )
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    {
+        let mut state = manager.remote_catalog_cache_refresh_state.write().unwrap();
+        state.in_flight = true;
+        state.requests.push_back(queued);
+    }
+    let completion = AsyncPluginWorkerReset {
+        manager: manager.clone(),
+        kind: AsyncPluginWorkerKind::CatalogRefresh,
+        armed: true,
+    };
+    let panic = manager
+        .task_registry
+        .spawn(async move {
+            let _completion = completion;
+            panic!("synthetic actual queue coordinator panic");
+        })
+        .unwrap();
+    assert_eq!(panic.await, crate::retirement::JoinOutcome::Panicked);
+    let report = manager
+        .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(2))
+        .await;
+    assert!(report.terminal && report.panicked && report.unavailable && !report.is_clean());
+    host.joined().await;
+    let state = manager.remote_catalog_cache_refresh_state.read().unwrap();
+    assert!(!state.in_flight && state.requests.is_empty());
+}
+
+async fn remote_async_request_births_preserve_real_http_origin(bundle_sync: bool) {
+    let home = TempDir::new().unwrap();
+    write_file(
+        &home.path().join(CONFIG_TOML_FILE),
+        "[features]\nplugins = true\nremote_plugin = true\n",
+    );
+    let auth_manager = test_auth_manager(None);
+    set_test_auth(&auth_manager, Some(queued_auth("header.e30.direct"))).await;
+    let manager = Arc::new(test_plugins_manager_with_auth_manager(
+        home.path().to_owned(),
+        None,
+        auth_manager,
+    ));
+    let host = QueuedTestHost::new(9);
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/ps/plugins/installed"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"plugins":[],"pagination":{"next_page_token":null}}),
+            ),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/ps/plugins/suggested/codex"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"enabled":true,"plugins":[]})),
+        )
+        .mount(&server)
+        .await;
+    let mut config = load_config(home.path(), home.path())
+        .await
+        .with_plugin_recommendations_enabled(true)
+        .with_runtime_auth_mode(None);
+    config.chatgpt_base_url = server.uri();
+    let (recording, records) = queued_recording_config(&server.uri());
+    config.remote_http_clients = Arc::new(std::sync::OnceLock::from(recording.http_clients));
+    codex_model_provider::with_auth_task_scope(host.access(), async {
+        if bundle_sync {
+            manager.maybe_start_remote_installed_plugin_bundle_sync(
+                &config,
+                Some(queued_auth("header.e30.direct")),
+                None,
+                InstalledPluginSyncSource::PluginList,
+            );
+        } else {
+            manager.maybe_start_remote_plugin_caches_refresh(
+                &config,
+                Some(queued_auth("header.e30.direct")),
+                None,
+            );
+        }
+    })
+    .await
+    .unwrap();
+    host.joined().await;
+    assert!(
+        manager
+            .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(2))
+            .await
+            .is_clean()
+    );
+    let records = records.lock().unwrap();
+    assert!(!records.is_empty());
+    assert!(
+        records.iter().all(|(_, origin)| *origin == Some(9)),
+        "real remote HTTP origin: {records:?}"
+    );
+    assert!(records.iter().any(|(url, _)| if bundle_sync {
+        url.contains("/ps/plugins/installed")
+    } else {
+        url.contains("/ps/plugins/suggested/codex")
+    }));
+}
+
+mod installed_queue_keeps_prior_callback_original_and_latest_backend {
+    #[tokio::test(flavor = "current_thread")]
+    async fn managed_replacement() {
+        super::installed_queue_keeps_prior_callback_original_and_latest_backend(false).await;
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn independent_replacement() {
+        super::installed_queue_keeps_prior_callback_original_and_latest_backend(true).await;
+    }
+}
+
+mod remote_async_request_births_preserve_real_http_origin {
+    #[tokio::test(flavor = "current_thread")]
+    async fn recommendations() {
+        super::remote_async_request_births_preserve_real_http_origin(false).await;
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn bundle_sync() {
+        super::remote_async_request_births_preserve_real_http_origin(true).await;
+    }
+}
+
+struct OneShotRefusedCapture {
+    refused: Arc<AtomicBool>,
+    polled: Arc<AtomicBool>,
+}
+impl Drop for OneShotRefusedCapture {
+    fn drop(&mut self) {
+        let polled = self.polled.clone();
+        let result = codex_model_provider::spawn_provider_task(Box::pin(async move {
+            polled.store(true, Ordering::SeqCst);
+        }));
+        self.refused.store(result.is_err(), Ordering::SeqCst);
+    }
+}
+#[tokio::test(flavor = "current_thread")]
+async fn closed_family_refuses_one_shot_before_physical_or_destructor_birth() {
+    let home = TempDir::new().unwrap();
+    let manager = Arc::new(test_plugins_manager(home.path().to_owned()));
+    manager.task_registry.close();
+    let host = QueuedTestHost::new(12);
+    let refused = Arc::new(AtomicBool::new(false));
+    let polled = Arc::new(AtomicBool::new(false));
+    let capture = OneShotRefusedCapture {
+        refused: refused.clone(),
+        polled: polled.clone(),
+    };
+    let result = codex_model_provider::with_auth_task_scope(host.access(), async {
+        manager
+            .task_registry
+            .spawn_request_thread("must-not-start-one-shot", move || {
+                std::hint::black_box(capture);
+                panic!("closed family body must not execute");
+            })
+    })
+    .await;
+    assert!(
+        result.is_err(),
+        "closed family failure is sticky in the invoking scope"
+    );
+    assert!(refused.load(Ordering::SeqCst));
+    assert!(!polled.load(Ordering::SeqCst));
+    assert!(host.originals.lock().unwrap().is_empty());
+    assert!(host.physical.lock().unwrap().is_empty());
+    assert!(
+        manager
+            .shutdown_until(tokio::time::Instant::now())
+            .await
+            .is_clean()
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn curated_named_body_and_runtime_callback_keep_initiating_auth_originals() {
+    static STARTED: AtomicBool = AtomicBool::new(false);
+    let home = TempDir::new().unwrap();
+    let source = curated_plugins_repo_path(home.path());
+    write_curated_plugin(&source, "gmail");
+    write_openai_curated_marketplace(&source, &["gmail"]);
+    write_file(
+        &home.path().join(CONFIG_TOML_FILE),
+        "[plugins.\"gmail@openai-curated\"]\nenabled = true\n",
+    );
+    let manager = Arc::new(test_plugins_manager(home.path().to_owned()));
+    let host = QueuedTestHost::new(13);
+    let entered = Arc::new(tokio::sync::Semaphore::new(0));
+    let child_entered = entered.clone();
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let child_release = release.clone();
+    let origins = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let callback_origins = origins.clone();
+    let callback: EffectivePluginsChangedCallback = Arc::new(move |_| {
+        callback_origins
+            .lock()
+            .unwrap()
+            .push(QUEUED_TEST_ORIGIN.try_with(|origin| *origin).ok());
+        let (entered, release) = (child_entered.clone(), child_release.clone());
+        let child = codex_model_provider::spawn_provider_task(Box::pin(async move {
+            assert_eq!(QUEUED_TEST_ORIGIN.try_with(|origin| *origin).ok(), Some(13));
+            entered.add_permits(1);
+            release.acquire().await.unwrap().forget();
+        }))
+        .unwrap();
+        assert!(
+            child.is_some(),
+            "the real curated callback must derive its initiating original"
+        );
+        drop(child);
+    });
+    let proof = home.path().join("named-sync-body");
+    let written = proof.clone();
+    let receipt = codex_model_provider::with_auth_task_scope(host.access(), async {
+        manager.start_curated_repo_sync_with(
+            test_http_client_factory(),
+            Some(callback),
+            CuratedSyncStart::begin(&STARTED).unwrap(),
+            move |_, _, _| {
+                assert_eq!(
+                    std::thread::current().name(),
+                    Some("plugins-curated-repo-sync")
+                );
+                assert!(tokio::runtime::Handle::try_current().is_ok());
+                std::fs::write(written, b"actual named body").unwrap();
+                Ok(TEST_CURATED_PLUGIN_SHA.into())
+            },
+        )
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    drop(receipt);
+    queued_wait(&entered).await;
+    assert_eq!(std::fs::read(proof).unwrap(), b"actual named body");
+    assert_eq!(*origins.lock().unwrap(), vec![Some(13)]);
+    assert_eq!(*host.physical.lock().unwrap(), vec![13]);
+    assert!(
+        host.pending() > 0,
+        "common auth owner still owns the held descendant"
+    );
+    assert!(
+        manager
+            .store
+            .plugin_root(
+                &PluginId::new("gmail".into(), OPENAI_CURATED_MARKETPLACE_NAME.into()).unwrap(),
+                TEST_CURATED_PLUGIN_CACHE_VERSION,
+            )
+            .as_path()
+            .is_dir()
+    );
+    release.add_permits(1);
+    host.joined().await;
+    assert!(
+        manager
+            .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(2))
+            .await
+            .is_clean()
+    );
+    assert!(STARTED.load(Ordering::SeqCst));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn startup_hop_and_configured_named_worker_use_the_invoking_auth_scope() {
+    let home = TempDir::new().unwrap();
+    write_file(
+        &home.path().join(CONFIG_TOML_FILE),
+        "[features]\nplugins = true\nremote_plugin = true\n",
+    );
+    let auth_manager = test_auth_manager(None);
+    set_test_auth(&auth_manager, Some(queued_auth("header.e30.startup"))).await;
+    let manager = Arc::new(test_plugins_manager_with_auth_manager(
+        home.path().to_owned(),
+        None,
+        auth_manager,
+    ));
+    let host = QueuedTestHost::new(14);
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/ps/plugins/installed"))
+        .and(header("authorization", "Bearer header.e30.startup"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"plugins":[],"pagination":{"next_page_token":null}}),
+            ),
+        )
+        .mount(&server)
+        .await;
+    let mut config = load_config(home.path(), home.path())
+        .await
+        .with_runtime_auth_mode(None);
+    config.chatgpt_base_url = server.uri();
+    let (recording, records) = queued_recording_config(&server.uri());
+    config.remote_http_clients = Arc::new(std::sync::OnceLock::from(recording.http_clients));
+    assert!(
+        manager.remote_global_catalog_active(&config),
+        "skip unrelated curated network startup"
+    );
+    let stack = config.config_layer_stack.clone();
+    let reload: ConfigLayerReload = Arc::new(move || Ok(stack.clone()));
+    let (warnings, _warning_rx) = mpsc::unbounded_channel();
+    let entered = Arc::new(tokio::sync::Semaphore::new(0));
+    let (release, wait) = std::sync::mpsc::channel();
+    *host.gate.lock().unwrap() = Some((entered.clone(), wait));
+    codex_model_provider::with_auth_task_scope(host.access(), async {
+        manager.maybe_start_plugin_startup_tasks_for_config(&config, reload, None, warnings);
+    })
+    .await
+    .unwrap();
+    queued_wait(&entered).await;
+    assert_eq!(
+        *host.physical.lock().unwrap(),
+        vec![14],
+        "configured worker must use physical host admission"
+    );
+    assert!(host.pending() > 0);
+    release.send(()).unwrap();
+    host.joined().await;
+    assert!(
+        manager
+            .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(2))
+            .await
+            .is_clean()
+    );
+    assert!(
+        !manager
+            .configured_marketplace_upgrade_state
+            .read()
+            .unwrap()
+            .in_flight
+    );
+    let records = records.lock().unwrap();
+    assert!(!records.is_empty());
+    assert!(
+        records.iter().all(|(_, origin)| *origin == Some(14)),
+        "actual startup HTTP origin: {records:?}"
+    );
+    assert!(
+        records
+            .iter()
+            .any(|(url, _)| url.contains("/ps/plugins/installed"))
+    );
+}
+
+#[test]
+fn disarmed_configured_worker_cleanup_preserves_the_new_epoch_flag() {
+    let home = TempDir::new().unwrap();
+    let manager = Arc::new(test_plugins_manager(home.path().to_owned()));
+    let completion = BlockingPluginWorkerReset {
+        manager: manager.clone(),
+        kind: BlockingPluginWorkerKind::MarketplaceUpgrade,
+        armed: false,
+    };
+    manager
+        .configured_marketplace_upgrade_state
+        .write()
+        .unwrap()
+        .in_flight = true;
+    drop(completion);
+    assert!(
+        manager
+            .configured_marketplace_upgrade_state
+            .read()
+            .unwrap()
+            .in_flight
+    );
+    manager
+        .configured_marketplace_upgrade_state
+        .write()
+        .unwrap()
+        .in_flight = false;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn refused_one_shot_observation_does_not_poison_an_unrelated_drain_scope() {
+    #[derive(Debug)]
+    struct UnsupportedPhysical;
+    impl codex_model_provider::AuthTaskSpawner for UnsupportedPhysical {
+        fn spawn(
+            &self,
+            _: codex_model_provider::AuthTaskFuture,
+        ) -> Result<codex_model_provider::AuthTaskObservation, codex_model_provider::AuthTaskFailure>
+        {
+            panic!("no async fallback for a physical original");
+        }
+    }
+    let home = TempDir::new().unwrap();
+    let manager = Arc::new(test_plugins_manager(home.path().to_owned()));
+    let first = codex_model_provider::with_auth_task_scope(
+        codex_model_provider::AuthTaskAccess::Admitted(Arc::new(UnsupportedPhysical)),
+        async {
+            manager
+                .task_registry
+                .spawn_request_thread("unsupported-one-shot", || panic!("must not run"))
+        },
+    )
+    .await;
+    assert!(first.is_err());
+    let other = QueuedTestHost::new(15);
+    let report = codex_model_provider::with_auth_task_scope(other.access(), async {
+        manager
+            .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(2))
+            .await
+    })
+    .await
+    .expect("polling A's pure receipt must not mark B failed");
+    assert!(report.terminal && report.unavailable && !report.is_clean());
+    assert!(other.originals.lock().unwrap().is_empty());
 }

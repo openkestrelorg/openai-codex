@@ -1,6 +1,7 @@
 //! Turn lifecycle inputs and scheduling phases for host-owned contributors.
 
 use codex_protocol::config_types::CollaborationMode;
+use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TurnAbortReason;
@@ -28,7 +29,7 @@ pub struct TurnCommittedInput<'a> {
 
 /// Input supplied when the host starts a turn.
 pub struct TurnStartInput<'a> {
-    /// MCP attempt authority retained by this turn's host work.
+    /// Invocation-only MCP authority; refusal never means unscoped permission.
     pub mcp_access: Result<codex_mcp::McpAttemptAccess<'a>, codex_mcp::McpAttemptRefused>,
     /// Stable host-owned turn identifier.
     pub turn_id: &'a str,
@@ -43,6 +44,17 @@ pub struct TurnStartInput<'a> {
     /// Store scoped to this thread runtime.
     pub thread_store: &'a ExtensionData,
     /// Store scoped to this turn runtime.
+    pub turn_store: &'a ExtensionData,
+}
+
+/// Inputs for refreshing catalogs before a model step.
+#[derive(Clone, Copy)]
+pub struct CatalogRefreshInput<'a> {
+    /// Invocation-only MCP authority; refusal never means unscoped permission.
+    pub mcp_access: Result<codex_mcp::McpAttemptAccess<'a>, codex_mcp::McpAttemptRefused>,
+    pub turn_id: &'a str,
+    pub session_store: &'a ExtensionData,
+    pub thread_store: &'a ExtensionData,
     pub turn_store: &'a ExtensionData,
 }
 
@@ -74,6 +86,8 @@ pub struct TurnErrorInput<'a> {
     pub turn_id: &'a str,
     /// Error surfaced by the host for this turn.
     pub error: CodexErrorInfo,
+    /// Original error details, including backend metadata omitted from the public category.
+    pub error_details: &'a CodexErrorDetails,
     /// Store scoped to the host session runtime.
     pub session_store: &'a ExtensionData,
     /// Store scoped to this thread runtime.

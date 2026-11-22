@@ -33,6 +33,7 @@ use tokio::task::JoinHandle;
 pub(crate) use crate::linux_fds::close_inherited_fds_except;
 use crate::process::ChildTerminator;
 use crate::process::ProcessHandle;
+use crate::process::ProcessPin;
 use crate::process::ProcessSignal;
 use crate::process::PtyHandles;
 use crate::process::PtyMasterHandle;
@@ -209,6 +210,8 @@ async fn spawn_process_portable(
     }
 
     let mut child = pair.slave.spawn_command(command_builder)?;
+    let child_pid = child.process_id();
+    let launcher_pin = ProcessPin::for_child(child_pid);
     #[cfg(unix)]
     // portable-pty establishes the spawned PTY child as a new session leader on
     // Unix, so PID == PGID and we can reuse the pipe backend's process-group
@@ -300,15 +303,16 @@ async fn spawn_process_portable(
             #[cfg(unix)]
             process_group_id,
         }),
-        reader_handle,
-        Vec::new(),
+        Some(reader_handle),
+        /*stderr_reader*/ None,
         writer_handle,
         wait_handle,
         exit_status,
         exit_code,
         Some(handles),
         /*resizer*/ None,
-    );
+    )
+    .with_child(child_pid, launcher_pin);
 
     Ok(SpawnedProcess {
         session: handle,
@@ -413,6 +417,11 @@ async fn spawn_process_preserving_fds(
     };
     drop(slave);
     #[cfg(target_os = "linux")]
+    let child_pid = child.id();
+    #[cfg(not(target_os = "linux"))]
+    let child_pid = Some(child.id());
+    let launcher_pin = ProcessPin::for_child(child_pid);
+    #[cfg(target_os = "linux")]
     let process_group_id = child
         .id()
         .ok_or_else(|| std::io::Error::other("missing child pid"))?;
@@ -459,15 +468,16 @@ async fn spawn_process_preserving_fds(
     let handle = ProcessHandle::new(
         writer_tx,
         Box::new(RawPidTerminator { process_group_id }),
-        reader_handle,
-        Vec::new(),
+        Some(reader_handle),
+        /*stderr_reader*/ None,
         writer_handle,
         wait_handle,
         exit_status,
         exit_code,
         Some(handles),
         /*resizer*/ None,
-    );
+    )
+    .with_child(child_pid, launcher_pin);
 
     Ok(SpawnedProcess {
         session: handle,

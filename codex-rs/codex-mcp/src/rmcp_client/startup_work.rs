@@ -28,11 +28,29 @@ pub(crate) struct ClientStartup {
 }
 
 impl ClientStartup {
+    #[cfg(test)]
     pub(crate) fn new(future: ManagedClientFuture, requirement: McpAttemptRequirement) -> Self {
+        Self::new_with_work(
+            move |work| {
+                async move {
+                    let _work = work;
+                    future.await
+                }
+                .boxed()
+                .shared()
+            },
+            requirement,
+        )
+    }
+
+    pub(crate) fn new_with_work(
+        factory: impl FnOnce(Option<Box<dyn McpAttemptWork>>) -> ManagedClientFuture + Send + 'static,
+        requirement: McpAttemptRequirement,
+    ) -> Self {
         let admission = Arc::new(Mutex::new(Admission::Unstarted));
         let admission_for_future = Arc::clone(&admission);
         let completion = async move {
-            let _work = {
+            let work = {
                 let mut admission = admission_for_future.lock().map_err(|_| {
                     StartupOutcomeError::from(anyhow::anyhow!("MCP startup admission is poisoned"))
                 })?;
@@ -46,7 +64,7 @@ impl ClientStartup {
                     }
                 }
             };
-            future.await
+            factory(work).await
         }
         .boxed()
         .shared();
@@ -54,6 +72,18 @@ impl ClientStartup {
             requirement,
             admission,
             completion,
+        }
+    }
+
+    /// Extend the original attempt's result sequence before publication, preserving
+    /// the same admission slot. No public Future implementation exposes an unchecked poll.
+    pub(crate) fn map_completion(
+        self,
+        map: impl FnOnce(ManagedClientFuture) -> ManagedClientFuture,
+    ) -> Self {
+        Self {
+            completion: map(self.completion),
+            ..self
         }
     }
 
@@ -106,10 +136,67 @@ impl ClientStartup {
 #[cfg(test)]
 impl From<ManagedClientFuture> for ClientStartup {
     fn from(future: ManagedClientFuture) -> Self {
-        Self::new(future, McpAttemptRequirement::Ungated)
+        // Existing synthetic fixtures inject an original that may already own
+        // a live transport before its Shared is first-polled. Do not relabel it
+        // as unstarted or let shutdown skip its actual cleanup. Production has
+        // no raw-Future conversion; new admission tests use the gated factories.
+        Self {
+            requirement: McpAttemptRequirement::Ungated,
+            admission: Arc::new(Mutex::new(Admission::Running)),
+            completion: future,
+        }
     }
 }
 
 #[cfg(test)]
 #[path = "startup_work_tests.rs"]
 mod tests;
+
+/// Derive before invoking a physical startup factory. The original future, not
+/// a chat's connect observer or a reusable factory, retains this descendant.
+#[cfg(test)]
+pub(crate) fn physical_attempt(
+    requirement: McpAttemptRequirement,
+    access: McpAttemptAccess<'_>,
+    factory: impl FnOnce() -> ManagedClientFuture,
+) -> ManagedClientFuture {
+    physical_attempt_with_work(requirement, access, |work| {
+        let original = factory();
+        async move {
+            let _work = work;
+            original.await
+        }
+        .boxed()
+        .shared()
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn physical_attempt_with_work(
+    requirement: McpAttemptRequirement,
+    access: McpAttemptAccess<'_>,
+    factory: impl FnOnce(Option<Box<dyn McpAttemptWork>>) -> ManagedClientFuture,
+) -> ManagedClientFuture {
+    match requirement.derive(access) {
+        Ok(work) => factory(work),
+        Err(error) => futures::future::ready(Err(StartupOutcomeError::Refused(error)))
+            .boxed()
+            .shared(),
+    }
+}
+
+/// Continuation custody for one already-admitted invocation. Cloning it is not
+/// a new attempt or fresh authority. Each retained original must keep its clone
+/// through effects; only their conjunctive release drops the counted lease.
+pub(crate) fn physical_continuation(
+    requirement: McpAttemptRequirement,
+    work: Option<Arc<Box<dyn McpAttemptWork>>>,
+    factory: impl FnOnce(Option<Arc<Box<dyn McpAttemptWork>>>) -> ManagedClientFuture,
+) -> ManagedClientFuture {
+    if requirement == McpAttemptRequirement::Required && work.is_none() {
+        return futures::future::ready(Err(StartupOutcomeError::Refused(crate::McpAttemptRefused)))
+            .boxed()
+            .shared();
+    }
+    factory(work)
+}

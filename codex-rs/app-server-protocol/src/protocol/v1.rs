@@ -44,6 +44,10 @@ pub struct ClientInfo {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct InitializeCapabilities {
+    /// Present `humanCommand` approvals to a person and return only a one-time decision.
+    /// Requires `experimentalApi`. Pending requests can be replayed to compatible clients.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub required_human_approval: bool,
     /// Use explicit gateway OAuth login instead of automatic browser authorization.
     /// Applies to this app-server's gateway runtime; later connections cannot undo it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -54,8 +58,7 @@ pub struct InitializeCapabilities {
     /// Opt into `attestation/generate` requests for upstream `x-oai-attestation`.
     #[serde(default)]
     pub request_attestation: bool,
-    /// Requests classification as an interactive app-server client. This is a
-    /// request only; the server must independently establish entitlement.
+    /// Requests interactive-client classification; the server independently verifies entitlement.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub interactive_client: bool,
     /// Legacy opt-in for the `openai/form` MCP extension.
@@ -248,4 +251,32 @@ pub struct SandboxSettings {
 #[serde(rename_all = "camelCase")]
 pub struct InterruptConversationResponse {
     pub abort_reason: TurnAbortReason,
+}
+
+#[cfg(test)]
+mod interactive_client_tests {
+    use super::InitializeCapabilities;
+
+    #[test]
+    fn omitted_interactive_role_is_not_requested() {
+        let capabilities: InitializeCapabilities = serde_json::from_str("{}").unwrap();
+        assert!(!capabilities.interactive_client);
+        assert!(
+            serde_json::to_value(capabilities)
+                .unwrap()
+                .get("interactiveClient")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn interactive_role_round_trips_as_a_request() {
+        let capabilities: InitializeCapabilities =
+            serde_json::from_str(r#"{"interactiveClient":true}"#).unwrap();
+        assert!(capabilities.interactive_client);
+        assert_eq!(
+            serde_json::to_value(capabilities).unwrap()["interactiveClient"],
+            true
+        );
+    }
 }

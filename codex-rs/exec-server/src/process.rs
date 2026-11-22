@@ -16,6 +16,7 @@ use crate::protocol::ProcessOutputChunk;
 use crate::protocol::ProcessSandboxType;
 use crate::protocol::ProcessSignal;
 use crate::protocol::ReadResponse;
+use crate::protocol::SandboxCleanupSummary;
 use crate::protocol::WriteResponse;
 
 pub struct StartedExecProcess {
@@ -57,6 +58,7 @@ pub enum ExecProcessEvent {
     },
     Closed {
         seq: u64,
+        sandbox_cleanup: Option<SandboxCleanupSummary>,
     },
     Failed(String),
 }
@@ -93,7 +95,9 @@ impl ExecProcessEvent {
     pub(crate) fn seq(&self) -> Option<u64> {
         match self {
             ExecProcessEvent::Output(chunk) => Some(chunk.seq),
-            ExecProcessEvent::Exited { seq, .. } | ExecProcessEvent::Closed { seq } => Some(*seq),
+            ExecProcessEvent::Exited { seq, .. } | ExecProcessEvent::Closed { seq, .. } => {
+                Some(*seq)
+            }
             ExecProcessEvent::Failed(_) => None,
         }
     }
@@ -176,6 +180,15 @@ impl ExecProcessEventReceiver {
         }
     }
 
+    /// Inert replay fixture for cross-crate process-owner tests. It runs no
+    /// executor or transport, and remains open after the supplied events.
+    #[doc(hidden)]
+    pub fn from_replay_for_tests(events: Vec<ExecProcessEvent>) -> Self {
+        let mut receiver = Self::empty();
+        receiver.replay = events.into();
+        receiver
+    }
+
     /// Returns the next replayed or live event.
     ///
     /// `Lagged` means this receiver fell behind the bounded live channel. The
@@ -215,6 +228,15 @@ pub trait ExecProcess: Send + Sync {
     fn signal(&self, signal: ProcessSignal) -> ExecProcessFuture<'_, ()>;
 
     fn terminate(&self) -> ExecProcessFuture<'_, ()>;
+
+    /// Older/local implementations retain their ordinary terminate behavior;
+    /// callers must still require actual cleanup evidence independently.
+    fn terminate_with_cleanup_deadline(
+        &self,
+        _deadline: std::time::Instant,
+    ) -> ExecProcessFuture<'_, ()> {
+        self.terminate()
+    }
 }
 
 pub type ExecProcessFuture<'a, T> =
@@ -288,7 +310,10 @@ mod tests {
             exit_code: 0,
             sandbox_denied: Some(false),
         });
-        log.publish(ExecProcessEvent::Closed { seq: 3 });
+        log.publish(ExecProcessEvent::Closed {
+            seq: 3,
+            sandbox_cleanup: None,
+        });
 
         let mut events = log.subscribe();
         let replay = vec![
@@ -310,7 +335,10 @@ mod tests {
                     exit_code: 0,
                     sandbox_denied: Some(false),
                 },
-                ExecProcessEvent::Closed { seq: 3 },
+                ExecProcessEvent::Closed {
+                    seq: 3,
+                    sandbox_cleanup: None
+                },
             ]
         );
     }

@@ -17,10 +17,7 @@ async fn reserves_before_use_and_compacts_only_proven_controls() {
         report,
         AppsRuntimeDrain {
             unavailable: false,
-            reports: vec![RuntimeTerminationReport {
-                connections: vec![],
-                tasks: vec![]
-            }]
+            reports: vec![AppDiscoveryTerminationReport::Unused]
         }
     );
     assert!(second.is_retired());

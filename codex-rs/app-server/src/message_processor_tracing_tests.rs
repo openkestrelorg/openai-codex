@@ -5,27 +5,19 @@ use crate::analytics_utils::analytics_events_client_from_config;
 use crate::config_manager::ConfigManager;
 use crate::outgoing_message::ConnectionId;
 use crate::outgoing_message::OutgoingMessageSender;
+use crate::plugin_config_reload::PluginStartupConfig;
 use crate::transport::AppServerTransport;
 use anyhow::Result;
 use app_test_support::create_mock_responses_server_repeating_assistant;
 use app_test_support::write_mock_responses_config_toml;
 use codex_analytics::AppServerRpcTransport;
-use codex_app_server_protocol::CancelManagedTransitionParams;
-use codex_app_server_protocol::CancelManagedTransitionResponse;
 use codex_app_server_protocol::ClientInfo;
 use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::InitializeCapabilities;
 use codex_app_server_protocol::InitializeParams;
 use codex_app_server_protocol::InitializeResponse;
 use codex_app_server_protocol::JSONRPCRequest;
-use codex_app_server_protocol::MANAGED_AUTH_TRANSITION_CONTRACT_VERSION;
-use codex_app_server_protocol::ManagedTransitionIntent;
-use codex_app_server_protocol::ManagedTransitionRefusalKind;
-use codex_app_server_protocol::ReadManagedTransitionParams;
-use codex_app_server_protocol::ReadManagedTransitionResponse;
 use codex_app_server_protocol::RequestId;
-use codex_app_server_protocol::StartManagedTransitionParams;
-use codex_app_server_protocol::StartManagedTransitionResponse;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
 use codex_app_server_protocol::TurnStartParams;
@@ -122,55 +114,19 @@ struct TracingHarness {
     outgoing_rx: mpsc::Receiver<crate::outgoing_message::OutgoingEnvelope>,
     session: Arc<ConnectionSessionState>,
     tracing: &'static TestTracing,
-    telemetry: Option<TestManagedTelemetry>,
-}
-
-enum TestTelemetry {
-    Unavailable,
-    Managed,
-}
-
-struct TestManagedTelemetry {
-    cancel: tokio_util::sync::CancellationToken,
-    task: tokio::task::JoinHandle<
-        crate::otel_reloader::ManagedReloader<tracing_subscriber::Registry>,
-    >,
-    _dispatch: tracing::Dispatch,
 }
 
 impl TracingHarness {
     async fn new() -> Result<Self> {
-        Self::with_codex_home(TempDir::new()?).await
-    }
-
-    async fn with_codex_home(codex_home: TempDir) -> Result<Self> {
-        Self::with_telemetry(codex_home, TestTelemetry::Unavailable).await
-    }
-
-    async fn with_telemetry(codex_home: TempDir, telemetry: TestTelemetry) -> Result<Self> {
-        Self::with_retention_authority(codex_home, telemetry, false).await
-    }
-
-    async fn new_for_recovery() -> Result<Self> {
-        Self::with_retention_authority(TempDir::new()?, TestTelemetry::Unavailable, true).await
-    }
-
-    async fn with_retention_authority(
-        codex_home: TempDir,
-        telemetry: TestTelemetry,
-        retention_enabled: bool,
-    ) -> Result<Self> {
         let server = create_mock_responses_server_repeating_assistant("Done").await;
-        let mut config = build_test_config(codex_home.path(), &server.uri()).await?;
-        config.chatgpt_base_url = format!("{}/backend-api", server.uri());
-        let config = Arc::new(config);
+        let codex_home = TempDir::new()?;
+        let config = Arc::new(build_test_config(codex_home.path(), &server.uri()).await?);
         let auth_manager = AuthManager::shared_from_config(
             config.as_ref(),
             /*enable_codex_api_key_env*/ false,
         )
         .await?;
-        let (processor, outgoing_rx, telemetry) =
-            build_test_processor_with_telemetry(config, auth_manager, telemetry).await;
+        let (processor, outgoing_rx) = build_test_processor(config, auth_manager).await;
         let tracing = init_test_tracing();
         tracing.exporter.reset();
         tracing::callsite::rebuild_interest_cache();
@@ -179,13 +135,10 @@ impl TracingHarness {
             _codex_home: codex_home,
             processor,
             outgoing_rx,
-            session: Arc::new(if retention_enabled {
-                ConnectionSessionState::in_process()
-            } else {
-                ConnectionSessionState::new(crate::transport::ConnectionOrigin::Stdio)
-            }),
+            session: Arc::new(ConnectionSessionState::new(
+                crate::transport::ConnectionOrigin::Stdio,
+            )),
             tracing,
-            telemetry,
         };
 
         let _: InitializeResponse = harness
@@ -208,17 +161,9 @@ impl TracingHarness {
             )
             .await;
         assert!(harness.session.initialized());
-        // The transport loop completes stdio connection registration after
-        // initialize; this direct processor fixture must perform that step.
         harness
             .processor
-            .connection_initialized(
-                TEST_CONNECTION_ID,
-                harness.session.request_attestation(),
-                harness.session.trusted_interactive(),
-                harness.session.retention_principal(),
-                harness.session.auth_observation_only(),
-            )
+            .connection_initialized(TEST_CONNECTION_ID, &harness.session)
             .await;
 
         Ok(harness)
@@ -231,14 +176,6 @@ impl TracingHarness {
     async fn shutdown(self) {
         self.processor.shutdown_threads().await;
         self.processor.drain_background_tasks().await;
-        if let Some(telemetry) = self.telemetry {
-            telemetry.cancel.cancel();
-            let owner = tokio::time::timeout(std::time::Duration::from_secs(30), telemetry.task)
-                .await
-                .expect("telemetry owner shutdown deadline")
-                .expect("telemetry owner join");
-            assert_eq!(owner.shutdown_result, Some(Ok(())));
-        }
     }
 
     async fn request<T>(&mut self, request: ClientRequest, trace: Option<W3cTraceContext>) -> T
@@ -298,6 +235,7 @@ async fn build_test_config(codex_home: &Path, server_uri: &str) -> Result<Config
 
     Ok(ConfigBuilder::default()
         .codex_home(codex_home.to_path_buf())
+        .cli_overrides(vec![("features.plugins".to_string(), false.into())])
         .build()
         .await?)
 }
@@ -308,20 +246,6 @@ pub(super) async fn build_test_processor(
 ) -> (
     Arc<MessageProcessor>,
     mpsc::Receiver<crate::outgoing_message::OutgoingEnvelope>,
-) {
-    let (processor, outgoing, _) =
-        build_test_processor_with_telemetry(config, auth_manager, TestTelemetry::Unavailable).await;
-    (processor, outgoing)
-}
-
-async fn build_test_processor_with_telemetry(
-    config: Arc<Config>,
-    auth_manager: Arc<AuthManager>,
-    telemetry: TestTelemetry,
-) -> (
-    Arc<MessageProcessor>,
-    mpsc::Receiver<crate::outgoing_message::OutgoingEnvelope>,
-    Option<TestManagedTelemetry>,
 ) {
     let (outgoing_tx, outgoing_rx) = mpsc::channel(16);
     let config_manager = ConfigManager::new(
@@ -335,56 +259,25 @@ async fn build_test_processor_with_telemetry(
         Arg0DispatchPaths::default(),
         Arc::new(codex_config::NoopThreadConfigLoader),
     );
-    let analytics_events_client =
-        analytics_events_client_from_config(Arc::clone(&auth_manager), config.as_ref());
-    let (telemetry_reset, telemetry) = match telemetry {
-        TestTelemetry::Unavailable => (
-            crate::otel_reset_control::TelemetryResetControl::default(),
-            None,
-        ),
-        TestTelemetry::Managed => {
-            let (layers, routes) = codex_otel::ManagedTelemetryRoutes::layers();
-            let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(layers));
-            let mut candidate = Some(
-                codex_core::otel_init::prepare_provider(
-                    &config,
-                    "test",
-                    Some(crate::OTEL_SERVICE_NAME),
-                    /*default_analytics_enabled*/ false,
-                )
-                .expect("prepare actual telemetry provider"),
-            );
-            let initial = routes
-                .publish(&mut candidate)
-                .expect("publish actual telemetry routes");
-            let cancel = tokio_util::sync::CancellationToken::new();
-            let (control, task) = crate::otel_reloader::spawn_managed(
-                initial,
-                routes,
-                config_manager.clone(),
-                Arc::clone(&auth_manager),
-                /*default_analytics_enabled*/ false,
-                cancel.clone(),
-            );
-            (
-                control,
-                Some(TestManagedTelemetry {
-                    cancel,
-                    task,
-                    _dispatch: dispatch,
-                }),
-            )
-        }
-    };
+    let analytics_events_client = analytics_events_client_from_config(
+        Arc::clone(&auth_manager),
+        config.as_ref(),
+        /*runtime_auth_slot*/ None,
+    );
     let outgoing = Arc::new(OutgoingMessageSender::new(
         outgoing_tx,
         analytics_events_client.clone(),
     ));
     let processor = Arc::new(MessageProcessor::new(MessageProcessorArgs {
-        telemetry_reset,
+        managed_transition_control_socket_endpoint: None,
+        managed_transition_process_instance_id: None,
+        telemetry_reset: Default::default(),
+        control_endpoint: None,
+        cloud_skill_provider: None,
         outgoing,
         analytics_events_client,
         arg0_paths: Arg0DispatchPaths::default(),
+        startup_cwd: Some(config.cwd.to_path_buf()),
         config,
         config_manager,
         environment_manager: Arc::new(EnvironmentManager::default_for_tests()),
@@ -392,201 +285,20 @@ async fn build_test_processor_with_telemetry(
         log_db: None,
         state_db: None,
         config_warnings: Vec::new(),
+        startup_warnings_tx: mpsc::unbounded_channel().0,
         session_source: SessionSource::VSCode,
         user_verification: Arc::new(crate::user_verification::Service::new(Arc::clone(
             &auth_manager,
         ))),
         auth_manager,
+        runtime_auth_slot: None,
         installation_id: "11111111-1111-4111-8111-111111111111".to_string(),
         code_mode_session_provider: None,
         rpc_transport: AppServerRpcTransport::Stdio,
         remote_control_handle: None,
-        // Keep this retirement fixture deterministic: startup plugin refresh
-        // workers are exercised by their own ownership tests and would add an
-        // unrelated admitted population to the background-drain assertion.
-        plugin_startup_tasks: None,
-        managed_transition_control_socket_endpoint: None,
-        managed_transition_process_instance_id: None,
-        control_endpoint: None,
+        plugin_startup_tasks: Some(PluginStartupConfig::Current),
     }));
-    (processor, outgoing_rx, telemetry)
-}
-
-async fn build_test_processor_for_retirement(
-    config: Arc<Config>,
-    telemetry: TestTelemetry,
-) -> (
-    Arc<MessageProcessor>,
-    mpsc::Receiver<crate::outgoing_message::OutgoingEnvelope>,
-    Option<TestManagedTelemetry>,
-) {
-    let auth_manager =
-        AuthManager::shared_from_config(config.as_ref(), /*enable_codex_api_key_env*/ false)
-            .await
-            .expect("create test auth manager");
-    build_test_processor_with_telemetry(config, auth_manager, telemetry).await
-}
-
-#[tokio::test]
-async fn processor_login_shutdown_facade_binds_first_deadline() -> Result<()> {
-    let home = TempDir::new()?;
-    let config = Arc::new(build_test_config(home.path(), "http://127.0.0.1:1").await?);
-    let (processor, _outgoing, _telemetry) =
-        build_test_processor_for_retirement(config, TestTelemetry::Unavailable).await;
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
-    drop(processor.begin_login_shutdown(deadline)?);
-    let ticket = processor.begin_login_shutdown(deadline + std::time::Duration::from_secs(60))?;
-    assert_eq!(ticket.deadline(), deadline);
-    let report = ticket.wait().await;
-    assert!(report.tasks.is_clean());
-    assert_eq!(report.browsers, Ok(Vec::new()));
-    assert!(!report.admission_unavailable);
-    // Independently clean the fixture's other worker populations. The login
-    // report is not a claim about them or a substitute for host retirement.
-    processor.drain_background_tasks_until(deadline).await;
-    Ok(())
-}
-
-#[tokio::test]
-async fn processor_thread_shutdown_facade_retains_first_attempt() -> Result<()> {
-    let home = TempDir::new()?;
-    let config = Arc::new(build_test_config(home.path(), "http://127.0.0.1:1").await?);
-    let (processor, _outgoing, _telemetry) =
-        build_test_processor_for_retirement(config, TestTelemetry::Unavailable).await;
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
-    drop(processor.begin_thread_shutdown(deadline).unwrap());
-    let ticket = processor
-        .begin_thread_shutdown(deadline + std::time::Duration::from_secs(20))
-        .unwrap();
-    assert_eq!(ticket.deadline(), deadline);
-    let report = ticket.wait().await;
-    assert!(report.is_complete(), "{report:?}");
-    assert_eq!(ticket.wait().await, report);
-    // This proves only the thread limb. Independently stop fixture workers;
-    // the thread receipt must not be mistaken for all-processor cleanup.
-    processor.drain_background_tasks_until(deadline).await;
-    Ok(())
-}
-
-#[tokio::test]
-#[expect(
-    clippy::await_holding_invalid_type,
-    reason = "the fixture exclusively observes worker shutdown under its owner lock before testing background custody"
-)]
-async fn background_drain_timeout_retains_work_and_reobserves_completion() -> Result<()> {
-    use super::ProcessorBackgroundShutdown;
-    use crate::models_refresh_worker::ModelsRefreshShutdown;
-    use crate::processor_task_retirement::ProcessorTaskDrain as ThreadStartDrain;
-    use crate::request_processors::AppsRuntimeDrain;
-    use crate::request_processors::AppsShutdown;
-    use tokio::time::Instant;
-
-    let home = TempDir::new()?;
-    let config = Arc::new(build_test_config(home.path(), "http://127.0.0.1:1").await?);
-    let (processor, _outgoing, _telemetry) =
-        build_test_processor_for_retirement(config, TestTelemetry::Unavailable).await;
-    assert_eq!(
-        processor
-            .models_refresh_worker
-            .lock()
-            .await
-            .shutdown_until(Instant::now() + std::time::Duration::from_secs(5))
-            .await,
-        ModelsRefreshShutdown::Joined
-    );
-    let resource = Arc::new(());
-    let weak_resource = Arc::downgrade(&resource);
-    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
-    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-    let task = processor
-        .thread_processor
-        .background_tasks_for_test()
-        .spawn(async move {
-            let _resource = resource;
-            entered_tx.send(()).unwrap();
-            release_rx.await.unwrap();
-        })
-        .unwrap();
-    entered_rx.await?;
-    let mut observer = Box::pin(
-        processor
-            .drain_background_tasks_until(Instant::now() + std::time::Duration::from_millis(10)),
-    );
-    assert!(futures::poll!(observer.as_mut()).is_pending());
-    drop(observer);
-    assert_eq!(
-        processor
-            .drain_background_tasks_until(Instant::now() + std::time::Duration::from_millis(10))
-            .await,
-        ProcessorBackgroundShutdown {
-            models: ModelsRefreshShutdown::Joined,
-            thread_starts: ThreadStartDrain::default(),
-            apps: AppsShutdown {
-                tasks: ThreadStartDrain {
-                    terminal: true,
-                    ..Default::default()
-                },
-                runtimes: AppsRuntimeDrain {
-                    unavailable: false,
-                    reports: Vec::new()
-                },
-            },
-            skills: crate::skills_watcher::SkillsWatcherShutdown::Joined,
-            plugins: codex_core_plugins::PluginTaskDrain {
-                terminal: true,
-                ..Default::default()
-            },
-            auxiliary_tasks: ThreadStartDrain {
-                terminal: true,
-                ..Default::default()
-            },
-        }
-    );
-    assert!(weak_resource.upgrade().is_some());
-    assert_eq!(
-        processor.thread_processor.background_tasks_for_test().len(),
-        1
-    );
-    release_tx.send(()).unwrap();
-    // A later observer may normalize a completed join, but cannot extend the
-    // expired attempt to wait for work. Settle the actual task first.
-    let _ = task.await;
-    let deadline = Instant::now() + std::time::Duration::from_secs(1);
-    let (first, second) = tokio::join!(
-        processor.drain_background_tasks_until(deadline),
-        processor.drain_background_tasks_until(deadline),
-    );
-    let expected = ProcessorBackgroundShutdown {
-        models: ModelsRefreshShutdown::Joined,
-        thread_starts: ThreadStartDrain {
-            terminal: true,
-            ..Default::default()
-        },
-        apps: AppsShutdown {
-            tasks: ThreadStartDrain {
-                terminal: true,
-                ..Default::default()
-            },
-            runtimes: AppsRuntimeDrain {
-                unavailable: false,
-                reports: Vec::new(),
-            },
-        },
-        skills: crate::skills_watcher::SkillsWatcherShutdown::Joined,
-        plugins: codex_core_plugins::PluginTaskDrain {
-            terminal: true,
-            ..Default::default()
-        },
-        auxiliary_tasks: ThreadStartDrain {
-            terminal: true,
-            ..Default::default()
-        },
-    };
-    assert_eq!((first, second), (expected.clone(), expected));
-    assert!(weak_resource.upgrade().is_none());
-    processor.clear_runtime_references();
-    processor.shutdown_threads().await;
-    Ok(())
+    (processor, outgoing_rx)
 }
 
 fn run_current_thread_test_with_stack<F>(name: &str, future: F) -> Result<()>
@@ -774,7 +486,7 @@ pub(super) async fn read_response_from<T: serde::de::DeserializeOwned>(
             crate::outgoing_message::OutgoingMessage::Error(error)
                 if error.id == RequestId::Integer(request_id) =>
             {
-                panic!("request {request_id} failed: {:?}", error.error);
+                panic!("request {request_id} failed before its expected response: {error:?}");
             }
             _ => continue,
         };
@@ -968,22 +680,6 @@ fn thread_start_jsonrpc_span_exports_server_span_and_parents_children() -> Resul
 
 #[tokio::test(flavor = "current_thread")]
 #[serial(app_server_tracing)]
-async fn initialized_unproven_connection_has_no_retention_principal() -> Result<()> {
-    let harness = TracingHarness::new().await?;
-
-    assert!(harness.session.initialized());
-    assert_eq!(
-        harness.session.retention_principal(),
-        None,
-        "client initialization and experimental opt-in cannot establish retention eligibility"
-    );
-
-    harness.shutdown().await;
-    Ok(())
-}
-
-#[tokio::test(flavor = "current_thread")]
-#[serial(app_server_tracing)]
 async fn turn_start_jsonrpc_span_parents_core_turn_spans() -> Result<()> {
     let mut harness = TracingHarness::new().await?;
     let thread_start_response = harness.start_thread(/*request_id*/ 2, /*trace*/ None).await;
@@ -1010,8 +706,11 @@ async fn turn_start_jsonrpc_span_parents_core_turn_spans() -> Result<()> {
                         text_elements: Vec::new(),
                     }],
                     turn_trigger: None,
+                    parent_turn_id: None,
+                    root_turn_id: None,
                     tool_output: None,
                     responsesapi_client_metadata: None,
+                    responsesapi_client_metadata_patch: None,
                     additional_context: None,
                     cwd: None,
                     runtime_workspace_roots: None,
@@ -1066,257 +765,474 @@ async fn turn_start_jsonrpc_span_parents_core_turn_spans() -> Result<()> {
     Ok(())
 }
 
-#[test]
-#[serial(app_server_tracing)]
-fn managed_transition_dispatch_paths_refuse_before_authorization_without_reserving_state()
+#[tokio::test]
+async fn processor_login_shutdown_facade_binds_first_deadline() -> Result<()> {
+    let home = TempDir::new()?;
+    let config = Arc::new(build_test_config(home.path(), "http://127.0.0.1:1").await?);
+    let (processor, _outgoing) = build_test_processor_for_retirement(config).await;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+    drop(processor.begin_login_shutdown(deadline)?);
+    let ticket = processor.begin_login_shutdown(deadline + std::time::Duration::from_secs(60))?;
+    assert_eq!(ticket.deadline(), deadline);
+    let report = ticket.wait().await;
+    assert!(report.tasks.is_clean());
+    assert_eq!(report.browsers, Ok(Vec::new()));
+    assert!(!report.admission_unavailable);
+    // Independently clean the fixture's other worker populations. The login
+    // report is not a claim about them or a substitute for host retirement.
+    processor.drain_background_tasks_until(deadline).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn processor_thread_shutdown_facade_retains_first_attempt() -> Result<()> {
+    let home = TempDir::new()?;
+    let config = Arc::new(build_test_config(home.path(), "http://127.0.0.1:1").await?);
+    let (processor, _outgoing) = build_test_processor_for_retirement(config).await;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+    drop(processor.begin_thread_shutdown(deadline).unwrap());
+    let ticket = processor
+        .begin_thread_shutdown(deadline + std::time::Duration::from_secs(20))
+        .unwrap();
+    assert_eq!(ticket.deadline(), deadline);
+    let report = ticket.wait().await;
+    assert!(report.is_complete(), "{report:?}");
+    assert_eq!(ticket.wait().await, report);
+    // This proves only the thread limb. Independently stop fixture workers;
+    // the thread receipt must not be mistaken for all-processor cleanup.
+    processor.drain_background_tasks_until(deadline).await;
+    Ok(())
+}
+
+#[tokio::test]
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "the fixture settles the model worker under its owner lock before testing the background census"
+)]
+async fn timed_out_background_keeps_component_reports_and_closes_request_auth() -> Result<()> {
+    use crate::message_processor::SharedBackgroundProgress;
+    use tokio::time::Instant;
+
+    let home = TempDir::new()?;
+    let config = Arc::new(build_test_config(home.path(), "http://127.0.0.1:1").await?);
+    let (processor, _outgoing) = build_test_processor_for_retirement(config).await;
+    assert_eq!(
+        processor
+            .models_refresh_worker
+            .lock()
+            .await
+            .shutdown_until(Instant::now() + std::time::Duration::from_secs(5))
+            .await,
+        crate::models_refresh_worker::ModelsRefreshShutdown::Joined
+    );
+    let (release, released) = tokio::sync::oneshot::channel();
+    let held = processor
+        .auxiliary_tasks
+        .spawn(async move {
+            let _ = released.await;
+        })
+        .unwrap();
+    let progress = SharedBackgroundProgress::default();
+    let deadline = Instant::now() + std::time::Duration::from_millis(20);
+    let aggregate = processor.drain_background_tasks_recording(deadline, &progress);
+    tokio::pin!(aggregate);
+    assert!(
+        crate::standalone_shutdown::poll_before(deadline, aggregate.as_mut())
+            .await
+            .is_none()
+    );
+    let census = processor.background_census_after_timeout(deadline, &progress);
+    assert_eq!(
+        census.unfinished,
+        vec!["model_auth", "request_auth", "auxiliary_tasks"]
+    );
+    assert!(census.finished.models.is_some());
+    assert!(census.finished.plugins.is_some());
+    assert_eq!(census.registries["auxiliary_tasks"].pending, Some(1));
+    assert!(!census.registries["auxiliary_tasks"].drain.terminal);
+    assert!(processor.request_auth_tasks.spawn(async {}).is_err());
+    release.send(()).unwrap();
+    assert_eq!(
+        held.await,
+        crate::processor_task_retirement::ProcessorTaskJoin::Joined
+    );
+    // The retained aggregate is never polled again, even after its original joins.
+    Ok(())
+}
+
+#[tokio::test]
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "the fixture exclusively observes worker shutdown under its owner lock before testing background custody"
+)]
+async fn background_drain_timeout_retains_work_and_reobserves_completion() -> Result<()> {
+    use crate::command_exec::CommandExecSandboxShutdown;
+    use crate::models_refresh_worker::ModelsRefreshShutdown;
+    use tokio::time::Instant;
+
+    let home = TempDir::new()?;
+    let config = Arc::new(build_test_config(home.path(), "http://127.0.0.1:1").await?);
+    let (processor, _outgoing) = build_test_processor_for_retirement(config).await;
+    assert_eq!(
+        processor
+            .models_refresh_worker
+            .lock()
+            .await
+            .shutdown_until(Instant::now() + std::time::Duration::from_secs(5))
+            .await,
+        ModelsRefreshShutdown::Joined
+    );
+    let resource = Arc::new(());
+    let weak_resource = Arc::downgrade(&resource);
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let task = processor
+        .thread_processor
+        .background_tasks_for_test()
+        .spawn(async move {
+            let _resource = resource;
+            entered_tx.send(()).unwrap();
+            release_rx.await.unwrap();
+        })
+        .unwrap();
+    entered_rx.await?;
+    let mut observer = Box::pin(
+        processor
+            .drain_background_tasks_until(Instant::now() + std::time::Duration::from_millis(10)),
+    );
+    assert!(futures::poll!(observer.as_mut()).is_pending());
+    drop(observer);
+    let pending = processor
+        .drain_background_tasks_until(Instant::now() + std::time::Duration::from_millis(10))
+        .await;
+    assert!(!pending.is_clean());
+    assert!(!pending.thread_starts.terminal);
+    assert!(weak_resource.upgrade().is_some());
+    assert_eq!(
+        processor.thread_processor.background_tasks_for_test().len(),
+        1
+    );
+    release_tx.send(()).unwrap();
+    // A later observer may normalize a completed join, but cannot extend the
+    // expired attempt to wait for work. Settle the actual task first.
+    let _ = task.await;
+    let deadline = Instant::now() + std::time::Duration::from_secs(1);
+    let (first, second) = tokio::join!(
+        processor.drain_background_tasks_until(deadline),
+        processor.drain_background_tasks_until(deadline),
+    );
+    // Compare each named population without adding production Eq/Clone merely for a test.
+    macro_rules! same_population {
+        ($($field:ident),* $(,)?) => { $(assert_eq!(first.$field, second.$field);)* };
+    }
+    same_population!(
+        models,
+        turn_cost,
+        thread_starts,
+        apps,
+        skills,
+        plugins,
+        command_exec,
+        model_auth,
+        request_auth,
+        auxiliary_tasks,
+        workspace_routing
+    );
+    let first_login = first.login.as_ref().expect("first login receipt");
+    let second_login = second.login.as_ref().expect("second login receipt");
+    assert_eq!(first_login.tasks, second_login.tasks);
+    assert_eq!(first_login.browsers, second_login.browsers);
+    assert_eq!(
+        first_login.admission_unavailable,
+        second_login.admission_unavailable
+    );
+    assert!(first.is_clean(), "{first:?}");
+    assert!(second.is_clean(), "{second:?}");
+    let mut expected = first;
+    // An uncollected or unproven command/exec sandbox cleanup alone makes
+    // the otherwise clean background shutdown evidence non-clean.
+    for command_exec in [
+        CommandExecSandboxShutdown {
+            in_flight: 1,
+            ..Default::default()
+        },
+        CommandExecSandboxShutdown {
+            unproven: 1,
+            ..Default::default()
+        },
+        CommandExecSandboxShutdown {
+            unavailable: true,
+            ..Default::default()
+        },
+    ] {
+        expected.command_exec = command_exec;
+        assert!(!expected.is_clean());
+    }
+    assert!(weak_resource.upgrade().is_none());
+    processor.clear_runtime_references();
+    processor.shutdown_threads().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn production_plugin_change_callbacks_join_refresh_and_queued_trust_without_unverified()
 -> Result<()> {
-    run_current_thread_test_with_stack(
-        "managed_transition_dispatch_paths_refuse_before_authorization_without_reserving_state",
-        async {
-            let codex_home = TempDir::new()?;
-            app_test_support::write_chatgpt_auth(
-                codex_home.path(),
-                app_test_support::ChatGptAuthFixture::new("prior-access-token")
-                    .account_id("authorization-test-account"),
-                codex_config::types::AuthCredentialsStoreMode::File,
-            )?;
-            let mut harness = TracingHarness::with_codex_home(codex_home).await?;
-            let process_instance_id = harness
-                .processor
-                .managed_transition_coordinator
-                .process_instance_id()
-                .await;
-            let start_params = StartManagedTransitionParams {
-                contract_version: MANAGED_AUTH_TRANSITION_CONTRACT_VERSION,
-                transition_id: "transition-a".to_owned(),
-                process_instance_id: process_instance_id.clone(),
-                intent: ManagedTransitionIntent::AdoptManagedAuth,
-                expected_auth_revision: 0,
-                expected_transition_revision: 0,
-                expected_auth_fingerprint: Some(
-                    codex_login::AuthManager::managed_account_fingerprint(
-                        "authorization-test-account",
-                    ),
-                ),
-                intended_result_auth_fingerprint: Some(
-                    codex_login::AuthManager::managed_account_fingerprint(
-                        "authorization-test-account",
-                    ),
-                ),
-            };
-            let start: StartManagedTransitionResponse = harness
-                .request(
-                    ClientRequest::ManagedTransitionStart {
-                        request_id: RequestId::Integer(40_001),
-                        params: start_params.clone(),
+    use crate::request_serialization::RequestSerializationAccess;
+    use crate::request_serialization::RequestSerializationQueueKey;
+    use codex_core_plugins::EffectivePluginsChange;
+    use codex_core_plugins::remote::RemotePluginMaterialization;
+    use codex_core_plugins::remote::RemotePluginScope;
+    use codex_plugin::PluginId;
+    use std::time::Duration;
+    use tokio::time::Instant;
+
+    for with_materialization in [false, true] {
+        let home = TempDir::new()?;
+        let config = Arc::new(build_test_config(home.path(), "http://127.0.0.1:1").await?);
+        let (processor, _outgoing) = build_test_processor_for_retirement(config).await;
+        let queues = processor.request_serialization_queues.clone();
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let blocker = tokio::spawn(async move {
+            queues
+                .enqueue_background_and_wait(
+                    RequestSerializationQueueKey::Global("config"),
+                    RequestSerializationAccess::Exclusive,
+                    async move {
+                        let _ = entered.send(());
+                        let _ = released.await;
                     },
-                    None,
                 )
-                .await;
-            let read: ReadManagedTransitionResponse = harness
-                .request(
-                    ClientRequest::ManagedTransitionRead {
-                        request_id: RequestId::Integer(40_002),
-                        params: ReadManagedTransitionParams {
-                            contract_version: MANAGED_AUTH_TRANSITION_CONTRACT_VERSION,
-                            transition_id: start_params.transition_id.clone(),
-                            process_instance_id: process_instance_id.clone(),
-                        },
-                    },
-                    None,
-                )
-                .await;
-            let cancel: CancelManagedTransitionResponse = harness
-                .request(
-                    ClientRequest::ManagedTransitionCancel {
-                        request_id: RequestId::Integer(40_003),
-                        params: CancelManagedTransitionParams {
-                            contract_version: MANAGED_AUTH_TRANSITION_CONTRACT_VERSION,
-                            transition_id: start_params.transition_id.clone(),
-                            process_instance_id,
-                        },
-                    },
-                    None,
-                )
-                .await;
-            for refusal in [
-                match start {
-                    StartManagedTransitionResponse::Refused { refusal } => refusal,
-                    StartManagedTransitionResponse::Accepted { .. } => panic!("start must refuse"),
-                },
-                match read {
-                    ReadManagedTransitionResponse::Refused { refusal } => refusal,
-                    ReadManagedTransitionResponse::Accepted { .. } => panic!("read must refuse"),
-                },
-                match cancel {
-                    CancelManagedTransitionResponse::Refused { refusal } => refusal,
-                    CancelManagedTransitionResponse::Accepted { .. } => {
-                        panic!("cancel must refuse")
-                    }
-                },
-            ] {
-                assert_eq!(
-                    refusal.kind,
-                    ManagedTransitionRefusalKind::AuthorizationNotAdmitted
-                );
+                .await
+        });
+        started.await?;
+        let materialized_remote_plugins = if with_materialization {
+            vec![RemotePluginMaterialization {
+                plugin_id: PluginId::new("fixture".into(), "test".into())?,
+                scope: RemotePluginScope::User,
+                discoverability: None,
+                authenticated_account_id: None,
+            }]
+        } else {
+            Vec::new()
+        };
+        let callback = processor
+            .plugin_processor
+            .effective_plugins_changed_callback();
+        callback(EffectivePluginsChange {
+            materialized_remote_plugins,
+            ..Default::default()
+        });
+        assert_eq!(
+            processor.auxiliary_tasks.len(),
+            1 + usize::from(with_materialization),
+            "the production factory must admit both actual callback originals"
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let census = processor.auxiliary_tasks.census();
+                assert!(!census.drain.unverified);
+                if census.pending == Some(usize::from(with_materialization)) {
+                    break;
+                }
+                tokio::task::yield_now().await;
             }
+        })
+        .await?;
+        if with_materialization {
             assert!(
-                harness
-                    .processor
-                    .managed_transition_coordinator
-                    .admit(start_params)
-                    .await
-                    .is_ok(),
-                "the three real MessageProcessor paths must not reserve the transition"
+                !processor.auxiliary_tasks.census().drain.terminal,
+                "the real trust callback stays owned while queued"
             );
-            harness.shutdown().await;
-            Ok(())
-        },
-    )
+        }
+        release.send(()).unwrap();
+        blocker.await??;
+        let report = processor
+            .drain_background_tasks_until(Instant::now() + Duration::from_secs(5))
+            .await;
+        assert!(report.auxiliary_tasks.is_clean(), "{report:?}");
+        assert!(report.request_auth.is_clean(), "{report:?}");
+    }
+    Ok(())
 }
 
-/// End-to-end proof that a real managed-auth adoption, driven through the
-/// actual production-wired `MessageProcessor` (not a synthetic
-/// `ResetInventory` double), completes the composed reset for the new account.
-/// Upstream's PluginsManager reads the shared AuthManager directly instead of
-/// retaining a separate auth-mode snapshot. The cloud request checks the new
-/// account identity, while the terminal status checks the transition result.
-/// Wire authorization is
-/// bypassed the same way the sibling test above does, via
-/// `managed_transition_coordinator.start_dispatch` directly -- that gate
-/// is a separate, already-covered concern
-/// (`managed_transition_dispatch_paths_refuse_before_authorization_without_reserving_state`).
-#[test]
-#[serial(app_server_tracing)]
-fn managed_transition_adoption_completes_reset_with_shared_plugin_auth() -> Result<()> {
-    run_current_thread_test_with_stack(
-        "managed_transition_adoption_completes_reset_with_shared_plugin_auth",
-        async {
-            let codex_home = TempDir::new()?;
-            app_test_support::write_chatgpt_auth(
-                codex_home.path(),
-                app_test_support::ChatGptAuthFixture::new("prior-access-token")
-                    .account_id("prior-managed-account"),
-                codex_config::types::AuthCredentialsStoreMode::File,
-            )?;
-            let harness =
-                TracingHarness::with_telemetry(codex_home, TestTelemetry::Managed).await?;
-            wiremock::Mock::given(wiremock::matchers::method("GET"))
-                .and(wiremock::matchers::path("/backend-api/wham/config/bundle"))
-                .and(wiremock::matchers::header(
-                    "authorization",
-                    "Bearer access-token",
-                ))
-                .and(wiremock::matchers::header(
-                    "chatgpt-account-id",
-                    "managed-adoption-account",
-                ))
-                .respond_with(
-                    wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({})),
-                )
-                .expect(1)
-                .mount(&harness._server)
-                .await;
-            wiremock::Mock::given(wiremock::matchers::method("GET"))
-                .and(wiremock::matchers::path("/v1/models"))
-                .respond_with(
-                    wiremock::ResponseTemplate::new(200)
-                        .set_body_json(serde_json::json!({"models": []})),
-                )
-                .mount(&harness._server)
-                .await;
-            assert_eq!(
-                harness
-                    .processor
-                    .thread_manager_for_tests()
-                    .plugins_manager()
-                    .auth_mode(),
-                Some(codex_protocol::auth::AuthMode::Chatgpt),
-                "plugins must read the initially installed account through the shared manager"
-            );
-
-            let process_instance_id = harness
-                .processor
-                .managed_transition_coordinator
-                .process_instance_id()
-                .await;
-            let start_params = StartManagedTransitionParams {
-                contract_version: MANAGED_AUTH_TRANSITION_CONTRACT_VERSION,
-                transition_id: "adopt-and-reset-plugins-auth-mode".to_owned(),
-                process_instance_id,
-                intent: ManagedTransitionIntent::AdoptManagedAuth,
-                expected_auth_revision: 0,
-                expected_transition_revision: 0,
-                expected_auth_fingerprint: Some(
-                    codex_login::AuthManager::managed_account_fingerprint("prior-managed-account"),
-                ),
-                intended_result_auth_fingerprint: Some(
-                    codex_login::AuthManager::managed_account_fingerprint(
-                        "managed-adoption-account",
-                    ),
-                ),
-            };
-
-            // A real managed account lands on disk before Adopting reads
-            // it -- the same fixture builder the rest of this app-server
-            // test suite already relies on for genuine ChatGPT auth.
-            app_test_support::write_chatgpt_auth(
-                harness._codex_home.path(),
-                app_test_support::ChatGptAuthFixture::new("access-token")
-                    .account_id("managed-adoption-account")
-                    .plan_type("enterprise"),
-                codex_config::types::AuthCredentialsStoreMode::File,
-            )
-            .expect("write real chatgpt auth.json for adoption");
-
-            let status = harness
-                .processor
-                .managed_transition_coordinator
-                .start_dispatch(start_params, /*caller_authorized*/ true)
-                .await;
-            let StartManagedTransitionResponse::Accepted { status } = status else {
-                panic!("expected the real production coordinator to accept and complete adoption");
-            };
-            assert_eq!(
-                status.phase,
-                codex_app_server_protocol::ManagedTransitionPhase::Succeeded
-            );
-            assert_eq!(
-                (
-                    status.prior_auth_fingerprint,
-                    status.result_auth_fingerprint
-                ),
-                (
-                    Some(AuthManager::managed_account_fingerprint(
-                        "prior-managed-account"
-                    )),
-                    Some(AuthManager::managed_account_fingerprint(
-                        "managed-adoption-account"
-                    )),
-                )
-            );
-
-            assert_eq!(
-                harness
-                    .processor
-                    .thread_manager_for_tests()
-                    .plugins_manager()
-                    .auth_mode(),
-                Some(codex_protocol::auth::AuthMode::Chatgpt),
-                "plugins must still read the adopted account's mode from the shared manager"
-            );
-
-            harness.shutdown().await;
-            Ok(())
-        },
-    )
+async fn build_test_processor_for_retirement_with_auth(
+    config: Arc<Config>,
+    auth_manager: Arc<AuthManager>,
+) -> (
+    Arc<MessageProcessor>,
+    mpsc::Receiver<crate::outgoing_message::OutgoingEnvelope>,
+) {
+    let (outgoing_tx, outgoing_rx) = mpsc::channel(16);
+    let config_manager = ConfigManager::new(
+        config.codex_home.to_path_buf(),
+        Vec::new(),
+        LoaderOverrides::with_managed_config_path_for_tests(
+            config.codex_home.join("managed_config.toml").to_path_buf(),
+        ),
+        /*strict_config*/ false,
+        CloudConfigBundleLoader::default(),
+        Arg0DispatchPaths::default(),
+        Arc::new(codex_config::NoopThreadConfigLoader),
+    );
+    let analytics_events_client = analytics_events_client_from_config(
+        Arc::clone(&auth_manager),
+        config.as_ref(),
+        /*runtime_auth_slot*/ None,
+    );
+    let outgoing = Arc::new(OutgoingMessageSender::new(
+        outgoing_tx,
+        analytics_events_client.clone(),
+    ));
+    let processor = Arc::new(MessageProcessor::new(MessageProcessorArgs {
+        managed_transition_control_socket_endpoint: None,
+        managed_transition_process_instance_id: None,
+        telemetry_reset: Default::default(),
+        control_endpoint: None,
+        cloud_skill_provider: None,
+        outgoing,
+        analytics_events_client,
+        arg0_paths: Arg0DispatchPaths::default(),
+        startup_cwd: Some(config.cwd.to_path_buf()),
+        config,
+        config_manager,
+        environment_manager: Arc::new(EnvironmentManager::default_for_tests()),
+        feedback: CodexFeedback::new(),
+        log_db: None,
+        state_db: None,
+        config_warnings: Vec::new(),
+        startup_warnings_tx: mpsc::unbounded_channel().0,
+        session_source: SessionSource::VSCode,
+        user_verification: Arc::new(crate::user_verification::Service::new(Arc::clone(
+            &auth_manager,
+        ))),
+        auth_manager,
+        runtime_auth_slot: None,
+        installation_id: "11111111-1111-4111-8111-111111111111".to_string(),
+        code_mode_session_provider: None,
+        rpc_transport: AppServerRpcTransport::Stdio,
+        remote_control_handle: None,
+        // This fixture observes retirement, not network plugin warmup.
+        plugin_startup_tasks: None,
+    }));
+    (processor, outgoing_rx)
 }
 
-#[path = "message_processor_recovery_tests.rs"]
-mod recovery_tests;
+async fn build_test_processor_for_retirement(
+    config: Arc<Config>,
+) -> (
+    Arc<MessageProcessor>,
+    mpsc::Receiver<crate::outgoing_message::OutgoingEnvelope>,
+) {
+    let auth = AuthManager::shared_from_config(config.as_ref(), false)
+        .await
+        .expect("create test auth manager");
+    build_test_processor_for_retirement_with_auth(config, auth).await
+}
 
-#[path = "message_processor_recovery_compatibility_tests.rs"]
-mod recovery_compatibility_tests;
+#[tokio::test]
+async fn production_reset_inventory_revokes_hosted_declaration_authority() -> Result<()> {
+    use crate::hosted_mcp_endpoints::tests::Behavior;
+    use crate::hosted_mcp_endpoints::tests::CAPABILITY;
+    use crate::hosted_mcp_endpoints::tests::declare_params;
+    use crate::hosted_mcp_endpoints::tests::serve_proof;
+    use crate::hosted_mcp_endpoints::tests::thread_start_naming;
+    use crate::managed_transition::ResetInventory;
+    use codex_app_server_protocol::McpHostedEndpointDeclareResponse;
+    use codex_app_server_protocol::McpHostedEndpointRefusalReason;
 
-#[path = "message_processor_override_retirement_tests.rs"]
-mod override_retirement_tests;
+    let home = TempDir::new()?;
+    let mut config = build_test_config(home.path(), "http://127.0.0.1:1").await?;
+    config.features.disable(codex_features::Feature::Plugins)?;
+    let (processor, _outgoing) = build_test_processor_for_retirement(Arc::new(config)).await;
+    let (url, _hits) = serve_proof(Behavior::Answer).await;
+    let endpoints = &processor.hosted_mcp_endpoints;
+    endpoints
+        .admit_request(ConnectionId(1), &thread_start_naming(&url))
+        .expect("hosted attribution");
+    assert!(matches!(
+        endpoints
+            .declare(ConnectionId(1), declare_params(&url, CAPABILITY), || false)
+            .await,
+        McpHostedEndpointDeclareResponse::Declared { .. }
+    ));
+    let custody = processor
+        .thread_manager
+        .mcp_manager()
+        .hosted_endpoint_custody();
+    assert_eq!(custody.census().declared, 1);
+
+    // Invoke the process-owned inventory used by the coordinator, not registry
+    // cleanup directly. Later account-dependent stages may refuse this fixture;
+    // hosted authority must already be revoked before either return outcome.
+    let reset = processor.reset_inventory.reset_all().await;
+    assert_eq!(custody.census().declared, 0, "reset result: {reset:?}");
+    for connection in [ConnectionId(1), ConnectionId(2)] {
+        assert_eq!(
+            endpoints
+                .declare(connection, declare_params(&url, CAPABILITY), || false)
+                .await,
+            McpHostedEndpointDeclareResponse::Refused {
+                reason: McpHostedEndpointRefusalReason::NotUsed,
+            },
+            "old capability must not restore cleared attribution"
+        );
+    }
+    processor
+        .drain_background_tasks_until(tokio::time::Instant::now() + Duration::from_secs(20))
+        .await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn production_connection_close_revokes_hosted_declaration_authority() -> Result<()> {
+    use crate::hosted_mcp_endpoints::tests::Behavior;
+    use crate::hosted_mcp_endpoints::tests::CAPABILITY;
+    use crate::hosted_mcp_endpoints::tests::declare_params;
+    use crate::hosted_mcp_endpoints::tests::serve_proof;
+    use crate::hosted_mcp_endpoints::tests::thread_start_naming;
+    use codex_app_server_protocol::McpHostedEndpointDeclareResponse;
+    use codex_app_server_protocol::McpHostedEndpointRefusalReason;
+
+    let home = TempDir::new()?;
+    let mut config = build_test_config(home.path(), "http://127.0.0.1:1").await?;
+    config.features.disable(codex_features::Feature::Plugins)?;
+    let (processor, _outgoing) = build_test_processor_for_retirement(Arc::new(config)).await;
+    let (url, _hits) = serve_proof(Behavior::Answer).await;
+    let endpoints = &processor.hosted_mcp_endpoints;
+    endpoints
+        .admit_request(ConnectionId(1), &thread_start_naming(&url))
+        .expect("hosted attribution");
+    assert!(matches!(
+        endpoints
+            .declare(ConnectionId(1), declare_params(&url, CAPABILITY), || false)
+            .await,
+        McpHostedEndpointDeclareResponse::Declared { .. }
+    ));
+    let custody = processor
+        .thread_manager
+        .mcp_manager()
+        .hosted_endpoint_custody();
+    assert_eq!(custody.census().declared, 1);
+
+    // Drive the real connection-close hook, including its RPC gate and
+    // hosted teardown, rather than calling the registry's release directly.
+    let session = ConnectionSessionState::new(crate::transport::ConnectionOrigin::Stdio);
+    processor.connection_closed(ConnectionId(1), &session).await;
+    assert_eq!(custody.census().declared, 0);
+    for connection in [ConnectionId(1), ConnectionId(2)] {
+        assert_eq!(
+            endpoints
+                .declare(connection, declare_params(&url, CAPABILITY), || false)
+                .await,
+            McpHostedEndpointDeclareResponse::Refused {
+                reason: McpHostedEndpointRefusalReason::NotUsed,
+            },
+            "old capability must not restore cleared attribution"
+        );
+    }
+    processor
+        .drain_background_tasks_until(tokio::time::Instant::now() + Duration::from_secs(20))
+        .await;
+    Ok(())
+}

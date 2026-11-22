@@ -9,6 +9,7 @@ use codex_app_server_protocol::CommandExecOutputStream;
 use codex_app_server_protocol::CommandExecParams;
 use codex_app_server_protocol::CommandExecResizeParams;
 use codex_app_server_protocol::CommandExecResponse;
+use codex_app_server_protocol::CommandExecSandboxCleanup;
 use codex_app_server_protocol::CommandExecTerminalSize;
 use codex_app_server_protocol::CommandExecTerminateParams;
 use codex_app_server_protocol::CommandExecWriteParams;
@@ -77,13 +78,16 @@ async fn command_exec_without_streams_can_be_terminated() -> Result<()> {
         .await?;
     assert_eq!(terminate_response.result, serde_json::json!({}));
 
-    let response: CommandExecResponse = mcp.read_response(command_request_id).await?;
+    let mut response: CommandExecResponse = mcp.read_response(command_request_id).await?;
     assert_ne!(
         response.exit_code, 0,
         "terminated command should not succeed"
     );
     assert_eq!(response.stdout, "");
     assert_eq!(response.stderr, "");
+    // Terminate tightens the cleanup deadline; the owner still collects the
+    // report before answering, so the response carries it.
+    take_sandbox_cleanup(&mut response, /*sandboxed*/ true);
 
     Ok(())
 }
@@ -103,7 +107,7 @@ async fn command_exec_without_process_id_keeps_buffered_compatibility() -> Resul
         .send_command_exec_request(CommandExecParams {
             command: vec![
                 "sh".to_string(),
-                "-c".to_string(),
+                "-lc".to_string(),
                 "printf 'legacy-out'; printf 'legacy-err' >&2".to_string(),
             ],
             process_id: None,
@@ -122,13 +126,15 @@ async fn command_exec_without_process_id_keeps_buffered_compatibility() -> Resul
         })
         .await?;
 
-    let response: CommandExecResponse = mcp.read_response(command_request_id).await?;
+    let mut response: CommandExecResponse = mcp.read_response(command_request_id).await?;
+    take_sandbox_cleanup(&mut response, /*sandboxed*/ true);
     assert_eq!(
         response,
         CommandExecResponse {
             exit_code: 0,
             stdout: "legacy-out".to_string(),
             stderr: "legacy-err".to_string(),
+            sandbox_cleanup: None,
         }
     );
 
@@ -152,7 +158,7 @@ async fn command_exec_env_overrides_merge_with_server_environment_and_support_un
         .send_command_exec_request(CommandExecParams {
             command: vec![
                 "/bin/sh".to_string(),
-                "-c".to_string(),
+                "-lc".to_string(),
                 "printf '%s|%s|%s|%s|%s|%s' \"$COMMAND_EXEC_BASELINE\" \"$COMMAND_EXEC_EXTRA\" \"${RUST_LOG-unset}\" \"$CODEX_HOME\" \"$OPENAI_FEDERATION_RULE_ID\" \"$openai_identity_token_file\"".to_string(),
             ],
             process_id: None,
@@ -186,55 +192,26 @@ async fn command_exec_env_overrides_merge_with_server_environment_and_support_un
         })
         .await?;
 
-    let response: CommandExecResponse = mcp.read_response(command_request_id).await?;
+    let mut response: CommandExecResponse = mcp.read_response(command_request_id).await?;
+    take_sandbox_cleanup(&mut response, /*sandboxed*/ true);
     assert_eq!(
         response,
         CommandExecResponse {
             exit_code: 0,
             stdout: format!("request|added|unset|{}||", codex_home.path().display()),
             stderr: String::new(),
+            sandbox_cleanup: None,
         }
     );
 
     Ok(())
 }
 
-#[derive(Clone, Copy)]
-enum CommandExecApplyPatchRollout {
-    Enabled,
-    Disabled,
-}
-
 #[tokio::test]
-async fn command_exec_apply_patch_preserves_line_endings_despite_client_override() -> Result<()> {
-    assert_command_exec_apply_patch_rollout(
-        CommandExecApplyPatchRollout::Enabled,
-        "0",
-        b"after\r\n",
-    )
-    .await
-}
-
-#[tokio::test]
-async fn command_exec_apply_patch_normalizes_line_endings_despite_stale_overrides() -> Result<()> {
-    assert_command_exec_apply_patch_rollout(CommandExecApplyPatchRollout::Disabled, "1", b"after\n")
-        .await
-}
-
-async fn assert_command_exec_apply_patch_rollout(
-    rollout: CommandExecApplyPatchRollout,
-    client_override: &str,
-    expected_contents: &[u8],
-) -> Result<()> {
+async fn command_exec_apply_patch_preserves_line_endings_by_default() -> Result<()> {
     let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri(), "never")?;
-
-    let feature_enabled = matches!(rollout, CommandExecApplyPatchRollout::Enabled);
-    insert_command_exec_config(
-        codex_home.path(),
-        &format!("[features]\napply_patch_preserve_line_endings = {feature_enabled}\n"),
-    )?;
 
     let workspace = TempDir::new()?;
     let file_path = workspace.path().join("crlf.txt");
@@ -262,7 +239,7 @@ async fn assert_command_exec_apply_patch_rollout(
             cwd: Some(workspace.path().to_path_buf()),
             env: Some(HashMap::from([(
                 CODEX_APPLY_PATCH_PRESERVE_LINE_ENDINGS_ENV_VAR.to_string(),
-                Some(client_override.to_string()),
+                Some("0".to_string()),
             )])),
             size: None,
             sandbox_policy: Some(SandboxPolicy::DangerFullAccess),
@@ -270,16 +247,18 @@ async fn assert_command_exec_apply_patch_rollout(
         })
         .await?;
 
-    let response: CommandExecResponse = mcp.read_response(request_id).await?;
+    let mut response: CommandExecResponse = mcp.read_response(request_id).await?;
+    take_sandbox_cleanup(&mut response, /*sandboxed*/ false);
     assert_eq!(
         response,
         CommandExecResponse {
             exit_code: 0,
             stdout: "Success. Updated the following files:\nM crlf.txt\n".to_string(),
             stderr: String::new(),
+            sandbox_cleanup: None,
         }
     );
-    assert_eq!(std::fs::read(file_path)?, expected_contents);
+    assert_eq!(std::fs::read(file_path)?, b"after\r\n");
     Ok(())
 }
 
@@ -298,7 +277,7 @@ async fn command_exec_accepts_permission_profile() -> Result<()> {
         .send_command_exec_request(CommandExecParams {
             command: vec![
                 "sh".to_string(),
-                "-c".to_string(),
+                "-lc".to_string(),
                 "printf 'profile'".to_string(),
             ],
             process_id: None,
@@ -317,13 +296,15 @@ async fn command_exec_accepts_permission_profile() -> Result<()> {
         })
         .await?;
 
-    let response: CommandExecResponse = mcp.read_response(command_request_id).await?;
+    let mut response: CommandExecResponse = mcp.read_response(command_request_id).await?;
+    take_sandbox_cleanup(&mut response, /*sandboxed*/ true);
     assert_eq!(
         response,
         CommandExecResponse {
             exit_code: 0,
             stdout: "profile".to_string(),
             stderr: String::new(),
+            sandbox_cleanup: None,
         }
     );
 
@@ -398,13 +379,15 @@ async fn command_exec_enforces_managed_deny_read_requirements() -> Result<()> {
         .last_mut()
         .expect("cat command includes a file path") = user_denied_path.to_string_lossy().into();
     let request_id = app_server.send_command_exec_request(user_request).await?;
-    let response: CommandExecResponse = app_server.read_response(request_id).await?;
+    let mut response: CommandExecResponse = app_server.read_response(request_id).await?;
+    take_sandbox_cleanup(&mut response, /*sandboxed*/ true);
     assert_eq!(
         response,
         CommandExecResponse {
             exit_code: 0,
             stdout: "user secret".to_string(),
             stderr: String::new(),
+            sandbox_cleanup: None,
         }
     );
 
@@ -462,7 +445,7 @@ async fn command_exec_permission_profile_starts_selected_network_proxy() -> Resu
         .send_command_exec_request(CommandExecParams {
             command: vec![
                 "sh".to_string(),
-                "-c".to_string(),
+                "-lc".to_string(),
                 "printf '%s' \"${CODEX_NETWORK_PROXY_ACTIVE-unset}\"".to_string(),
             ],
             process_id: None,
@@ -481,13 +464,15 @@ async fn command_exec_permission_profile_starts_selected_network_proxy() -> Resu
         })
         .await?;
 
-    let response: CommandExecResponse = mcp.read_response(command_request_id).await?;
+    let mut response: CommandExecResponse = mcp.read_response(command_request_id).await?;
+    take_sandbox_cleanup(&mut response, /*sandboxed*/ true);
     assert_eq!(
         response,
         CommandExecResponse {
             exit_code: 0,
             stdout: "1".to_string(),
             stderr: String::new(),
+            sandbox_cleanup: None,
         }
     );
 
@@ -510,7 +495,7 @@ async fn command_exec_permission_profile_does_not_reuse_default_network_proxy() 
         .send_command_exec_request(CommandExecParams {
             command: vec![
                 "sh".to_string(),
-                "-c".to_string(),
+                "-lc".to_string(),
                 "printf '%s' \"${CODEX_NETWORK_PROXY_ACTIVE-unset}\"".to_string(),
             ],
             process_id: None,
@@ -529,13 +514,15 @@ async fn command_exec_permission_profile_does_not_reuse_default_network_proxy() 
         })
         .await?;
 
-    let response: CommandExecResponse = mcp.read_response(command_request_id).await?;
+    let mut response: CommandExecResponse = mcp.read_response(command_request_id).await?;
+    take_sandbox_cleanup(&mut response, /*sandboxed*/ true);
     assert_eq!(
         response,
         CommandExecResponse {
             exit_code: 0,
             stdout: "unset".to_string(),
             stderr: String::new(),
+            sandbox_cleanup: None,
         }
     );
 
@@ -863,7 +850,7 @@ async fn command_exec_non_streaming_respects_output_cap() -> Result<()> {
         .send_command_exec_request(CommandExecParams {
             command: vec![
                 "sh".to_string(),
-                "-c".to_string(),
+                "-lc".to_string(),
                 "printf 'abcdef'; printf 'uvwxyz' >&2".to_string(),
             ],
             process_id: Some("cap-1".to_string()),
@@ -882,13 +869,15 @@ async fn command_exec_non_streaming_respects_output_cap() -> Result<()> {
         })
         .await?;
 
-    let response: CommandExecResponse = mcp.read_response(command_request_id).await?;
+    let mut response: CommandExecResponse = mcp.read_response(command_request_id).await?;
+    take_sandbox_cleanup(&mut response, /*sandboxed*/ true);
     assert_eq!(
         response,
         CommandExecResponse {
             exit_code: 0,
             stdout: "abcde".to_string(),
             stderr: "uvwxy".to_string(),
+            sandbox_cleanup: None,
         }
     );
 
@@ -1022,13 +1011,15 @@ async fn command_exec_pipe_streams_output_and_accepts_write() -> Result<()> {
     )
     .await?;
 
-    let response: CommandExecResponse = mcp.read_response(command_request_id).await?;
+    let mut response: CommandExecResponse = mcp.read_response(command_request_id).await?;
+    take_sandbox_cleanup(&mut response, /*sandboxed*/ true);
     assert_eq!(
         response,
         CommandExecResponse {
             exit_code: 0,
             stdout: String::new(),
             stderr: String::new(),
+            sandbox_cleanup: None,
         }
     );
 
@@ -1098,10 +1089,12 @@ async fn command_exec_tty_implies_streaming_and_reports_pty_output() -> Result<(
     )
     .await?;
 
-    let response: CommandExecResponse = mcp.read_response(command_request_id).await?;
+    let mut response: CommandExecResponse = mcp.read_response(command_request_id).await?;
     assert_eq!(response.exit_code, 0);
     assert_eq!(response.stdout, "");
     assert_eq!(response.stderr, "");
+    // The PTY spawn passes the custody descriptors as attached descriptors.
+    take_sandbox_cleanup(&mut response, /*sandboxed*/ true);
 
     Ok(())
 }
@@ -1277,6 +1270,216 @@ async fn command_exec_process_ids_are_connection_scoped_and_disconnect_terminate
         .await
         .context("failed to stop websocket app-server process")?;
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn command_exec_sandboxed_command_reports_complete_sandbox_cleanup() -> Result<()> {
+    let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri(), "never")?;
+    // A workspace without `.git`, `.agents` or `.codex`: the workspace profile
+    // protects those paths read-only, so the launcher installs synthetic
+    // mount targets for them and must remove them again.
+    let workspace = TempDir::new()?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+        .await?;
+
+    let command_request_id = mcp
+        .send_command_exec_request(CommandExecParams {
+            command: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "printf 'cleaned'".to_string(),
+            ],
+            process_id: None,
+            tty: false,
+            stream_stdin: false,
+            stream_stdout_stderr: false,
+            output_bytes_cap: None,
+            disable_output_cap: false,
+            disable_timeout: false,
+            timeout_ms: None,
+            cwd: Some(workspace.path().to_path_buf()),
+            env: None,
+            size: None,
+            sandbox_policy: None,
+            permission_profile: Some(
+                codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_WORKSPACE.to_string(),
+            ),
+        })
+        .await?;
+
+    let mut response: CommandExecResponse = mcp.read_response(command_request_id).await?;
+    let sandbox_cleanup = take_sandbox_cleanup(&mut response, /*sandboxed*/ true)
+        .context("a Linux sandbox launch reports its cleanup")?;
+    assert_eq!(
+        response,
+        CommandExecResponse {
+            exit_code: 0,
+            stdout: "cleaned".to_string(),
+            stderr: String::new(),
+            sandbox_cleanup: None,
+        }
+    );
+    assert_eq!(
+        (
+            sandbox_cleanup.state,
+            sandbox_cleanup.preserved_unproven,
+            sandbox_cleanup.timed_out,
+            sandbox_cleanup.joined,
+        ),
+        (
+            codex_app_server_protocol::CommandExecSandboxCleanupState::Complete,
+            0,
+            0,
+            true,
+        ),
+        "unexpected cleanup report: {sandbox_cleanup:?}"
+    );
+    assert!(
+        sandbox_cleanup.reaped > 0,
+        "expected synthetic targets to be installed and reaped: {sandbox_cleanup:?}"
+    );
+    // The report is collected before the response, so the workspace is
+    // already clean when the client sees it.
+    for name in [".git", ".agents", ".codex"] {
+        assert!(
+            !workspace.path().join(name).exists(),
+            "synthetic target {name} survived the launch"
+        );
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn command_exec_timeout_keeps_exit_code_124_separate_from_sandbox_cleanup() -> Result<()> {
+    let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri(), "never")?;
+    let workspace = TempDir::new()?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+        .await?;
+
+    let command_request_id = mcp
+        .send_command_exec_request(CommandExecParams {
+            command: vec!["sh".to_string(), "-c".to_string(), "sleep 30".to_string()],
+            process_id: None,
+            tty: false,
+            stream_stdin: false,
+            stream_stdout_stderr: false,
+            output_bytes_cap: None,
+            disable_output_cap: false,
+            disable_timeout: false,
+            timeout_ms: Some(200),
+            cwd: Some(workspace.path().to_path_buf()),
+            env: None,
+            size: None,
+            sandbox_policy: None,
+            permission_profile: Some(
+                codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_WORKSPACE.to_string(),
+            ),
+        })
+        .await?;
+
+    let mut response: CommandExecResponse = mcp.read_response(command_request_id).await?;
+    // The command timeout is reported only through the exit code.
+    assert_eq!(response.exit_code, 124);
+    let sandbox_cleanup = take_sandbox_cleanup(&mut response, /*sandboxed*/ true)
+        .context("a timed-out Linux sandbox launch still reports its cleanup")?;
+    // The cleanup outcome is its own fact, bounded by the cleanup deadline
+    // (tightened at the command timeout), and it must have been reported.
+    assert_ne!(
+        sandbox_cleanup.state,
+        codex_app_server_protocol::CommandExecSandboxCleanupState::Unreported,
+        "unexpected cleanup report: {sandbox_cleanup:?}"
+    );
+
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn command_exec_sandboxed_command_inherits_only_stdio_descriptors() -> Result<()> {
+    let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri(), "never")?;
+    let workspace = TempDir::new()?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+        .await?;
+
+    // Lists the sandboxed shell's own open descriptors (`[` and the glob run
+    // in the shell, so `/proc/self` is the shell). The glob briefly opens the
+    // fd directory itself; that entry is gone by the time it is tested, so
+    // only descriptors the shell inherited are printed.
+    let command_request_id = mcp
+        .send_command_exec_request(CommandExecParams {
+            command: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "for f in /proc/self/fd/*; do if [ -e \"$f\" ]; then printf '%s ' \"${f##*/}\"; fi; done".to_string(),
+            ],
+            process_id: None,
+            tty: false,
+            stream_stdin: false,
+            stream_stdout_stderr: false,
+            output_bytes_cap: None,
+            disable_output_cap: false,
+            disable_timeout: false,
+            timeout_ms: None,
+            cwd: Some(workspace.path().to_path_buf()),
+            env: None,
+            size: None,
+            sandbox_policy: None,
+            permission_profile: Some(
+                codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_WORKSPACE.to_string(),
+            ),
+        })
+        .await?;
+
+    let mut response: CommandExecResponse = mcp.read_response(command_request_id).await?;
+    // The launch held cleanup custody, yet neither the custody pipes nor
+    // bubblewrap's own descriptors reach the sandboxed command.
+    take_sandbox_cleanup(&mut response, /*sandboxed*/ true)
+        .context("a Linux sandbox launch reports its cleanup")?;
+    assert_eq!(
+        response,
+        CommandExecResponse {
+            exit_code: 0,
+            stdout: "0 1 2 ".to_string(),
+            stderr: String::new(),
+            sandbox_cleanup: None,
+        }
+    );
+
+    Ok(())
+}
+
+/// Takes the sandbox cleanup report off a response. Only a launch through the
+/// Linux sandbox launcher has cleanup custody, so a sandboxed command reports
+/// one exactly on Linux and an unsandboxed command never does.
+fn take_sandbox_cleanup(
+    response: &mut CommandExecResponse,
+    sandboxed: bool,
+) -> Option<CommandExecSandboxCleanup> {
+    let sandbox_cleanup = response.sandbox_cleanup.take();
+    assert_eq!(
+        sandbox_cleanup.is_some(),
+        sandboxed && cfg!(target_os = "linux"),
+        "unexpected sandbox cleanup report: {sandbox_cleanup:?}"
+    );
+    sandbox_cleanup
 }
 
 async fn read_command_exec_delta(

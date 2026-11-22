@@ -4,17 +4,18 @@
 //! newest thread state; exact model steps remain the correctness path.
 
 use super::*;
+use crate::McpRefreshReason;
 
 impl Session {
-    pub(crate) fn request_mcp_runtime_refresh(&self) {
+    pub(crate) fn request_mcp_runtime_refresh(&self, reason: McpRefreshReason) {
         // Plugin changes can reuse connections but still change their skill resources.
         self.services.mcp_runtime.invalidate_resource_caches();
-        self.request_mcp_runtime_reprojection();
+        self.request_mcp_runtime_reprojection(reason);
     }
 
     /// Reproject contributor state without invalidating cached MCP resources.
-    pub(crate) fn request_mcp_runtime_reprojection(&self) {
-        self.mark_mcp_runtime_dirty();
+    pub(crate) fn request_mcp_runtime_reprojection(&self, reason: McpRefreshReason) {
+        self.mark_mcp_runtime_dirty(reason);
         self.schedule_mcp_prewarm();
     }
 
@@ -47,11 +48,10 @@ impl Session {
                     break;
                 };
                 if auth_changed {
-                    current.mark_mcp_runtime_dirty();
+                    current.mark_mcp_runtime_dirty(McpRefreshReason::AuthChangeNotification);
                 }
-                // Background admission precedes the refresh semaphore and claim.
-                // Waiting for reopen must not block admitted foreground work or
-                // keep a session alive without any operation in progress.
+                // Admit this finite background operation before refresh locks.
+                // Reopen waits retain neither the session nor idle account work.
                 let account_work = loop {
                     let admission = current
                         .services

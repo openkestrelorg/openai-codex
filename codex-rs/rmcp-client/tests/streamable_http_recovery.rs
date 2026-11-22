@@ -1,5 +1,8 @@
 mod streamable_http_test_support;
 
+#[path = "streamable_http_recovery/telemetry_tests.rs"]
+mod telemetry_tests;
+
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
@@ -34,29 +37,6 @@ use streamable_http_test_support::spawn_streamable_http_server;
 const JSON_RPC_INTERNAL_ERROR_CODE: i64 = -32603;
 const SIMULATED_NO_RESPONSE_MESSAGE: &str =
     "http/request failed: error sending request for url (simulated no response)";
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-async fn failed_initialize_attempts_remain_in_the_retirement_census() -> anyhow::Result<()> {
-    let (_server, base_url) = spawn_streamable_http_server().await?;
-    arm_initialize_post_failure(&base_url, /*status*/ 502, /*remaining*/ 2).await?;
-    let client = create_client(&base_url).await?;
-    assert_eq!(
-        call_echo_tool(&client, "after-two-failures").await?,
-        expected_echo_result("after-two-failures")
-    );
-    let report = client
-        .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(5))
-        .await;
-    assert_eq!(
-        report.attempts,
-        vec![
-            (0, codex_rmcp_client::PhysicalRetirementOutcome::Complete),
-            (1, codex_rmcp_client::PhysicalRetirementOutcome::Complete),
-            (2, codex_rmcp_client::PhysicalRetirementOutcome::Complete),
-        ]
-    );
-    Ok(())
-}
 
 #[derive(Clone)]
 struct FailFirstInitializeHttpClient {
@@ -472,5 +452,30 @@ async fn streamable_http_non_session_failure_does_not_trigger_recovery() -> anyh
         .unwrap_err();
     assert!(second_error.to_string().contains("500"));
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn session_recovery_retirement_census_includes_both_physical_services() -> anyhow::Result<()>
+{
+    let (_server, base_url) = spawn_streamable_http_server().await?;
+    let client = create_client(&base_url).await?;
+    assert_eq!(
+        call_echo_tool(&client, "warmup").await?,
+        expected_echo_result("warmup")
+    );
+    arm_session_post_failure(&base_url, 404, 1, &[]).await?;
+    assert_eq!(
+        call_echo_tool(&client, "recovered").await?,
+        expected_echo_result("recovered")
+    );
+    let report = client
+        .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(5))
+        .await;
+    assert_eq!(report.attempts.len(), 2);
+    assert!(
+        report.is_complete(),
+        "old and new HTTP services both need exact close receipts: {report:?}"
+    );
     Ok(())
 }

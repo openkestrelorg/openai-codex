@@ -241,11 +241,14 @@ async fn production_claim_and_acquire_have_one_winner_in_both_lock_orders() {
         let settings = crate::request_processors::thread_settings_from_config_snapshot(
             &started.thread.config_snapshot().await,
         );
+        let (_drained_tx, drained_rx) = tokio::sync::watch::channel(false);
         let (_commands, generation) = entry.lock().await.set_listener(
             cancel_tx,
+            drained_rx,
             &started.thread,
             codex_file_watcher::WatchRegistration::default(),
             settings,
+            started.thread.config_snapshot().await.history_mode,
         );
         let watch = state
             .subscribe_to_retention(thread_id)
@@ -460,4 +463,80 @@ async fn observation_removal_cannot_erase_a_retirement_claim() {
     );
     assert_eq!(watch.borrow().generation, claim.generation);
     assert!(watch.borrow().retiring);
+}
+
+#[tokio::test]
+async fn atomic_connection_retention_never_adopts_retiring_authority() {
+    use crate::thread_state::ConnectionRetention;
+    use crate::thread_state::ConnectionRetentionOutcome;
+
+    let state = ThreadStateManager::new();
+    let thread_id = ThreadId::new();
+    let principal = RetentionPrincipalId::connection_owned();
+    let connection = ConnectionId(1);
+    state
+        .connection_initialized(
+            connection,
+            ConnectionCapabilities {
+                retention_principal: Some(principal),
+                ..ConnectionCapabilities::default()
+            },
+        )
+        .await;
+    state.thread_state(thread_id).await;
+    let generation = {
+        let mut locked = state.state.lock().await;
+        let record = locked.lifecycle.get_mut(&thread_id).unwrap();
+        record
+            .snapshot
+            .send_modify(|snapshot| snapshot.retiring = true);
+        record.snapshot.borrow().generation
+    };
+
+    // The current incarnation is retiring: its authority is closed.
+    assert_eq!(
+        state
+            .try_add_connection_to_thread_retaining(
+                thread_id,
+                connection,
+                ConnectionRetention::Requested(principal),
+            )
+            .await
+            .expect("live connection subscribes"),
+        ConnectionRetentionOutcome::Granted {
+            principal,
+            outcome: Err(RetentionAuthorityError::LifecycleClosed),
+        }
+    );
+
+    // A retiring row without a complete report survives observation removal.
+    // A later subscription for the same ID must not adopt that authority.
+    state.remove_thread_state(thread_id).await;
+    let successor = state
+        .try_add_connection_to_thread_retaining(
+            thread_id,
+            connection,
+            ConnectionRetention::Requested(principal),
+        )
+        .await
+        .expect("live connection subscribes");
+    assert_eq!(successor.minted_grant(), None);
+    assert!(matches!(
+        successor.evidence(),
+        Some(codex_app_server_protocol::ThreadRetentionAcquireResponse::Refused { .. })
+    ));
+    let locked = state.state.lock().await;
+    let record = locked
+        .lifecycle
+        .get(&thread_id)
+        .expect("retiring row is retained");
+    assert!(record.is_retiring());
+    assert!(record.report.is_none());
+    assert_eq!(record.snapshot.borrow().generation, generation);
+    assert!(
+        locked
+            .retention_grants_by_thread
+            .get(&thread_id)
+            .is_none_or(std::collections::HashMap::is_empty)
+    );
 }

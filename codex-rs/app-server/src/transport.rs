@@ -1,6 +1,5 @@
 use crate::message_processor::ConnectionSessionState;
 use crate::outgoing_message::OutgoingEnvelope;
-use crate::thread_state::RetentionPrincipalId;
 use codex_app_server_protocol::ExperimentalApi;
 use codex_app_server_protocol::ServerRequest;
 use std::collections::HashMap;
@@ -36,6 +35,7 @@ pub(crate) use codex_app_server_transport::start_remote_control;
 pub(crate) use codex_app_server_transport::start_stdio_connection;
 pub(crate) use codex_app_server_transport::start_websocket_acceptor;
 pub use codex_app_server_transport::take_remote_control_disabled_env;
+pub use codex_app_server_transport::verified_local_daemon_socket;
 
 pub(crate) struct ConnectionState {
     pub(crate) origin: ConnectionOrigin,
@@ -54,12 +54,10 @@ impl ConnectionState {
         outbound_experimental_api_enabled: Arc<AtomicBool>,
         outbound_opted_out_notification_methods: Arc<RwLock<HashSet<String>>>,
     ) -> Self {
-        // The transport boundary explicitly classifies the principal's owner;
-        // upstream connection authentication remains on its separate RPC gate.
         let mut session = ConnectionSessionState::with_provenance(
             origin,
             provenance,
-            RetentionPrincipalId::connection_owned(),
+            crate::thread_state::RetentionPrincipalId::connection_owned(),
         );
         let mut rpc_gate = crate::connection_rpc_gate::ConnectionRpcGate::new();
         rpc_gate.auth = auth;
@@ -96,7 +94,7 @@ pub(crate) fn trusted_interactive(
 
 /// Evaluates the server-owned entitlement half of Issue 05's managed-transition
 /// caller authorization (`CODEX-I05-S02-R005`). Deliberately narrower than
-/// [`trusted_interactive_provenance`]: an in-process embedder shares the
+/// ordinary interactive trust: an in-process embedder shares the
 /// server's own address space and has no independent, externally-verifiable
 /// process target to bind against, so it is not accepted here even though it
 /// is otherwise a trusted interactive caller for thread attachment. Only a
@@ -181,87 +179,6 @@ mod managed_transition_caller_tests {
     }
 }
 
-#[cfg(test)]
-mod provenance_tests {
-    use super::ConnectionOrigin;
-    use super::ConnectionProvenance;
-    use super::ConnectionState;
-    use super::trusted_interactive;
-    use super::trusted_interactive_provenance;
-    use crate::message_processor::InitializedConnectionSessionState;
-    use crate::thread_state::RetentionPrincipalOwner;
-    use codex_app_server_transport::PeerExecutableIdentity;
-    use codex_protocol::mcp::ClientMcpExtensions;
-    use std::collections::HashSet;
-    use std::sync::Arc;
-    use std::sync::RwLock;
-    use std::sync::atomic::AtomicBool;
-
-    #[test]
-    fn unproven_connections_cannot_become_interactive() {
-        assert!(!trusted_interactive_provenance(
-            ConnectionProvenance::Unproven
-        ));
-    }
-
-    #[test]
-    fn interactive_role_is_necessary_even_for_the_embedded_connection() {
-        assert!(!trusted_interactive(
-            /*interactive_client_requested*/ false,
-            ConnectionProvenance::InProcess,
-        ));
-        assert!(trusted_interactive(
-            /*interactive_client_requested*/ true,
-            ConnectionProvenance::InProcess,
-        ));
-    }
-
-    #[test]
-    fn interactive_role_cannot_promote_an_unproven_connection() {
-        assert!(!trusted_interactive(
-            /*interactive_client_requested*/ true,
-            ConnectionProvenance::Unproven,
-        ));
-    }
-
-    #[test]
-    fn normal_transport_construction_marks_a_verified_peer_connection_owned() {
-        let connection = ConnectionState::new(
-            ConnectionOrigin::WebSocket,
-            /*auth*/ None,
-            ConnectionProvenance::UnixPeerExecutable(PeerExecutableIdentity::FileIdentity {
-                device: 1,
-                inode: 2,
-            }),
-            Arc::new(AtomicBool::new(false)),
-            Arc::new(AtomicBool::new(false)),
-            Arc::new(RwLock::new(HashSet::new())),
-        );
-
-        connection
-            .session
-            .initialize(InitializedConnectionSessionState {
-                auth_observation_only: false,
-                experimental_api_enabled: true,
-                opted_out_notification_methods: HashSet::new(),
-                app_server_client_name: "test".to_string(),
-                client_version: "0.0.0".to_string(),
-                request_attestation: true,
-                interactive_client_requested: true,
-                client_mcp_extensions: ClientMcpExtensions::default(),
-            })
-            .expect("test session initializes once");
-        assert_eq!(
-            connection
-                .session
-                .retention_principal()
-                .map(super::super::thread_state::RetentionPrincipalId::owner),
-            Some(RetentionPrincipalOwner::ConnectionOwned),
-            "the normal transport seam must classify its server-minted principal explicitly"
-        );
-    }
-}
-
 pub(crate) struct OutboundConnectionState {
     pub(crate) initialized: Arc<AtomicBool>,
     pub(crate) experimental_api_enabled: Arc<AtomicBool>,
@@ -334,19 +251,40 @@ fn disconnect_connection(
     false
 }
 
+/// A reply (response or error) that did not reach its connection's writer.
+/// A disconnect request is not proof of observed peer closure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReplyDrop {
+    /// The connection is not, or is no longer, registered with the router.
+    Unregistered(ConnectionId),
+    /// Its registered writer refused the reply (closed, or full for a
+    /// disconnectable connection) and was removed.
+    WriterRefused {
+        connection_id: ConnectionId,
+        disconnectable: bool,
+    },
+}
+
+enum SendOutcome {
+    Queued,
+    Skipped,
+    Unregistered,
+    Refused { disconnectable: bool },
+}
+
 async fn send_message_to_connection(
     connections: &mut HashMap<ConnectionId, OutboundConnectionState>,
     connection_id: ConnectionId,
     message: OutgoingMessage,
     write_complete_tx: Option<tokio::sync::oneshot::Sender<()>>,
-) -> bool {
+) -> SendOutcome {
     let Some(connection_state) = connections.get(&connection_id) else {
         warn!("dropping message for disconnected connection: {connection_id:?}");
-        return false;
+        return SendOutcome::Unregistered;
     };
     let message = filter_outgoing_message_for_connection(connection_state, message);
     if should_skip_notification_for_connection(connection_state, &message) {
-        return false;
+        return SendOutcome::Skipped;
     }
 
     let writer = connection_state.writer.clone();
@@ -356,21 +294,30 @@ async fn send_message_to_connection(
     };
     if connection_state.can_disconnect() {
         match writer.try_send(queued_message) {
-            Ok(()) => false,
+            Ok(()) => SendOutcome::Queued,
             Err(mpsc::error::TrySendError::Full(_)) => {
                 warn!(
                     "disconnecting slow connection after outbound queue filled: {connection_id:?}"
                 );
-                disconnect_connection(connections, connection_id)
+                disconnect_connection(connections, connection_id);
+                SendOutcome::Refused {
+                    disconnectable: true,
+                }
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
-                disconnect_connection(connections, connection_id)
+                disconnect_connection(connections, connection_id);
+                SendOutcome::Refused {
+                    disconnectable: true,
+                }
             }
         }
     } else if writer.send(queued_message).await.is_err() {
-        disconnect_connection(connections, connection_id)
+        disconnect_connection(connections, connection_id);
+        SendOutcome::Refused {
+            disconnectable: false,
+        }
     } else {
-        false
+        SendOutcome::Queued
     }
 }
 
@@ -401,16 +348,29 @@ fn filter_outgoing_message_for_connection(
 pub(crate) async fn route_outgoing_envelope(
     connections: &mut HashMap<ConnectionId, OutboundConnectionState>,
     envelope: OutgoingEnvelope,
-) {
+) -> Option<ReplyDrop> {
     match envelope {
         OutgoingEnvelope::ToConnection {
             connection_id,
             message,
             write_complete_tx,
         } => {
-            let _ =
+            let is_reply = matches!(
+                message,
+                OutgoingMessage::Response(_) | OutgoingMessage::Error(_)
+            );
+            let outcome =
                 send_message_to_connection(connections, connection_id, message, write_complete_tx)
                     .await;
+            match outcome {
+                _ if !is_reply => None,
+                SendOutcome::Queued | SendOutcome::Skipped => None,
+                SendOutcome::Unregistered => Some(ReplyDrop::Unregistered(connection_id)),
+                SendOutcome::Refused { disconnectable } => Some(ReplyDrop::WriterRefused {
+                    connection_id,
+                    disconnectable,
+                }),
+            }
         }
         OutgoingEnvelope::Broadcast { message } => {
             let target_connections: Vec<ConnectionId> = connections
@@ -426,15 +386,17 @@ pub(crate) async fn route_outgoing_envelope(
                 })
                 .collect();
 
-            for connection_id in target_connections {
+            let messages = std::iter::repeat_n(message, target_connections.len());
+            for (connection_id, message) in target_connections.into_iter().zip(messages) {
                 let _ = send_message_to_connection(
                     connections,
                     connection_id,
-                    message.clone(),
+                    message,
                     /*write_complete_tx*/ None,
                 )
                 .await;
             }
+            None
         }
     }
 }
@@ -442,3 +404,7 @@ pub(crate) async fn route_outgoing_envelope(
 #[cfg(test)]
 #[path = "transport_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "router_reply_outcome_tests.rs"]
+mod router_reply_outcome_tests;

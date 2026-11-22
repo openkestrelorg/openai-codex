@@ -5,7 +5,6 @@ use std::ffi::OsStr;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
-use std::process::Command;
 use tempfile::TempDir;
 
 const NPM_PLUGIN_SOURCE_STAGING_DIR: &str = "plugins/.marketplace-plugin-source-staging";
@@ -35,6 +34,7 @@ fn materialize_npm_plugin_source_with_command(
     registry: Option<&str>,
     npm_command: &OsStr,
 ) -> Result<(AbsolutePathBuf, TempDir), String> {
+    crate::retirement::ensure_worker_running("npm source staging")?;
     let staging_root = codex_home.join(NPM_PLUGIN_SOURCE_STAGING_DIR);
     fs::create_dir_all(&staging_root).map_err(|err| {
         format!(
@@ -83,11 +83,12 @@ fn pack_npm_package(
     registry: Option<&str>,
     npm_command: &OsStr,
 ) -> Result<(), String> {
+    crate::retirement::ensure_worker_running("npm pack")?;
     let package_spec = version.map_or_else(
         || package.to_string(),
         |version| format!("{package}@{version}"),
     );
-    let mut command = Command::new(npm_command);
+    let mut command = codex_utils_process::background_command(npm_command);
     command
         .current_dir(destination)
         .arg("pack")
@@ -99,9 +100,7 @@ fn pack_npm_package(
     }
     command.arg("--").arg(package_spec);
 
-    let output = command
-        .output()
-        .map_err(|err| format!("failed to run npm pack: {err}"))?;
+    let output = crate::retirement::current_worker_output(&mut command, "npm pack")?;
     if output.status.success() {
         return Ok(());
     }
@@ -115,6 +114,7 @@ fn pack_npm_package(
 }
 
 fn find_npm_package_archive(destination: &Path) -> Result<PathBuf, String> {
+    crate::retirement::ensure_worker_running("npm archive discovery")?;
     let mut archives = fs::read_dir(destination)
         .map_err(|err| format!("failed to read npm pack destination: {err}"))?
         .filter_map(std::result::Result::ok)
@@ -134,6 +134,7 @@ fn find_npm_package_archive(destination: &Path) -> Result<PathBuf, String> {
 }
 
 fn read_npm_package_archive(archive_path: &Path) -> Result<Vec<u8>, String> {
+    crate::retirement::ensure_worker_running("npm archive read")?;
     let archive_size = fs::metadata(archive_path)
         .map_err(|err| format!("failed to inspect npm package archive: {err}"))?
         .len();
@@ -146,6 +147,7 @@ fn read_npm_package_archive(archive_path: &Path) -> Result<Vec<u8>, String> {
 }
 
 fn validate_npm_package_metadata(plugin_root: &Path, package: &str) -> Result<(), String> {
+    crate::retirement::ensure_worker_running("npm package validation")?;
     #[derive(Deserialize)]
     struct NpmPackageMetadata {
         name: String,

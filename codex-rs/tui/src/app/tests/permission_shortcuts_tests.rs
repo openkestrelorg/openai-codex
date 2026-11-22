@@ -24,7 +24,6 @@ async fn permission_shortcut_rejections_leave_state_unchanged() -> Result<()> {
             ));
         let original = RuntimePermissionProfileOverride::from_config(app.chat_widget.config_ref());
         let original_reviewer = app.config.approvals_reviewer;
-        let host = Arc::new(codex_app_server_client::InProcessHost::default());
         let client = crate::start_embedded_app_server_with(
             Arg0DispatchPaths::default(),
             app.config.clone(),
@@ -39,14 +38,12 @@ async fn permission_shortcut_rejections_leave_state_unchanged() -> Result<()> {
             Default::default(),
             |mut args| {
                 args.experimental_api = experimental_api;
-                codex_app_server_client::InProcessAppServerClient::start_in_host(
-                    Arc::clone(&host),
-                    args,
-                )
+                codex_app_server_client::InProcessAppServerClient::start(args)
             },
         )
         .await?;
         let mut app_server = AppServerSession::new(
+            crate::backend_id::BackendId::new(),
             codex_app_server_client::AppServerClient::InProcess(client),
             crate::app_server_session::ThreadParamsMode::Embedded,
         );
@@ -109,7 +106,11 @@ async fn permission_shortcut_confirms_without_persisting() -> Result<()> {
         RuntimePermissionProfileOverride::from_config(app.chat_widget.config_ref()),
         before
     );
-    assert!(app.pending_server_profiles.contains_key(&thread_id));
+    assert!(
+        app.agents_overview
+            .requested_permission_profiles
+            .contains_key(&thread_id)
+    );
     insta::assert_snapshot!(
         next_history_message(&mut events),
         @"• Permission selection requested: Read Only"

@@ -80,19 +80,26 @@ pub struct McpEventNotification {
     pub params: Option<Value>,
 }
 
+pub(crate) enum EventStreamCustody {
+    Private(crate::connection_pool::EventConnectionLease),
+    Borrowed(crate::rmcp_client::ManagedClient),
+}
+
 /// Owns an MCP event subscription and cancels its request when dropped.
 pub struct McpEventStream {
     request: Option<CancellableEventStreamRequest>,
+    custody: Option<EventStreamCustody>,
+    release_pool: crate::McpConnectionPool,
     runtime_handle: Handle,
     client: Option<Arc<RmcpClient>>,
-    connection: Option<Arc<McpServerConnection>>,
     cancel_event_streams_on_server_removal: watch::Receiver<()>,
 }
 
 impl McpEventStream {
     pub(crate) async fn open(
         client: Arc<RmcpClient>,
-        connection: Option<Arc<McpServerConnection>>,
+        custody: EventStreamCustody,
+        release_pool: crate::McpConnectionPool,
         cancel_event_streams_on_server_removal: watch::Receiver<()>,
         event_name: &str,
         arguments: &Value,
@@ -108,9 +115,10 @@ impl McpEventStream {
             .context("events/stream request failed")?;
         Ok(Self {
             request: Some(request),
+            custody: Some(custody),
+            release_pool,
             runtime_handle: Handle::current(),
             client: Some(client),
-            connection,
             cancel_event_streams_on_server_removal,
         })
     }
@@ -141,8 +149,7 @@ impl McpEventStream {
             }
             response = &mut request.handle.rx => {
                 self.request = None;
-                self.client = None;
-                self.connection = None;
+                self.release_with(std::future::ready(()));
 
                 match response {
                     Ok(Ok(_))
@@ -155,6 +162,35 @@ impl McpEventStream {
         }
     }
 
+    fn release_with(
+        &mut self,
+        before_close: impl std::future::Future<Output = ()> + Send + 'static,
+    ) {
+        let client = self.client.take();
+        match self.custody.take() {
+            Some(EventStreamCustody::Private(lease)) => lease.release_after(async move {
+                before_close.await;
+                if let Some(client) = &client {
+                    client.shutdown().await;
+                }
+                drop(client);
+            }),
+            Some(EventStreamCustody::Borrowed(managed)) => {
+                self.release_pool
+                    .spawn_event_release(&self.runtime_handle, async move {
+                        before_close.await;
+                        drop(client);
+                        // Retain the original ordinary lease through request cancellation.
+                        // Dropping it releases only this stream's holder.
+                        drop(managed);
+                    });
+            }
+            None => {
+                drop(client);
+            }
+        }
+    }
+
     fn cancel(&mut self) {
         if let Some(CancellableEventStreamRequest {
             handle,
@@ -162,17 +198,15 @@ impl McpEventStream {
         }) = self.request.take()
         {
             drop(notifications);
-            let client = self.client.take();
-            let connection = self.connection.take();
-            self.runtime_handle.spawn(async move {
+            self.release_with(async move {
                 let _ = tokio::time::timeout(
                     Duration::from_secs(30),
                     handle.cancel(Some("event subscription closed".to_string())),
                 )
                 .await;
-                drop(client);
-                drop(connection);
             });
+        } else {
+            self.release_with(std::future::ready(()));
         }
     }
 }
@@ -329,17 +363,27 @@ impl McpResourceClient {
         params: CodexAppsResourceListParams,
         access: crate::McpAttemptAccess<'_>,
     ) -> Result<McpResourcePage> {
+        let catalog = matches!(params.mime_type.as_str(), "mcp/plugin" | "mcp/skill");
         let params = serde_json::to_value(params)
             .context("failed to serialize Codex Apps resource params")?;
         let connections = self.runtime.latest_host_owned_codex_apps_connections()?;
-        let (managed, timeout) = connections
-            .client_by_name_with_authority(CODEX_APPS_MCP_SERVER_NAME, access)
-            .await?;
-        let result = managed
-            .client
-            .send_custom_request_with_timeout("resources/list", Some(params), timeout)
-            .await
-            .context("resources/list failed for `codex_apps`")?;
+        let list = async move |client: Arc<RmcpClient>, timeout| {
+            client
+                .send_custom_request_with_timeout("resources/list", Some(params), timeout)
+                .await
+                .context("resources/list failed for `codex_apps`")
+        };
+        let result =
+            if catalog && let Some((connection, timeout)) = connections.early_apps_discovery() {
+                connection
+                    .with_early_apps_client_with_authority(&self.runtime, timeout, list, access)
+                    .await?
+            } else {
+                let (managed, timeout) = connections
+                    .client_by_name_with_authority(CODEX_APPS_MCP_SERVER_NAME, access)
+                    .await?;
+                list(managed.client, timeout).await?
+            };
         let result = match result {
             ServerResult::ListResourcesResult(result) => result,
             ServerResult::CustomResult(result) => result
@@ -448,12 +492,10 @@ impl McpResourceClient {
         let (managed, _) = connections
             .client_by_name_with_authority(CODEX_APPS_MCP_SERVER_NAME, access)
             .await?;
-        let connection = connections
-            .connection_by_name(CODEX_APPS_MCP_SERVER_NAME)
-            .context("event server connection disappeared")?;
         McpEventStream::open(
-            managed.client,
-            Some(connection),
+            Arc::clone(&managed.client),
+            EventStreamCustody::Borrowed(managed),
+            connections.event_pool.clone(),
             cancel_event_streams_on_server_removal,
             event_name,
             arguments,

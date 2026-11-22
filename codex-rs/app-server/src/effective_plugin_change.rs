@@ -1,4 +1,6 @@
+use codex_core::McpRefreshReason;
 use std::collections::BTreeSet;
+use std::future::Future;
 use std::sync::Arc;
 
 use codex_app_server_protocol::ConfigBatchWriteParams;
@@ -14,79 +16,157 @@ use serde_json::json;
 use tracing::warn;
 
 use crate::config_manager::ConfigManager;
-use crate::managed_transition::AccountWorkPermits;
-use crate::processor_task_retirement::ProcessorTasks;
 use crate::request_processors::ConfigRequestProcessor;
 use crate::request_serialization::RequestSerializationAccess;
 use crate::request_serialization::RequestSerializationQueueKey;
 use crate::request_serialization::RequestSerializationQueues;
 
-/// Refresh plugin consumers and trust hooks from newly materialized Workspace + Listed bundles.
+/// Transfer only the invoking finite root; the reusable callback factory owns
+/// no account authority. Dropping the observer never detaches a managed original.
+/// Independent callers retain the provider bridge's ordinary Tokio behavior.
+pub(crate) fn spawn_plugin_change_task(
+    future: impl Future<Output = ()> + Send + 'static,
+) -> Result<Option<codex_model_provider::AuthTaskObservation>, codex_model_provider::AuthTaskFailure>
+{
+    codex_model_provider::spawn_provider_task(Box::pin(future))
+}
+
+/// Poll only with the operation's actual auth custody, and hold that work
+/// through completion. The weak ticket cannot keep its own census alive.
+async fn run_retained_plugin_change(
+    ticket: crate::processor_task_retirement::ProcessorTaskTicket,
+    work: Option<Box<dyn codex_extension_api::HostOperationWork>>,
+    originator: codex_otel::auth_storage::AuthStorageOriginator,
+    future: impl Future<Output = ()>,
+) {
+    let access = match work.as_deref() {
+        Some(work) => match work.auth_task_spawner() {
+            Ok(spawner) => codex_model_provider::AuthTaskAccess::Admitted(spawner),
+            Err(_) => {
+                let _ = ticket.mark_unverified();
+                return;
+            }
+        },
+        None => codex_model_provider::AuthTaskAccess::Ungated,
+    };
+    if codex_model_provider::with_auth_task_scope(
+        access,
+        originator.scope(async move {
+            let _work = work;
+            future.await;
+        }),
+    )
+    .await
+    .is_err()
+    {
+        let _ = ticket.mark_unverified();
+    }
+}
+
+/// Callback factories own no operation authority or strong ThreadManager.
+/// Each invocation captures finite work; queued trust effects keep it until
+/// their actual body completes, not merely until enqueue returns.
 pub(crate) fn effective_plugins_changed_callback(
     auth_manager: Arc<AuthManager>,
     thread_manager: Arc<ThreadManager>,
     config_manager: ConfigManager,
     config_processor: ConfigRequestProcessor,
     request_serialization_queues: RequestSerializationQueues,
-    tasks: ProcessorTasks,
-    account_work_permits: AccountWorkPermits,
+    tasks: crate::processor_task_retirement::ProcessorTaskTicket,
 ) -> Arc<dyn Fn(EffectivePluginsChange) + Send + Sync> {
+    let thread_manager = Arc::downgrade(&thread_manager);
+    let config_processor = config_processor.downgrade();
     Arc::new(move |change| {
-        // Cache invalidation is synchronous and account-safe while the barrier
-        // is closed. It must not be dropped with the account-bound async work:
-        // reset does not otherwise re-drive this callback after reopening.
-        thread_manager.plugins_manager().clear_cache();
-        thread_manager.skills_service().clear_cache();
-
-        let Some(permit) = account_work_permits.try_acquire() else {
+        let Some(thread_manager) = thread_manager.upgrade() else {
             return;
         };
-        // One admission covers every callback effect. Each actual async owner
-        // retains a share, including the queued future after enqueue returns.
-        let permit = Arc::new(permit);
-
+        // Cache invalidation is synchronous and safe during the account barrier.
+        thread_manager.plugins_manager().clear_cache();
+        thread_manager.skills_service().clear_cache();
+        let work = match crate::account_turn_admission::derive_request_work() {
+            Ok(Some(_)) => thread_manager
+                .capture_request_operation_work()
+                .map_err(|_| ()),
+            Ok(None) => thread_manager
+                .admit_background_operation_work()
+                .map_err(|_| ()),
+            Err(_) => Err(()),
+        };
+        let Ok(mut work) = work else {
+            return;
+        };
+        let refresh_work = if change.materialized_remote_plugins.is_empty() {
+            work.take()
+        } else {
+            match work
+                .as_deref()
+                .map(codex_extension_api::HostOperationWork::derive_operation)
+                .transpose()
+            {
+                Ok(work) => work,
+                Err(_) => {
+                    let _ = tasks.mark_unverified();
+                    return;
+                }
+            }
+        };
+        let originator = codex_otel::auth_storage::AuthStorageOriginator::current();
         let refresh_thread_manager = Arc::clone(&thread_manager);
-        let refresh_permit = Arc::clone(&permit);
-        if let Err(err) = tasks.spawn_unverified(async move {
-            let _permit = refresh_permit;
-            refresh_thread_manager.invalidate_mcp_runtimes().await;
-            refresh_thread_manager.refresh_hook_runtimes().await;
+        let reason = change.metadata_change_id.map_or(
+            McpRefreshReason::EffectivePluginsChanged,
+            McpRefreshReason::InstalledPluginMetadata,
+        );
+        let refresh_ticket = tasks.clone();
+        if let Err(error) = tasks.spawn(async move {
+            run_retained_plugin_change(refresh_ticket, refresh_work, originator, async move {
+                refresh_thread_manager
+                    .invalidate_mcp_runtimes_for(reason)
+                    .await;
+                refresh_thread_manager.refresh_hook_runtimes().await;
+            })
+            .await;
         }) {
-            warn!(?err, "effective-plugin refresh task admission closed");
+            warn!(?error, "effective plugin refresh admission closed");
         }
-
         if change.materialized_remote_plugins.is_empty() {
             return;
         }
-
-        let trust_auth_manager = Arc::clone(&auth_manager);
-        let trust_thread_manager = Arc::clone(&thread_manager);
-        let trust_config_manager = config_manager.clone();
-        let trust_config_processor = config_processor.clone();
-        let trust_request_serialization_queues = request_serialization_queues.clone();
-        if let Err(err) = tasks.spawn_unverified(async move {
-            trust_request_serialization_queues
-                .enqueue_background(
+        let Some(config_processor) = config_processor.upgrade() else {
+            return;
+        };
+        let auth_manager = Arc::clone(&auth_manager);
+        let config_manager = config_manager.clone();
+        let queues = request_serialization_queues.clone();
+        let trust_ticket = tasks.clone();
+        let observer_ticket = tasks.clone();
+        if let Err(error) = tasks.spawn(async move {
+            let completed = queues
+                .enqueue_background_and_wait(
                     RequestSerializationQueueKey::Global("config"),
                     RequestSerializationAccess::Exclusive,
                     async move {
-                        let _permit = permit;
-                        if let Err(err) = trust_materialized_plugin_hooks(
-                            change.materialized_remote_plugins,
-                            &trust_auth_manager,
-                            &trust_thread_manager,
-                            &trust_config_manager,
-                            &trust_config_processor,
-                        )
-                        .await
-                        {
-                            warn!(error = %err, "failed to trust materialized plugin hooks");
-                        }
+                        run_retained_plugin_change(trust_ticket, work, originator, async move {
+                            if let Err(error) = trust_materialized_plugin_hooks(
+                                change.materialized_remote_plugins,
+                                &auth_manager,
+                                &thread_manager,
+                                &config_manager,
+                                &config_processor,
+                            )
+                            .await
+                            {
+                                warn!(%error, "failed to trust materialized plugin hooks");
+                            }
+                        })
+                        .await;
                     },
                 )
                 .await;
+            if completed.is_err() {
+                let _ = observer_ticket.mark_unverified();
+            }
         }) {
-            warn!(?err, "effective-plugin trust task admission closed");
+            warn!(?error, "effective plugin trust admission closed");
         }
     })
 }
@@ -140,14 +220,18 @@ pub(crate) async fn trust_materialized_plugin_hooks(
         .plugins_manager()
         .plugins_for_config(&config.plugins_config_input())
         .await;
-    let hooks = codex_hooks::list_hooks(codex_hooks::HooksConfig {
+    let hooks_config = codex_hooks::HooksConfig {
         feature_enabled: true,
         bypass_hook_trust: config.bypass_hook_trust,
         config_layer_stack: Some(config.config_layer_stack),
         plugin_hook_sources: plugin_outcome.effective_plugin_hook_sources(),
         plugin_hook_load_warnings: plugin_outcome.effective_plugin_hook_warnings(),
         ..Default::default()
-    });
+    };
+    let hooks =
+        codex_model_provider::run_blocking_call(move || codex_hooks::list_hooks(hooks_config))
+            .await
+            .map_err(|err| format!("hook discovery task failed: {err}"))?;
     if !hooks.warnings.is_empty() {
         warn!(
             warnings = ?hooks.warnings,

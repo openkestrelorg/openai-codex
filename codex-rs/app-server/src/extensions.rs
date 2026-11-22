@@ -32,6 +32,7 @@ use crate::thread_state::ThreadListenerCommand;
 use crate::thread_state::ThreadStateManager;
 
 pub(crate) struct ThreadExtensionDependencies {
+    pub(crate) sample_responses: Arc<crate::thread_sample::SampleResponseRegistry>,
     pub(crate) event_sink: Arc<dyn ExtensionEventSink>,
     pub(crate) auth_manager: Arc<AuthManager>,
     pub(crate) state_db: Option<StateDbHandle>,
@@ -40,6 +41,7 @@ pub(crate) struct ThreadExtensionDependencies {
     pub(crate) goal_service: Arc<GoalService>,
     pub(crate) environment_manager: Arc<EnvironmentManager>,
     pub(crate) executor_skill_provider: Arc<dyn codex_skills_extension::SkillProvider>,
+    pub(crate) cloud_skill_provider: Option<Arc<dyn codex_skills_extension::SkillProvider>>,
     pub(crate) git_attribution_base_url: String,
     pub(crate) http_client_factory: HttpClientFactory,
     /// Process-scoped queue shared by idle dispatch and app-server requests.
@@ -47,22 +49,12 @@ pub(crate) struct ThreadExtensionDependencies {
     pub(crate) turn_start_admission: Option<Arc<dyn TurnStartAdmission>>,
 }
 
-#[cfg(test)]
-thread_local! {
-    static TEST_TURN_CONTRIBUTOR: std::cell::RefCell<Option<Arc<dyn codex_extension_api::TurnLifecycleContributor>>> = const { std::cell::RefCell::new(None) };
-}
-
-#[cfg(test)]
-pub(crate) fn replace_test_turn_contributor(
-    contributor: Option<Arc<dyn codex_extension_api::TurnLifecycleContributor>>,
-) -> Option<Arc<dyn codex_extension_api::TurnLifecycleContributor>> {
-    TEST_TURN_CONTRIBUTOR.with(|slot| slot.replace(contributor))
-}
-
 pub(crate) fn thread_extensions(
+    config: &Config,
     dependencies: ThreadExtensionDependencies,
 ) -> Arc<ExtensionRegistry<Config>> {
     let ThreadExtensionDependencies {
+        sample_responses,
         event_sink,
         auth_manager,
         state_db,
@@ -71,12 +63,19 @@ pub(crate) fn thread_extensions(
         goal_service,
         environment_manager,
         executor_skill_provider,
+        cloud_skill_provider,
         git_attribution_base_url,
         http_client_factory,
         queue_service,
         turn_start_admission,
     } = dependencies;
     let mut builder = ExtensionRegistryBuilder::<Config>::with_event_sink(Arc::clone(&event_sink));
+    if config
+        .features
+        .enabled(codex_features::Feature::MultiEnvCopyFile)
+    {
+        codex_multi_env_copy_file::install(&mut builder);
+    }
     if let Some(admission) = turn_start_admission {
         builder.turn_start_admission(admission);
     }
@@ -84,7 +83,7 @@ pub(crate) fn thread_extensions(
         codex_queue_extension::install(&mut builder, queue_service);
     }
     codex_history_notes_extension::install(&mut builder, auth_manager.clone());
-    codex_core::install_agent_message_board(&mut builder, thread_manager.clone());
+    crate::install_agent_message_board(&mut builder, thread_manager.clone());
     if let Some(state_db) = state_db {
         codex_goal_extension::install_with_backend(
             &mut builder,
@@ -113,15 +112,24 @@ pub(crate) fn thread_extensions(
     codex_image_generation_extension::install(&mut builder, auth_manager, |config: &Config| {
         Some(config.codex_home.clone())
     });
-    let skill_providers = codex_skills_extension::SkillProviders::new()
+    let mut skill_providers = codex_skills_extension::SkillProviders::new()
         .with_executor_provider(executor_skill_provider)
         .with_host_provider(Arc::new(codex_skills_extension::HostSkillProvider::new()));
+    if let Some(provider) = cloud_skill_provider {
+        skill_providers = skill_providers.with_cloud_provider(provider);
+    }
     codex_skills_extension::install_with_providers_and_metrics(
         &mut builder,
         skill_providers,
         codex_otel::global(),
         |config: &Config| codex_skills_extension::SkillsExtensionConfig {
             include_instructions: config.include_skill_instructions,
+            catalog_deltas_enabled: config
+                .features
+                .enabled(codex_features::Feature::SkillCatalogDeltas),
+            omit_descriptions: config
+                .features
+                .enabled(codex_features::Feature::OmitSkillDescriptions),
             max_context_tokens: config.skill_max_context_tokens,
             bundled_skills_enabled: config.bundled_skills_enabled(),
             cloud_skill_enabled: config.cloud_skill_enabled,
@@ -130,17 +138,11 @@ pub(crate) fn thread_extensions(
                 .enabled(codex_features::Feature::SkillSearch),
         },
     );
-    // Release logical turn custody only after every other stop/abort callback,
-    // matching the terminal-event boundary rather than the start of teardown.
+    // Release logical turn custody only after every other stop/abort callback.
     builder.turn_lifecycle_contributor(Arc::new(
         crate::account_turn_admission::AccountTurnLifecycle,
     ));
-    #[cfg(test)]
-    TEST_TURN_CONTRIBUTOR.with(|slot| {
-        if let Some(contributor) = slot.borrow().as_ref() {
-            builder.turn_lifecycle_contributor(Arc::clone(contributor));
-        }
-    });
+    builder.model_request_contributor(sample_responses);
     Arc::new(builder.build())
 }
 
@@ -430,14 +432,13 @@ mod tests {
                 .connection_initialized(connection_id, ConnectionCapabilities::default())
                 .await;
         }
-        thread_state_manager
-            .try_ensure_connection_subscribed(
-                thread_id,
-                subscribed_connection,
-                /*experimental_raw_events*/ false,
-            )
-            .await
-            .expect("connection should be subscribed");
+        assert!(
+            thread_state_manager
+                .try_add_connection_to_thread(thread_id, subscribed_connection)
+                .await
+                .is_ok(),
+            "connection should be subscribed"
+        );
         let sink = app_server_extension_event_sink(outgoing, thread_state_manager);
 
         sink.emit_warning(ExtensionWarning {
@@ -496,14 +497,13 @@ mod tests {
             message: "catalog was shortened".to_string(),
         });
         tokio::task::yield_now().await;
-        thread_state_manager
-            .try_ensure_connection_subscribed(
-                thread_id,
-                subscribed_connection,
-                /*experimental_raw_events*/ false,
-            )
-            .await
-            .expect("connection should be subscribed");
+        assert!(
+            thread_state_manager
+                .try_add_connection_to_thread(thread_id, subscribed_connection)
+                .await
+                .is_ok(),
+            "connection should be subscribed"
+        );
 
         let envelope = timeout(Duration::from_secs(1), outgoing_rx.recv())
             .await
@@ -546,14 +546,13 @@ mod tests {
         thread_state_manager
             .connection_initialized(subscribed_connection, ConnectionCapabilities::default())
             .await;
-        thread_state_manager
-            .try_ensure_connection_subscribed(
-                thread_id,
-                subscribed_connection,
-                /*experimental_raw_events*/ false,
-            )
-            .await
-            .expect("connection should be subscribed");
+        assert!(
+            thread_state_manager
+                .try_add_connection_to_thread(thread_id, subscribed_connection)
+                .await
+                .is_ok(),
+            "connection should be subscribed"
+        );
         let (listener_command_tx, listener_command_rx) = mpsc::unbounded_channel();
         drop(listener_command_rx);
         thread_state_manager.register_listener_command_tx(thread_id, listener_command_tx);
@@ -630,5 +629,113 @@ mod tests {
                 },
             }),
         }
+    }
+}
+
+#[cfg(test)]
+mod account_turn_lifecycle_tests {
+    use super::*;
+    use codex_extension_api::ExtensionData;
+    use codex_extension_api::TurnAbortInput;
+    use codex_extension_api::TurnStartInput;
+    use codex_extension_api::TurnStopInput;
+    use codex_protocol::host_turn_work::HostTurnWork;
+
+    #[tokio::test]
+    async fn production_registry_releases_turn_work_after_stop_and_abort() -> anyhow::Result<()> {
+        let home = tempfile::tempdir()?;
+        let config = crate::config_manager::ConfigManager::without_managed_config_for_tests(
+            home.path().to_path_buf(),
+        )
+        .load_latest_config(None)
+        .await?;
+        let registry = thread_extensions(
+            &config,
+            ThreadExtensionDependencies {
+                sample_responses: Arc::new(crate::thread_sample::SampleResponseRegistry::default()),
+                event_sink: Arc::new(codex_extension_api::NoopExtensionEventSink),
+                auth_manager: AuthManager::from_auth_for_testing(
+                    codex_login::CodexAuth::from_api_key("dummy"),
+                ),
+                state_db: None,
+                analytics_events_client: AnalyticsEventsClient::disabled(),
+                thread_manager: Weak::new(),
+                goal_service: Arc::new(GoalService::new()),
+                environment_manager: Arc::new(EnvironmentManager::default_for_tests()),
+                executor_skill_provider: Arc::new(
+                    codex_skills_extension::ExecutorSkillProvider::new_with_restriction_product(
+                        codex_protocol::protocol::SessionSource::Exec.restriction_product(),
+                    ),
+                ),
+                cloud_skill_provider: None,
+                git_attribution_base_url: config.chatgpt_base_url.clone(),
+                http_client_factory: config.http_client_factory(),
+                queue_service: None,
+                turn_start_admission: None,
+            },
+        );
+        // The production cleanup hook must be last, after other terminal callbacks.
+        let lifecycle = registry
+            .turn_lifecycle_contributors()
+            .last()
+            .expect("cleanup hook");
+        let permits = crate::account_work_permits::AccountWorkPermits::new();
+        let work = crate::account_turn_work::AccountTurnWork::default();
+        let mode = codex_protocol::config_types::CollaborationMode {
+            mode: codex_protocol::config_types::ModeKind::Default,
+            settings: codex_protocol::config_types::Settings {
+                model: "test-model".into(),
+                reasoning_effort: None,
+                developer_instructions: None,
+            },
+        };
+        for abort in [false, true] {
+            let session_store = ExtensionData::new("session");
+            let thread_store = ExtensionData::new("thread");
+            let turn_store = ExtensionData::new("turn");
+            let session = work.session(Box::pin(std::future::pending()));
+            let mut pending = session
+                .begin(permits.try_acquire().expect("permit"))
+                .expect("slot");
+            pending.bind_submission("turn");
+            Box::new(pending).retain_until_terminal();
+            thread_store.insert(session);
+            lifecycle
+                .on_turn_start(TurnStartInput {
+                    mcp_access: Ok(codex_mcp::McpAttemptAccess::Unscoped),
+                    turn_id: "turn",
+                    collaboration_mode: &mode,
+                    token_usage_at_turn_start: None,
+                    session_store: &session_store,
+                    thread_store: &thread_store,
+                    turn_store: &turn_store,
+                })
+                .await;
+            assert_eq!(permits.admitted_count(), 1);
+            if abort {
+                lifecycle
+                    .on_turn_abort(TurnAbortInput {
+                        reason: codex_protocol::protocol::TurnAbortReason::Interrupted,
+                        session_store: &session_store,
+                        thread_store: &thread_store,
+                        turn_store: &turn_store,
+                    })
+                    .await;
+            } else {
+                lifecycle
+                    .on_turn_stop(TurnStopInput {
+                        session_store: &session_store,
+                        thread_store: &thread_store,
+                        turn_store: &turn_store,
+                    })
+                    .await;
+            }
+            assert_eq!(
+                permits.admitted_count(),
+                0,
+                "terminal callback must release work while thread lives"
+            );
+        }
+        Ok(())
     }
 }

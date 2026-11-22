@@ -1,6 +1,8 @@
 #![recursion_limit = "256"]
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 
+use crate::standalone_shutdown::STANDALONE_STAGE_CAPS;
+use crate::standalone_shutdown::StandaloneShutdownOwner;
 use codex_arg0::Arg0DispatchPaths;
 use codex_code_mode::CodeModeSessionProvider;
 use codex_code_mode::GrpcCodeModeSessionProvider;
@@ -13,10 +15,13 @@ use codex_login::AuthManager;
 #[cfg(debug_assertions)]
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_cli::CliConfigOverrides;
+use futures::FutureExt;
+use futures::future::BoxFuture;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::io::ErrorKind;
 use std::io::Result as IoResult;
+use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::RwLock;
@@ -53,6 +58,7 @@ use codex_app_server_protocol::JSONRPCMessage;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::TextPosition as AppTextPosition;
 use codex_app_server_protocol::TextRange as AppTextRange;
+use codex_app_server_transport::WebSocketCompression;
 use codex_app_server_transport::daemon_recovery_file_path;
 use codex_config::ConfigLayerSource;
 use codex_config::ConfigLoadError;
@@ -78,11 +84,12 @@ use tracing::info;
 use tracing::warn;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::Layer;
+use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::registry::Registry;
 use tracing_subscriber::util::SubscriberInitExt;
 
-const SQLITE_RECOVERY_CONFIG_WARNING_SUMMARY: &str = "Codex rebuilt its local database.";
+const SQLITE_RECOVERY_CONFIG_WARNING_SUMMARY: &str = "Codex rebuilt its local database";
 
 fn is_unsupported_untrusted_approval_policy_error(err: &std::io::Error) -> bool {
     err.get_ref().is_some_and(
@@ -92,20 +99,35 @@ fn is_unsupported_untrusted_approval_policy_error(err: &std::io::Error) -> bool 
     )
 }
 
+pub use codex_agent_message_board_host::delete_agent_message_boards;
+pub use codex_agent_message_board_host::install_agent_message_board;
+
 mod account_dependency;
 mod account_operation_work;
 mod account_turn_admission;
 mod account_turn_work;
+mod account_work_permits;
 mod analytics_utils;
 mod app_info;
 mod app_server_tracing;
 mod attestation;
 mod auth_mode;
+mod auth_task_work;
 mod bespoke_event_handling;
 mod code_mode_host;
 mod codex_home_metrics;
 mod command_exec;
 mod config_layer;
+#[cfg(test)]
+mod core_auth_task_tests;
+mod managed_reset;
+mod managed_target_record;
+mod managed_transition;
+mod otel_reset_control;
+mod startup_config;
+pub use startup_config::StartupConfigArgs;
+pub use startup_config::print_startup_config;
+
 mod config_manager;
 mod config_manager_service;
 mod connection_cleanup;
@@ -122,12 +144,12 @@ mod filters;
 mod fs_watch;
 mod fuzzy_file_search;
 mod gateway_oauth_notifications;
+mod hosted_mcp_endpoints;
 mod image_url;
 pub mod in_process;
 mod log_write_warning;
-mod managed_reset;
-mod managed_target_record;
-mod managed_transition;
+#[cfg(unix)]
+mod managed_daemon;
 mod mcp_config_identity;
 mod mcp_refresh;
 mod message_processor;
@@ -135,15 +157,19 @@ mod model_catalog;
 mod models;
 mod models_refresh_worker;
 mod notification_media;
+mod otel_config;
 mod otel_reloader;
-mod otel_reset_control;
 mod outgoing_message;
 mod plugin_config_reload;
 mod processor_task_retirement;
 mod request_processors;
 mod request_serialization;
 mod server_request_error;
+mod shutdown_intake;
 mod skills_watcher;
+mod standalone_shutdown;
+mod startup_warnings;
+mod thread_sample;
 mod thread_state;
 mod thread_status;
 mod transport;
@@ -160,6 +186,7 @@ pub use crate::transport::AppServerTransport;
 pub use crate::transport::RemoteControlStartupMode;
 pub use crate::transport::app_server_control_socket_path;
 pub use crate::transport::take_remote_control_disabled_env;
+pub use crate::transport::verified_local_daemon_socket;
 pub use codex_app_server_transport::PeerExecutableIdentity;
 
 const LOG_FORMAT_ENV_VAR: &str = "LOG_FORMAT";
@@ -174,6 +201,187 @@ enum LogFormat {
 }
 
 type StderrLogLayer = Box<dyn Layer<Registry> + Send + Sync + 'static>;
+
+fn stderr_span_events() -> FmtSpan {
+    FmtSpan::NEW | FmtSpan::CLOSE
+}
+
+/// Delivery accounting for a reply the router could not queue. Positively
+/// closed recipients (a websocket `Closed`, or stdio EPIPE) count as
+/// undeliverable after disconnect. Anything else (a stdio writer gone without
+/// a positive close, e.g. after SIGTERM) is abandoned, which is incomplete.
+fn account_reply_drop(
+    expiry: &codex_app_server_transport::OwnerExpiry,
+    refused_without_close: &mut HashSet<ConnectionId>,
+    drop: crate::transport::ReplyDrop,
+) {
+    match drop {
+        crate::transport::ReplyDrop::WriterRefused {
+            connection_id,
+            disconnectable: false,
+        } => {
+            refused_without_close.insert(connection_id);
+            expiry.record_dropped_output(/*messages*/ 1, /*bytes*/ 0);
+        }
+        crate::transport::ReplyDrop::WriterRefused {
+            disconnectable: true,
+            ..
+        } => expiry.record_undeliverable_after_disconnect(/*messages*/ 1, /*bytes*/ 0),
+        crate::transport::ReplyDrop::Unregistered(connection_id) => {
+            if refused_without_close.contains(&connection_id) {
+                expiry.record_dropped_output(/*messages*/ 1, /*bytes*/ 0);
+            } else {
+                expiry.record_undeliverable_after_disconnect(/*messages*/ 1, /*bytes*/ 0);
+            }
+        }
+    }
+}
+
+/// Production stages of the standalone drain (see `standalone_shutdown`).
+/// Retained by the owner after the drain: processor, retirement ticket and
+/// any parked connection cleanup stay owned until the host returns.
+struct ProcessorShutdownStages {
+    processor: Arc<MessageProcessor>,
+    background_progress: crate::message_processor::SharedBackgroundProgress,
+    connections: Vec<(ConnectionId, ConnectionState)>,
+    cleanup: Option<ConnectionCleanupTasks>,
+    thread_retirement: Option<crate::request_processors::ProcessorThreadRetirement>,
+    expiry: codex_app_server_transport::OwnerExpiry,
+}
+
+impl standalone_shutdown::StandaloneStages for ProcessorShutdownStages {
+    fn bind_runtimes(&mut self, owner_deadline: tokio::time::Instant) -> BoxFuture<'static, bool> {
+        let binding = self
+            .processor
+            .bind_thread_shutdown_deadlines_now(owner_deadline);
+        if !binding.is_complete() {
+            warn!(
+                ?binding,
+                "standalone shutdown: drain-time runtime binding incomplete"
+            );
+            return futures::future::ready(false).boxed();
+        }
+        // A competing latch caller can reach this stage before the first
+        // edge finishes (or even starts) its callback. The owner drives this
+        // wait only until its original deadline. Keep the first census even
+        // if a later bind sees no remaining runtime.
+        let mut intake = self.processor.subscribe_intake_thread_binding();
+        async move {
+            let Ok(receipt) = intake.wait_for(Option::is_some).await else {
+                return false;
+            };
+            let clean = receipt.is_some_and(|binding| binding.is_complete());
+            if !clean {
+                warn!(binding = ?*receipt, "standalone shutdown: intake runtime binding incomplete");
+            }
+            clean
+        }
+        .boxed()
+    }
+
+    fn connections(&mut self, stage_deadline: tokio::time::Instant) -> BoxFuture<'static, bool> {
+        let Some(mut cleanup) = self.cleanup.take() else {
+            return futures::future::ready(false).boxed();
+        };
+        for (connection_id, connection_state) in self.connections.drain(..) {
+            let processor = Arc::clone(&self.processor);
+            let session = Arc::clone(&connection_state.session);
+            cleanup.spawn(async move {
+                processor
+                    .connection_closed_until(connection_id, &session, Some(stage_deadline))
+                    .await;
+            });
+        }
+        // Each close is cooperative: at the latched owner expiry it stops
+        // before its next unit and hands its owner back (no abort). A timed-out
+        // RPC drain leaves accepted work unproven, so the stage is incomplete.
+        // A request accepted before stdin EOF and never answered is output
+        // abandoned for a recipient that is still there.
+        let processor = Arc::clone(&self.processor);
+        let expiry = self.expiry.clone();
+        async move {
+            let drained = cleanup.drain().await;
+            let unanswered = processor.unanswered_after_half_close();
+            expiry.record_abandoned(unanswered, /*bytes*/ 0);
+            drained && processor.connection_rpc_drains_complete() && unanswered == 0
+        }
+        .boxed()
+    }
+
+    fn background(&mut self, stage_deadline: tokio::time::Instant) -> BoxFuture<'static, bool> {
+        let processor = Arc::clone(&self.processor);
+        let progress = Arc::clone(&self.background_progress);
+        async move {
+            let report = processor
+                .drain_background_tasks_recording(stage_deadline, &progress)
+                .await;
+            if !report.is_clean() {
+                warn!(?report, "standalone background shutdown incomplete");
+            }
+            report.is_clean()
+        }
+        .boxed()
+    }
+
+    fn background_timed_out(&mut self, stage_deadline: tokio::time::Instant) {
+        let census = self
+            .processor
+            .background_census_after_timeout(stage_deadline, &self.background_progress);
+        warn!(finished = ?census.finished, unfinished = ?census.unfinished,
+            "standalone background shutdown timed out; component census");
+        for (component, observation) in &census.registries {
+            warn!(component, pending = ?observation.pending, drain = ?observation.drain,
+                "standalone background shutdown timed out; registry census");
+        }
+    }
+
+    fn plugin_tasks(&mut self, stage_deadline: tokio::time::Instant) -> BoxFuture<'static, bool> {
+        let processor = Arc::clone(&self.processor);
+        async move {
+            let drain = processor.plugin_tasks_shutdown_until(stage_deadline).await;
+            if !drain.is_clean() {
+                // E.g. the curated-sync OS thread still in a git step: its
+                // retained join is reported incomplete, never as stopped.
+                warn!(?drain, "standalone plugin worker drain incomplete");
+            }
+            drain.is_clean()
+        }
+        .boxed()
+    }
+
+    fn threads(&mut self, stage_deadline: tokio::time::Instant) -> BoxFuture<'static, bool> {
+        // Permanent: closes construction admission and binds (tightens) each
+        // runtime's deadline before its Shutdown submission.
+        let processor = Arc::clone(&self.processor);
+        match self.processor.begin_thread_shutdown(stage_deadline) {
+            Ok(retirement) => {
+                self.thread_retirement = Some(retirement.clone());
+                async move {
+                    // Thread-clear contract (kept from the legacy path): a held
+                    // clear reservation is reported incomplete, never awaited.
+                    let no_held_clear = processor.report_held_clear_reservations().await;
+                    let report = retirement.wait().await;
+                    if !report.is_complete() {
+                        warn!(
+                            ?report,
+                            "standalone thread shutdown incomplete; custody retained"
+                        );
+                    }
+                    no_held_clear && report.is_complete()
+                }
+                .boxed()
+            }
+            Err(error) => {
+                warn!(?error, "standalone thread shutdown custody unavailable");
+                async move {
+                    let _ = processor.report_held_clear_reservations().await;
+                    false
+                }
+                .boxed()
+            }
+        }
+    }
+}
 
 /// Control-plane messages from the processor/transport side to the outbound router task.
 ///
@@ -198,6 +406,8 @@ enum OutboundControlEvent {
     Closed { connection_id: ConnectionId },
     /// Disconnect all connection-oriented clients during graceful restart.
     DisconnectAll,
+    /// Route queued drained replies, release writers, then stop.
+    CloseAllAfterQueued,
 }
 
 #[derive(Default)]
@@ -219,18 +429,13 @@ enum ShutdownSignal {
     GracefulOnly,
 }
 
-async fn abort_startup_transports(
-    shutdown: &CancellationToken,
-    handles: &mut Vec<JoinHandle<()>>,
-    record: &mut managed_target_record::ManagedTargetRecordSetup,
-) {
+/// Startup has not handed transport custody to the normal shutdown owner yet.
+/// Observe every aborted acceptor before retracting its published rendezvous.
+async fn abort_startup_transports(shutdown: &CancellationToken, handles: &mut Vec<JoinHandle<()>>) {
     shutdown.cancel();
     for handle in handles.drain(..) {
         handle.abort();
         let _ = handle.await;
-    }
-    if let Err(error) = record.remove_after_startup_failure() {
-        error!(kind = ?error.kind(), "failed to remove managed target record after startup failure");
     }
 }
 
@@ -461,7 +666,7 @@ pub async fn run_main(
     strict_config: bool,
     default_analytics_enabled: bool,
 ) -> IoResult<()> {
-    run_main_with_transport_options(
+    run_main_with_transport_report(
         arg0_paths,
         cli_config_overrides,
         loader_overrides,
@@ -472,16 +677,88 @@ pub async fn run_main(
         WebsocketAuthSettings::default(),
         AppServerRuntimeOptions::default(),
     )
-    .await
-    .map(|_| ())
+    .await?
+    .into_shutdown_result()
 }
 
 /// Reports whether shutdown finished or the managed daemon must exit without waiting for I/O.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppServerExit {
+    /// Every shutdown stage was positively proven complete within the owner deadline.
     Graceful,
     /// Executables should exit before dropping their runtime; libraries must not exit their host.
     Forced,
+    /// Shutdown ran to its owner deadline without proving cleanup finished: a
+    /// stage timed out or stayed incomplete, a task handed back its owner, or
+    /// a blocking worker was still running. Details are in the
+    /// `codex.app_server.standalone_shutdown` report. Never a clean exit:
+    /// executables should exit non-zero after a normal runtime drop (which may
+    /// still wait on that work); this is not a request to force-exit.
+    ShutdownIncomplete,
+}
+
+impl AppServerExit {
+    /// Shared consumer mapping (CLI, binaries, `run_main`, remote control).
+    /// `ShutdownIncomplete` becomes an error so it can never pass for a clean
+    /// exit. `Forced` is `Ok`, because the executable has already handled it.
+    pub fn into_shutdown_result(self) -> IoResult<()> {
+        match self {
+            AppServerExit::Graceful | AppServerExit::Forced => Ok(()),
+            AppServerExit::ShutdownIncomplete => Err(std::io::Error::other(
+                "app-server shutdown incomplete: cleanup was not proven within its deadline",
+            )),
+        }
+    }
+}
+
+/// The final standalone disposition and its first unproven cleanup obligation.
+/// The executable renders the bounded reason through its existing error path.
+/// Library callers can inspect the disposition without writing to stderr.
+#[derive(Debug)]
+pub struct AppServerExitReport {
+    disposition: AppServerExit,
+    unproven: Option<(&'static str, &'static str)>,
+}
+
+impl From<AppServerExit> for AppServerExitReport {
+    fn from(disposition: AppServerExit) -> Self {
+        Self {
+            disposition,
+            unproven: None,
+        }
+    }
+}
+
+impl AppServerExitReport {
+    fn incomplete(obligation: &'static str, name: &'static str) -> Self {
+        let label = if name.len() <= 64
+            && !name.is_empty()
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+        {
+            name
+        } else {
+            "unclassified"
+        };
+        Self {
+            disposition: AppServerExit::ShutdownIncomplete,
+            unproven: Some((obligation, label)),
+        }
+    }
+
+    pub fn disposition(&self) -> AppServerExit {
+        self.disposition
+    }
+
+    pub fn into_shutdown_result(self) -> IoResult<()> {
+        if let Some((obligation, label)) = self.unproven {
+            return Err(std::io::Error::other(format!(
+                "app-server shutdown incomplete: cleanup was not proven within its deadline ({obligation}={label})"
+            )));
+        }
+        self.disposition.into_shutdown_result()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -492,6 +769,8 @@ pub enum PluginStartupTasks {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppServerRuntimeOptions {
+    /// Optional host-owned frozen cloud skill catalog and resources, loaded once at startup.
+    pub cloud_skills_snapshot: Option<std::path::PathBuf>,
     pub code_mode_host_transport: CodeModeHostTransport,
     pub plugin_startup_tasks: PluginStartupTasks,
     pub remote_control_startup_mode: RemoteControlStartupMode,
@@ -502,6 +781,7 @@ pub struct AppServerRuntimeOptions {
 impl Default for AppServerRuntimeOptions {
     fn default() -> Self {
         Self {
+            cloud_skills_snapshot: None,
             code_mode_host_transport: CodeModeHostTransport::Local,
             plugin_startup_tasks: PluginStartupTasks::Start,
             remote_control_startup_mode: RemoteControlStartupMode::ResolvePersisted,
@@ -523,9 +803,56 @@ pub async fn run_main_with_transport_options(
     auth: WebsocketAuthSettings,
     runtime_options: AppServerRuntimeOptions,
 ) -> IoResult<AppServerExit> {
+    Ok(run_main_with_transport_report(
+        arg0_paths,
+        cli_config_overrides,
+        loader_overrides,
+        strict_config,
+        default_analytics_enabled,
+        transport,
+        session_source,
+        auth,
+        runtime_options,
+    )
+    .await?
+    .disposition())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn run_main_with_transport_report(
+    arg0_paths: Arg0DispatchPaths,
+    cli_config_overrides: CliConfigOverrides,
+    loader_overrides: LoaderOverrides,
+    strict_config: bool,
+    default_analytics_enabled: bool,
+    transport: AppServerTransport,
+    session_source: SessionSource,
+    auth: WebsocketAuthSettings,
+    runtime_options: AppServerRuntimeOptions,
+) -> IoResult<AppServerExitReport> {
+    let cloud_skill_provider = match runtime_options.cloud_skills_snapshot {
+        Some(path) => {
+            let provider = tokio::task::spawn_blocking(move || {
+                codex_skills_extension::FrozenCloudSkillProvider::from_file(&path)
+            })
+            .await
+            .map_err(std::io::Error::other)?
+            .map_err(|err| std::io::Error::new(ErrorKind::InvalidInput, err))?;
+            Some(Arc::new(provider) as Arc<dyn codex_skills_extension::SkillProvider>)
+        }
+        None => None,
+    };
     #[cfg(target_os = "windows")]
     let _registered_core = codex_windows_sandbox::registered_core_requested();
     let control_endpoint = mcp_control_endpoint_uri(&transport);
+    let mut managed_target_record =
+        managed_target_record::ManagedTargetRecordSetup::from_env(&transport)
+            .map_err(|_| std::io::Error::other("managed target record initialization failed"))?;
+    let managed_transition_control_socket_endpoint = managed_target_record.control_endpoint.clone();
+    let managed_daemon = matches!(&transport, AppServerTransport::UnixSocket { .. })
+        && runtime_options.managed_daemon;
+    #[cfg(unix)]
+    let nofile_limit_result = managed_daemon.then(managed_daemon::raise_nofile_limit);
     let loader_overrides = loader_overrides_with_test_user_config_file(
         loader_overrides,
         test_user_config_file_from_env(),
@@ -545,6 +872,7 @@ pub async fn run_main_with_transport_options(
         )
     })?;
     let codex_home = find_codex_home()?;
+    let startup_cwd = std::env::current_dir().ok();
     let local_runtime_paths = ExecServerRuntimeOptions::from_optional_paths(
         arg0_paths.codex_self_exe.clone(),
         arg0_paths.codex_linux_sandbox_exe.clone(),
@@ -559,24 +887,12 @@ pub async fn run_main_with_transport_options(
         arg0_paths.clone(),
         Arc::new(NoopThreadConfigLoader),
     );
-    let bootstrap_config = config_manager
-        .load_startup_config(/*fallback_cwd*/ None)
+    let startup = config_manager
+        .load_managed_startup_config(startup_cwd.clone())
         .await?;
-    let bootstrap_auth =
-        AuthManager::shared_from_config(&bootstrap_config, /*enable_codex_api_key_env*/ false)
-            .await
-            .map_err(std::io::Error::other)?;
-    config_manager.replace_cloud_config_bundle_loader(
-        bootstrap_auth,
-        bootstrap_config.chatgpt_base_url.clone(),
-        bootstrap_config.http_client_factory(),
-    );
     let mut config_warnings = Vec::new();
     let mut plugin_startup_config = PluginStartupConfig::Current;
-    let config = match config_manager
-        .load_latest_config(/*fallback_cwd*/ None)
-        .await
-    {
+    let config = match startup.config {
         Ok(config) => config,
         Err(err) if is_unsupported_untrusted_approval_policy_error(&err) => {
             return Err(err);
@@ -597,7 +913,13 @@ pub async fn run_main_with_transport_options(
             })?
         }
     };
+    config.validate_windows_mxc_requirement()?;
     config.auth_config().validate()?;
+    let auth_manager =
+        AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false)
+            .await
+            .map_err(std::io::Error::other)?;
+    config_manager.update_managed_config_loader(auth_manager.clone(), &config);
     config_manager
         .sync_default_client_residency_requirement()
         .await;
@@ -657,9 +979,6 @@ pub async fn run_main_with_transport_options(
             )
         })?,
     );
-    let mut managed_target_record =
-        managed_target_record::ManagedTargetRecordSetup::from_env(&transport)
-            .map_err(|_| std::io::Error::other("managed target record preparation failed"))?;
     let unix_socket_startup_lock = match &transport {
         AppServerTransport::UnixSocket { .. } => {
             let startup_lock_path = app_server_startup_lock_path(&codex_home)?;
@@ -668,6 +987,8 @@ pub async fn run_main_with_transport_options(
         }
         _ => None,
     };
+    let sqlite_warning_index = config_warnings.len();
+
     if let Ok(Some(err)) = check_execpolicy_for_warnings(&config.config_layer_stack).await {
         config_warnings.push(exec_policy_config_warning(&err));
     }
@@ -683,9 +1004,10 @@ pub async fn run_main_with_transport_options(
             range: None,
         });
     }
-    if let Some(warning) =
-        codex_core::config::system_bwrap_warning(config.permissions.permission_profile())
-    {
+    if let Some(warning) = codex_core::config::system_bwrap_warning(
+        &config.permissions.effective_permission_profile(),
+        &config.cwd,
+    ) {
         config_warnings.push(ConfigWarningNotification {
             summary: warning,
             details: None,
@@ -694,25 +1016,46 @@ pub async fn run_main_with_transport_options(
         });
     }
 
+    let runtime_auth_slot = config
+        .features
+        .enabled(Feature::RuntimeAgentInstances)
+        .then(codex_runtime_agent_instance::RuntimeAuthSlot::default);
+    let analytics_events_client = analytics_events_client_from_config(
+        Arc::clone(&auth_manager),
+        &config,
+        runtime_auth_slot.clone(),
+    );
+    let outgoing_message_sender = Arc::new(OutgoingMessageSender::new(
+        outgoing_tx,
+        analytics_events_client.clone(),
+    ));
     let feedback = CodexFeedback::new();
 
     // Install a simple subscriber so `tracing` output is visible. Users can
     // control the log level with `RUST_LOG` and switch to JSON logs with
     // `LOG_FORMAT=json`.
+    // SQLx enters the caller's span for each command. Skip enter/exit records
+    // that can block its worker on stderr while holding a write transaction.
+    // Preserve span boundaries, busy/idle timings, and explicit events.
     let stderr_fmt: StderrLogLayer = match log_format_from_env() {
         LogFormat::Json => tracing_subscriber::fmt::layer()
             .json()
-            .with_writer(std::io::stderr)
-            .with_span_events(tracing_subscriber::fmt::format::FmtSpan::FULL)
+            .with_writer(codex_app_server_daemon::stderr_writer)
+            .with_span_events(stderr_span_events())
             .with_filter(EnvFilter::from_default_env())
             .boxed(),
         LogFormat::Default => tracing_subscriber::fmt::layer()
-            .with_writer(std::io::stderr)
-            .with_span_events(tracing_subscriber::fmt::format::FmtSpan::FULL)
+            .with_writer(codex_app_server_daemon::stderr_writer)
+            .with_span_events(stderr_span_events())
             .with_filter(EnvFilter::from_default_env())
             .boxed(),
     };
 
+    let log_write_warning = log_write_warning::LogWriteWarningReporter::new(
+        feedback.clone(),
+        &outgoing_message_sender,
+        &config,
+    );
     let feedback_layer = feedback.logger_layer();
     let feedback_metadata_layer = feedback.metadata_layer();
     let (log_db_layer, log_db_reload) =
@@ -736,19 +1079,47 @@ pub async fn run_main_with_transport_options(
         Ok(state_db_init) => state_db_init,
         Err(err) => {
             return Err(std::io::Error::other(format!(
-                "failed to initialize sqlite state runtime under {}: {err}",
+                "failed to initialize sqlite state runtime under {}: {err:#}",
                 config.sqlite_config().home().display()
             )));
         }
     };
     let state_db = state_db_init.state_db;
     if let Some(recovery_notice) = state_db_init.recovery_notice {
-        config_warnings.push(ConfigWarningNotification {
-            summary: SQLITE_RECOVERY_CONFIG_WARNING_SUMMARY.to_string(),
-            details: Some(recovery_notice.details),
-            path: None,
-            range: None,
-        });
+        config_warnings.insert(
+            sqlite_warning_index,
+            ConfigWarningNotification {
+                summary: SQLITE_RECOVERY_CONFIG_WARNING_SUMMARY.to_string(),
+                details: Some(recovery_notice.details),
+                path: None,
+                range: None,
+            },
+        );
+    }
+
+    let log_db = state_db
+        .clone()
+        .map(|state_db| log_db::start(state_db, log_write_warning.clone()));
+    log_db_reload
+        .reload(log_db.clone())
+        .map_err(|_| std::io::Error::other("app-server log database subscriber unavailable"))?;
+    if let Some(error) = state_db.as_ref().and_then(|db| db.diagnostic_logs_error()) {
+        tracing::warn!(
+            event.name = "diagnostic_database_unavailable",
+            error,
+            "diagnostic database unavailable"
+        );
+    }
+
+    #[cfg(unix)]
+    if let Some(Err(err)) = nofile_limit_result {
+        warn!(%err, "failed to raise managed app-server file descriptor limit");
+    }
+    for warning in &config_warnings {
+        match &warning.details {
+            Some(details) => error!("{} {}", warning.summary, details),
+            None => error!("{}", warning.summary),
+        }
     }
     let remote_control_policy = if config
         .config_layer_stack
@@ -777,12 +1148,29 @@ pub async fn run_main_with_transport_options(
     // Remote enrollment must cancel before RPC drain without shutting down telemetry.
     let remote_control_shutdown_token = transport_shutdown_token.child_token();
     let mut transport_accept_handles = Vec::<JoinHandle<()>>::new();
+    // Keep physical custody in this host scope, outside the processor task.
+    // Transport EOF/control/signal intake records the first absolute deadline.
+    let (owner_latch, host_custody) = shutdown_intake::OwnerLatch::new();
+    let owner_latch = Arc::new(owner_latch);
+    shutdown_intake::install_intake_latch(&owner_latch);
+    let owner_expiry = owner_latch.expiry();
 
+    let websocket_compression = if config
+        .features
+        .enabled(Feature::AppServerWebSocketCompression)
+    {
+        WebSocketCompression::Zstd
+    } else {
+        WebSocketCompression::Plain
+    };
     let single_client_mode = matches!(&transport, AppServerTransport::Stdio);
     let graceful_signal_restart_enabled =
         runtime_options.install_shutdown_signal_handler && !single_client_mode;
-    let managed_daemon = matches!(&transport, AppServerTransport::UnixSocket { .. })
-        && runtime_options.managed_daemon;
+    if graceful_signal_restart_enabled {
+        shutdown_intake::spawn_signal_intake(owner_expiry.clone(), async {
+            shutdown_signal().await.is_ok()
+        });
+    }
     let mut app_server_client_name_rx = None;
 
     match &transport {
@@ -793,6 +1181,7 @@ pub async fn run_main_with_transport_options(
                 transport_event_tx.clone(),
                 stdio_client_name_tx,
                 runtime_options.install_shutdown_signal_handler,
+                owner_expiry.clone(),
             )
             .await?;
             transport_accept_handles.push(handle);
@@ -810,6 +1199,8 @@ pub async fn run_main_with_transport_options(
                 } else {
                     DaemonShutdownAccess::Disabled
                 },
+                websocket_compression,
+                host_custody.expiry(),
                 || {
                     managed_target_record
                         .publish_after_socket_bound()
@@ -827,6 +1218,8 @@ pub async fn run_main_with_transport_options(
                 transport_event_tx.clone(),
                 transport_shutdown_token.clone(),
                 policy_from_settings(&auth)?,
+                websocket_compression,
+                owner_expiry.clone(),
             )
             .await?;
             transport_accept_handles.push(accept_handle);
@@ -835,56 +1228,6 @@ pub async fn run_main_with_transport_options(
     }
     drop(unix_socket_startup_lock);
 
-    for warning in &config_warnings {
-        match &warning.details {
-            Some(details) => error!("{} {}", warning.summary, details),
-            None => error!("{}", warning.summary),
-        }
-    }
-    let auth_manager =
-        match AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false).await {
-            Ok(manager) => manager,
-            Err(error) => {
-                abort_startup_transports(
-                    &transport_shutdown_token,
-                    &mut transport_accept_handles,
-                    &mut managed_target_record,
-                )
-                .await;
-                return Err(std::io::Error::other(error));
-            }
-        };
-    config_manager.replace_cloud_config_bundle_loader(
-        auth_manager.clone(),
-        config.chatgpt_base_url.clone(),
-        config.http_client_factory(),
-    );
-    let analytics_events_client =
-        analytics_events_client_from_config(Arc::clone(&auth_manager), &config);
-    let outgoing_message_sender = Arc::new(OutgoingMessageSender::new(
-        outgoing_tx,
-        analytics_events_client.clone(),
-    ));
-    let log_write_warning = log_write_warning::LogWriteWarningReporter::new(
-        feedback.clone(),
-        &outgoing_message_sender,
-        &config,
-    );
-    // Start the database writer only after the target and dependent auth are ready.
-    let log_db = state_db
-        .clone()
-        .map(|state_db| log_db::start(state_db, log_write_warning.clone()));
-    if log_db_reload.reload(log_db.clone()).is_err() {
-        abort_startup_transports(
-            &transport_shutdown_token,
-            &mut transport_accept_handles,
-            &mut managed_target_record,
-        )
-        .await;
-        return Err(std::io::Error::other(
-            "app-server log database subscriber unavailable",
-        ));
-    }
     let remote_control_enabled = remote_control_policy == RemoteControlPolicy::Allowed
         && remote_control_explicitly_requested
         && state_db.is_some();
@@ -908,8 +1251,11 @@ pub async fn run_main_with_transport_options(
         ));
     }
 
-    let (remote_control_accept_handle, remote_control_handle) = match start_remote_control(
+    let remote_control_start = start_remote_control(
         RemoteControlStartConfig {
+            runtime_auth: runtime_auth_slot
+                .clone()
+                .map(|slot| (slot, config.runtime_auth_mode)),
             remote_control_url: config.chatgpt_base_url.clone(),
             installation_id: installation_id.clone(),
             policy: remote_control_policy,
@@ -921,16 +1267,15 @@ pub async fn run_main_with_transport_options(
         app_server_client_name_rx,
         remote_control_startup_mode,
     )
-    .await
-    {
-        Ok(handles) => handles,
+    .await;
+    let (remote_control_accept_handle, remote_control_handle) = match remote_control_start {
+        Ok(started) => started,
         Err(error) => {
-            abort_startup_transports(
-                &transport_shutdown_token,
-                &mut transport_accept_handles,
-                &mut managed_target_record,
-            )
-            .await;
+            abort_startup_transports(&transport_shutdown_token, &mut transport_accept_handles)
+                .await;
+            if let Err(rollback_error) = managed_target_record.remove_after_startup_failure() {
+                error!(kind = ?rollback_error.kind(), "failed to remove managed target record after startup failure");
+            }
             return Err(error);
         }
     };
@@ -971,23 +1316,33 @@ pub async fn run_main_with_transport_options(
         codex_home_metrics::spawn(&config, metrics.clone(), transport_shutdown_token.clone());
     }
 
-    let (telemetry_reset, otel_reloader_handle) = otel_reloader::spawn_managed(
+    let (telemetry_reset, otel_reloader_handle) = otel_reloader::spawn_managed_with_owner_deadline(
         otel,
         otel_routes,
         config_manager.clone(),
         Arc::clone(&auth_manager),
         default_analytics_enabled,
         transport_shutdown_token.clone(),
+        owner_latch.subscribe(),
     );
 
-    let outbound_handle = tokio::spawn(async move {
+    let router_expiry = owner_expiry.clone();
+    let outbound_router = async move {
         let mut outbound_connections = HashMap::<ConnectionId, OutboundConnectionState>::new();
+        // Writers that refused a reply without a positive close (e.g. stdio
+        // after SIGTERM). Later replies to them are abandoned, not undeliverable.
+        let mut refused_without_close = HashSet::<ConnectionId>::new();
+        let mut control_open = true;
         loop {
             tokio::select! {
                     biased;
-                    event = outbound_control_rx.recv() => {
+                    event = outbound_control_rx.recv(), if control_open => {
                         let Some(event) = event else {
-                            break;
+                            // Never drop queued replies because the control
+                            // side closed first: keep routing until the
+                            // outgoing channel itself closes.
+                            control_open = false;
+                            continue;
                         };
                         match event {
                             OutboundControlEvent::Opened {
@@ -1022,41 +1377,89 @@ pub async fn run_main_with_transport_options(
                                 }
                                 outbound_connections.clear();
                             }
+                            OutboundControlEvent::CloseAllAfterQueued => {
+                                // Replies enqueued before the drain finished
+                                // are routed first (FIFO), never dropped.
+                                while let Ok(envelope) = outgoing_rx.try_recv() {
+                                    if let Some(reply_drop) =
+                                        route_outgoing_envelope(&mut outbound_connections, envelope)
+                                            .await
+                                    {
+                                        account_reply_drop(
+                                            &router_expiry,
+                                            &mut refused_without_close,
+                                            reply_drop,
+                                        );
+                                    }
+                                }
+                                outbound_connections.clear();
+                                break;
+                            }
                         }
                     }
                     envelope = outgoing_rx.recv() => {
                     let Some(envelope) = envelope else {
                         break;
                     };
-                    route_outgoing_envelope(&mut outbound_connections, envelope).await;
+                    if let Some(reply_drop) =
+                        route_outgoing_envelope(&mut outbound_connections, envelope).await
+                    {
+                        account_reply_drop(&router_expiry, &mut refused_without_close, reply_drop);
+                    }
                 }
             }
         }
         info!("outbound router task exited (channel closed)");
+    };
+    // (b) Stops before its next route at owner expiry and hands its writers
+    // and queues back to the host owner; never aborted.
+    let outbound_handle = tokio::spawn({
+        let owner_expiry = owner_expiry.clone();
+        async move {
+            if let Err(refused) = owner_expiry.run("outbound_router", outbound_router).await {
+                error!("outbound router not driven: {refused}");
+            }
+        }
     });
 
     let recovery_file = daemon_recovery_file_path(&config.codex_home);
-    let processor_handle = tokio::spawn({
+    let daemon_settings_file = managed_daemon.then(|| {
+        config
+            .codex_home
+            .as_path()
+            .join("app-server-daemon/settings.json")
+    });
+    let processor_handle = standalone_shutdown::spawn_fenced_processor(owner_expiry.clone(), {
         let auth_manager = Arc::clone(&auth_manager);
         let initialize_notification_sender = outgoing_message_sender.clone();
         let outbound_control_tx = outbound_control_tx;
-        let processor = Arc::new(MessageProcessor::new(MessageProcessorArgs {
+        let (startup_warnings_tx, mut startup_warnings_rx) = mpsc::unbounded_channel();
+        let mut processor = MessageProcessor::new(MessageProcessorArgs {
             telemetry_reset,
+            managed_transition_control_socket_endpoint,
+            managed_transition_process_instance_id: managed_target_record
+                .process_instance_id
+                .clone(),
+            control_endpoint,
+            cloud_skill_provider,
             outgoing: outgoing_message_sender,
             analytics_events_client,
             arg0_paths,
             config: Arc::new(config),
+            startup_cwd,
             config_manager,
             environment_manager,
             feedback: feedback.clone(),
             log_db,
             state_db: state_db.clone(),
             config_warnings,
+            startup_warnings_tx,
             session_source,
             user_verification: Arc::new(crate::user_verification::Service::new(Arc::clone(
                 &auth_manager,
             ))),
             auth_manager,
+            runtime_auth_slot,
             installation_id,
             code_mode_session_provider,
             rpc_transport: analytics_rpc_transport(&transport),
@@ -1066,19 +1469,18 @@ pub async fn run_main_with_transport_options(
                 PluginStartupTasks::Start
             )
             .then_some(plugin_startup_config),
-            managed_transition_control_socket_endpoint: managed_target_record
-                .control_endpoint
-                .clone(),
-            managed_transition_process_instance_id: managed_target_record
-                .process_instance_id
-                .clone(),
-            control_endpoint,
-        }));
+        });
+        processor.remote_control_processor.daemon_settings_file = daemon_settings_file;
+        let processor = Arc::new(processor);
+        standalone_shutdown::register_processor_intake(&owner_latch, &processor);
         let mut thread_created_rx = processor.thread_created_receiver();
         let mut running_turn_count_rx = processor.subscribe_running_assistant_turn_count();
         let mut active_admissions_rx = processor.turn_admission.subscribe_active();
         let mut connections = HashMap::<ConnectionId, ConnectionState>::new();
-        let mut connection_cleanup_tasks = ConnectionCleanupTasks::new();
+        let mut connection_cleanup_tasks =
+            ConnectionCleanupTasks::with_expiry(owner_expiry.clone());
+        let owner_latch = Arc::clone(&owner_latch);
+        let owner_expired = owner_expiry.expired_token();
         let mut thread_listener_tasks = tokio::task::JoinSet::new();
         let mut remote_control_status_rx = remote_control_handle.status_receiver();
         let mut remote_control_status = remote_control_status_rx.borrow().clone();
@@ -1119,7 +1521,13 @@ pub async fn run_main_with_transport_options(
             let mut clients_disconnected = false;
             let mut shutdown_state = ShutdownState::default();
             let mut shutdown_signal_future = Box::pin(shutdown_signal());
+            let mut shutdown_sends = standalone_shutdown::ShutdownSends::default();
             let exit_reason = loop {
+                // First shutdown edge (signal or daemon shutdown): latch the
+                // owner before any graceful drain, which then consumes it.
+                if shutdown_state.requested() {
+                    owner_latch.latch();
+                }
                 // Sample submissions first: one can publish a running turn before
                 // releasing its permit, and shutdown must observe that new turn.
                 let active_admissions = *active_admissions_rx.borrow_and_update();
@@ -1134,15 +1542,28 @@ pub async fn run_main_with_transport_options(
                     }
                     let finished = snapshot_finished || shutdown_state.forced();
                     if finished {
+                        // Before cancelling: telemetry must see the owner.
+                        owner_latch.latch();
                         transport_shutdown_token.cancel();
                     }
                     if managed_daemon && shutdown_state.forced() {
                         break "forced_shutdown_requested";
                     }
                     if !clients_disconnected {
-                        let _ = outbound_control_tx
-                            .send(OutboundControlEvent::DisconnectAll)
-                            .await;
+                        let control = outbound_control_tx.clone();
+                        let disconnect = async move {
+                            control
+                                .send(OutboundControlEvent::DisconnectAll)
+                                .await
+                                .is_ok()
+                        };
+                        if shutdown_sends
+                            .submit(&owner_latch, "disconnect_all", disconnect)
+                            .await
+                            .is_none()
+                        {
+                            break "shutdown_deadline_expired";
+                        }
                         clients_disconnected = true;
                     }
                     if finished {
@@ -1151,6 +1572,10 @@ pub async fn run_main_with_transport_options(
                 }
 
                 tokio::select! {
+                    // The graceful drain consumes the same owner budget.
+                    () = owner_expired.cancelled(), if shutdown_state.requested() => {
+                        break "shutdown_deadline_expired";
+                    }
                     _ = &mut snapshot, if shutdown_state.requested() && active_admissions == 0 && !snapshot_finished => {
                         snapshot_finished = true;
                     }
@@ -1178,6 +1603,7 @@ pub async fn run_main_with_transport_options(
                     }
                     event = transport_event_rx.recv() => {
                         let Some(event) = event else {
+                            owner_latch.latch();
                             break "transport_channel_closed";
                         };
                         if ready_to_exit && !matches!(event, TransportEvent::DaemonShutdown) {
@@ -1193,8 +1619,8 @@ pub async fn run_main_with_transport_options(
                             TransportEvent::ConnectionOpened {
                                 connection_id,
                                 origin,
-                                auth,
                                 provenance,
+                                auth,
                                 writer,
                                 disconnect_sender,
                             } => {
@@ -1203,23 +1629,28 @@ pub async fn run_main_with_transport_options(
                                     Arc::new(AtomicBool::new(false));
                                 let outbound_opted_out_notification_methods =
                                     Arc::new(RwLock::new(HashSet::new()));
-                                if outbound_control_tx
-                                    .send(OutboundControlEvent::Opened {
-                                        connection_id,
-                                        writer,
-                                        disconnect_sender,
-                                        initialized: Arc::clone(&outbound_initialized),
-                                        experimental_api_enabled: Arc::clone(
-                                            &outbound_experimental_api_enabled,
-                                        ),
-                                        opted_out_notification_methods: Arc::clone(
-                                            &outbound_opted_out_notification_methods,
-                                        ),
+                                let control = outbound_control_tx.clone();
+                                let opened = OutboundControlEvent::Opened {
+                                    connection_id,
+                                    writer,
+                                    disconnect_sender,
+                                    initialized: Arc::clone(&outbound_initialized),
+                                    experimental_api_enabled: Arc::clone(
+                                        &outbound_experimental_api_enabled,
+                                    ),
+                                    opted_out_notification_methods: Arc::clone(
+                                        &outbound_opted_out_notification_methods,
+                                    ),
+                                };
+                                match shutdown_sends
+                                    .submit(&owner_latch, "connection_opened", async move {
+                                        control.send(opened).await.is_ok()
                                     })
                                     .await
-                                    .is_err()
                                 {
-                                    break "outbound_router_closed";
+                                    Some(true) => {}
+                                    Some(false) => break "outbound_router_closed",
+                                    None => break "shutdown_deadline_expired",
                                 }
                                 connections.insert(
                                     connection_id,
@@ -1238,19 +1669,51 @@ pub async fn run_main_with_transport_options(
                                     continue;
                                 };
                                 let stdio_closed = connection_state.origin == ConnectionOrigin::Stdio;
+                                if single_client_mode && stdio_closed {
+                                    // Stdio EOF is the shutdown edge: latch first.
+                                    owner_latch.latch();
+                                }
+                                // Closes admission (inbound) only. Requests read
+                                // but not admitted are refused explicitly.
                                 connection_state.session.rpc_gate.close().await;
-                                let outbound_closed = outbound_control_tx
-                                    .send(OutboundControlEvent::Closed { connection_id })
-                                    .await
-                                    .is_ok();
+                                let half_close_deadline =
+                                    (single_client_mode && stdio_closed).then(|| owner_latch.latch());
+                                // Stdin EOF closes only the inbound half: keep the
+                                // stdio output recipient registered so every accepted
+                                // reply is still written. Only a positive signal in the
+                                // writer (EPIPE/POLLHUP) means the recipient is gone.
+                                let outbound_closed = if stdio_closed {
+                                    Some(true)
+                                } else {
+                                    let control = outbound_control_tx.clone();
+                                    shutdown_sends
+                                        .submit(&owner_latch, "connection_closed", async move {
+                                            control
+                                                .send(OutboundControlEvent::Closed { connection_id })
+                                                .await
+                                                .is_ok()
+                                        })
+                                        .await
+                                };
                                 let processor = Arc::clone(&processor);
                                 connection_cleanup_tasks.spawn(async move {
-                                    processor
-                                        .connection_closed(connection_id, &connection_state.session)
-                                        .await;
+                                    let session = &connection_state.session;
+                                    if stdio_closed {
+                                        processor
+                                            .connection_half_closed_until(
+                                                connection_id,
+                                                session,
+                                                half_close_deadline,
+                                            )
+                                            .await;
+                                    } else {
+                                        processor.connection_closed(connection_id, session).await;
+                                    }
                                 });
-                                if !outbound_closed {
-                                    break "outbound_router_closed";
+                                match outbound_closed {
+                                    Some(true) => {}
+                                    Some(false) => break "outbound_router_closed",
+                                    None => break "shutdown_deadline_expired",
                                 }
                                 if single_client_mode && stdio_closed {
                                     // Pending remote enrollment must stop before RPCs drain.
@@ -1261,9 +1724,31 @@ pub async fn run_main_with_transport_options(
                             TransportEvent::IncomingMessage { connection_id, message } => {
                                 let Some(connection_state) = connections.get_mut(&connection_id) else {
                                     warn!("dropping message from unknown connection: {connection_id:?}");
+                                    if let JSONRPCMessage::Request(request) = message {
+                                        let refusing = Arc::clone(&processor);
+                                        let refused = shutdown_sends
+                                            .submit(&owner_latch, "not_admitted_refusal", async move {
+                                                refusing.refuse_not_admitted(connection_id, request.id).await
+                                            })
+                                            .await;
+                                        if refused != Some(true) {
+                                            owner_latch.expiry().record_abandoned(/*messages*/ 1, /*bytes*/ 0);
+                                        }
+                                    }
                                     continue;
                                 };
                                 if connection_state.session.rpc_gate.is_closed() {
+                                    if let JSONRPCMessage::Request(request) = message {
+                                        let refusing = Arc::clone(&processor);
+                                        let refused = shutdown_sends
+                                            .submit(&owner_latch, "not_admitted_refusal", async move {
+                                                refusing.refuse_not_admitted(connection_id, request.id).await
+                                            })
+                                            .await;
+                                        if refused != Some(true) {
+                                            owner_latch.expiry().record_abandoned(/*messages*/ 1, /*bytes*/ 0);
+                                        }
+                                    }
                                     continue;
                                 }
                                 match message {
@@ -1316,19 +1801,7 @@ pub async fn run_main_with_transport_options(
                                                 )
                                                 .await;
                                             processor
-                                                .connection_initialized(
-                                                    connection_id,
-                                                    connection_state
-                                                        .session
-                                                        .request_attestation(),
-                                                    connection_state
-                                                        .session
-                                                        .trusted_interactive(),
-                                                    connection_state
-                                                        .session
-                                                        .retention_principal(),
-                                                    connection_state.session.auth_observation_only(),
-                                                )
+                                                .connection_initialized(connection_id, &connection_state.session)
                                                 .await;
                                             connection_state
                                                 .outbound_initialized
@@ -1347,6 +1820,9 @@ pub async fn run_main_with_transport_options(
                                 }
                             }
                         }
+                    }
+                    Some(message) = startup_warnings_rx.recv(), if connections.values().any(|state| state.session.initialized()) => {
+                        startup_warnings::send_warning(&initialize_notification_sender, message).await;
                     }
                     _ = connection_cleanup_tasks.reap_next() => {}
                     result = thread_listener_tasks.join_next(), if !thread_listener_tasks.is_empty() => {
@@ -1403,68 +1879,110 @@ pub async fn run_main_with_transport_options(
                 }
             };
 
+            // Admission is over. Frames already read but never admitted are
+            // refused explicitly; closing first makes every later send fail
+            // in the transport, which refuses those frames itself.
+            transport_event_rx.close();
+            while let Ok(event) = transport_event_rx.try_recv() {
+                if let TransportEvent::IncomingMessage {
+                    connection_id,
+                    message: JSONRPCMessage::Request(request),
+                } = event
+                {
+                    let refusing = Arc::clone(&processor);
+                    let refused = shutdown_sends
+                        .submit(&owner_latch, "not_admitted_refusal", async move {
+                            refusing
+                                .refuse_not_admitted(connection_id, request.id)
+                                .await
+                        })
+                        .await;
+                    if refused != Some(true) {
+                        owner_latch
+                            .expiry()
+                            .record_abandoned(/*messages*/ 1, /*bytes*/ 0);
+                    }
+                }
+            }
             if let Some(task) = recovery_task {
                 task.abort();
             }
             drop(snapshot);
             drop(thread_listener_tasks);
+            let remaining_connection_count = connections.len();
+            let mut owner = StandaloneShutdownOwner::new(owner_latch.latch(), owner_latch.expiry());
+            processor.retire_command_exec_sandbox_cleanup(Some(owner.deadline().into_std()));
             if !shutdown_state.forced() {
-                futures::future::join_all(connections.iter().map(
-                    |(&connection_id, connection_state)| {
-                        processor.connection_closed(connection_id, &connection_state.session)
-                    },
-                ))
+                let mut stages = ProcessorShutdownStages {
+                    processor: Arc::clone(&processor),
+                    background_progress: Default::default(),
+                    connections: connections.drain().collect(),
+                    cleanup: Some(connection_cleanup_tasks),
+                    thread_retirement: None,
+                    expiry: owner_latch.expiry(),
+                };
+                standalone_shutdown::drain_processor_stages(
+                    &mut owner,
+                    &mut stages,
+                    STANDALONE_STAGE_CAPS,
+                )
                 .await;
-                connection_cleanup_tasks.drain().await;
-                processor.drain_background_tasks().await;
-                processor.shutdown_threads().await;
+                let ProcessorShutdownStages {
+                    processor: stages_processor,
+                    cleanup,
+                    thread_retirement,
+                    ..
+                } = stages;
+                drop(stages_processor);
+                owner.retain((cleanup, thread_retirement));
             } else {
                 connection_cleanup_tasks.abort();
+                owner.record("forced", false);
             }
+            shutdown_sends.hand_to(&mut owner);
+            standalone_shutdown::submit_close_all(
+                &mut owner,
+                &outbound_control_tx,
+                OutboundControlEvent::CloseAllAfterQueued,
+            )
+            .await;
             info!(
                 exit_reason,
-                remaining_connection_count = connections.len(),
+                remaining_connection_count,
                 shutdown_forced = shutdown_state.forced(),
                 "processor task exited"
             );
             if managed_daemon && shutdown_state.forced() {
-                AppServerExit::Forced
+                (AppServerExit::Forced, Some(owner))
             } else {
-                AppServerExit::Graceful
+                (AppServerExit::Graceful, Some(owner))
             }
         }
     });
 
     drop(transport_event_tx);
 
-    if matches!(processor_handle.await, Ok(AppServerExit::Forced)) {
-        return Ok(AppServerExit::Forced);
-    }
-    let _ = outbound_handle.await;
-
-    transport_shutdown_token.cancel();
-    // A joined actor is not proof that its exporters retired. Retain the
-    // returned owner through the remaining standalone shutdown work.
-    let otel_shutdown_owner = otel_reloader_handle.await;
-    match &otel_shutdown_owner {
-        Ok(owner) => {
-            if let Some(Err(outcome)) = &owner.shutdown_result {
-                warn!(?outcome, "standalone telemetry retirement incomplete");
-            }
-        }
-        Err(error) => {
-            warn!(
-                cancelled = error.is_cancelled(),
-                panicked = error.is_panic(),
-                "standalone telemetry reloader task failed"
-            );
-        }
-    }
-    for handle in transport_accept_handles {
-        let _ = handle.await;
-    }
-
-    Ok(AppServerExit::Graceful)
+    let mut shutdown_owner = match standalone_shutdown::join_processor(
+        &owner_latch,
+        Some(host_custody),
+        processor_handle,
+    )
+    .await
+    {
+        standalone_shutdown::ProcessorJoin::Forced => return Ok(AppServerExit::Forced.into()),
+        standalone_shutdown::ProcessorJoin::Owner(owner) => owner,
+    };
+    let exit = standalone_shutdown::finish_host_shutdown(
+        &mut shutdown_owner,
+        outbound_handle,
+        || transport_shutdown_token.cancel(),
+        otel_reloader_handle,
+        |reloader| reloader.shutdown_result == Some(Ok(())),
+        futures::future::join_all(transport_accept_handles),
+    )
+    .await;
+    drop(shutdown_owner);
+    Ok(exit)
 }
 
 struct SqliteRecoveryNotice {
@@ -1484,74 +2002,71 @@ struct StateDbInitResult {
 async fn init_sqlite_state_db_with_fresh_start_on_corruption(
     config: &Config,
 ) -> anyhow::Result<StateDbInitResult> {
-    let mut attempted_backups = HashSet::new();
-    let mut recovered_databases = Vec::new();
-    loop {
-        let err = match rollout_state_db::try_init(config).await {
-            Ok(state_db) => {
-                let recovery_notice = sqlite_recovery_notice(&recovered_databases);
-                if recovery_notice.is_some() {
-                    emit_state_db_backup_warning(SQLITE_RECOVERY_CONFIG_WARNING_SUMMARY);
-                    for recovered_database in &recovered_databases {
-                        emit_state_db_backup_warning(&format!(
-                            "Database path: {}",
-                            recovered_database.database_path
-                        ));
-                        emit_state_db_backup_warning(&format!(
-                            "Backup folder: {}",
-                            recovered_database.backup_folder
-                        ));
-                    }
-                }
-                return Ok(StateDbInitResult {
-                    state_db: Some(state_db),
-                    recovery_notice,
-                });
+    let (result, backups) = codex_state::collect_runtime_db_backups(async {
+        let mut attempted_backups = HashSet::new();
+        loop {
+            let err = match rollout_state_db::try_init(config).await {
+                Ok(state_db) => return Ok(state_db),
+                Err(err) => err,
+            };
+            let database_path = codex_state::runtime_db_path_for_corruption_error(&err)
+                .unwrap_or_else(|| config.sqlite_config().state_db_path());
+            if !codex_state::is_sqlite_corruption_error(&err)
+                && !sqlite_home_is_blocking_file(database_path.as_path())
+            {
+                return Err(err);
             }
-            Err(err) => err,
-        };
-        let database_path = codex_state::runtime_db_path_for_corruption_error(&err)
-            .unwrap_or_else(|| config.sqlite_config().state_db_path());
-        if !codex_state::is_sqlite_corruption_error(&err)
-            && !sqlite_home_is_blocking_file(database_path.as_path())
-        {
-            return Err(err);
-        }
 
-        if !attempted_backups.insert(database_path.clone()) {
-            return Err(anyhow::anyhow!(
-                "failed to initialize sqlite state runtime after moving damaged database file into a backup folder: {err}"
-            ));
-        }
+            if !attempted_backups.insert(database_path.clone()) {
+                return Err(anyhow::anyhow!(
+                    "failed to initialize sqlite state runtime after moving damaged database file into a backup folder: {err}"
+                ));
+            }
 
-        let original_error = err.to_string();
-        emit_state_db_backup_warning(&format!(
-            "Codex local database at {} appears damaged. Moving it into a backup folder so the app server can rebuild it from saved data.",
-            database_path.display()
-        ));
-        let backups = codex_state::backup_runtime_db_for_fresh_start(database_path.as_path())
-            .await
-            .map_err(|backup_err| {
-                anyhow::anyhow!(
-                    "failed to move damaged sqlite state database files into a backup folder: {backup_err}; original error: {original_error}"
-                )
-            })?;
-        for backup in &backups {
+            let original_error = err.to_string();
             emit_state_db_backup_warning(&format!(
-                "Moved damaged Codex local database file {} to {}",
-                backup.original_path.display(),
-                backup.backup_path.display()
+                "Codex local database at {} appears damaged. Moving it into a backup folder so the app server can rebuild it from saved data.",
+                database_path.display()
             ));
+            let backups = codex_state::backup_runtime_db_for_fresh_start(database_path.as_path())
+                .await
+                .map_err(|backup_err| {
+                    anyhow::anyhow!(
+                        "failed to move damaged sqlite state database files into a backup folder: {backup_err}; original error: {original_error}"
+                    )
+                })?;
+            for backup in &backups {
+                emit_state_db_backup_warning(&format!(
+                    "Moved damaged Codex local database file {} to {}",
+                    backup.original_path.display(),
+                    backup.backup_path.display()
+                ));
+            }
         }
-        if let Some(first_backup) = backups.first()
-            && let Some(backup_folder) = first_backup.backup_path.parent()
+    })
+    .await;
+    let state_db = result?;
+    let mut recovered_databases = Vec::new();
+    let mut backup_folders = HashSet::new();
+    for backup in backups {
+        if let Some(folder) = backup.backup_path.parent()
+            && backup_folders.insert(folder.to_path_buf())
         {
             recovered_databases.push(RecoveredSqliteDatabase {
-                database_path: first_backup.original_path.display().to_string(),
-                backup_folder: backup_folder.display().to_string(),
+                database_path: backup.original_path.display().to_string(),
+                backup_folder: folder.display().to_string(),
             });
         }
     }
+    let recovery_notice = sqlite_recovery_notice(&recovered_databases);
+    if let Some(notice) = &recovery_notice {
+        emit_state_db_backup_warning(SQLITE_RECOVERY_CONFIG_WARNING_SUMMARY);
+        emit_state_db_backup_warning(&notice.details);
+    }
+    Ok(StateDbInitResult {
+        state_db: Some(state_db),
+        recovery_notice,
+    })
 }
 
 fn sqlite_home_is_blocking_file(database_path: &Path) -> bool {
@@ -1578,16 +2093,18 @@ fn sqlite_recovery_notice(
         })
         .collect::<Vec<_>>()
         .join("\n\n");
-    Some(SqliteRecoveryNotice { details })
+    Some(SqliteRecoveryNotice {
+        details: format!(
+            "Damaged local databases were rebuilt. Saved conversations remain in rollout files and can restore the thread list and history. Some database-only metadata may be unavailable. The original database files were preserved at the backup locations below.\n\n{details}"
+        ),
+    })
 }
 
 fn emit_state_db_backup_warning(message: &str) {
     warn!("{message}");
     if !tracing::dispatcher::has_been_set() {
-        #[allow(clippy::print_stderr)]
-        {
-            eprintln!("{message}");
-        }
+        let _ =
+            codex_app_server_daemon::stderr_writer().write_all(format!("{message}\n").as_bytes());
     }
 }
 
@@ -1637,17 +2154,13 @@ fn analytics_rpc_transport(transport: &AppServerTransport) -> AppServerRpcTransp
     }
 }
 
-/// Returns the URI eligible MCP providers receive for this app-server's
-/// explicitly bound Unix listener. Stdio and websocket transports do not have
-/// a filesystem control endpoint to disclose. A relative or non-Unicode Unix
-/// path remains usable by the app server itself but is deliberately not
-/// disclosed: the generic MCP contract requires an absolute `unix:///` URI.
+/// Derive disclosure only from the actual hosting absolute Unix listener.
+/// Other transports and relative paths provide no endpoint authority.
 fn mcp_control_endpoint_uri(transport: &AppServerTransport) -> Option<String> {
     let AppServerTransport::UnixSocket { socket_path } = transport else {
         return None;
     };
     if !socket_path.is_absolute() {
-        warn!(path = %socket_path.display(), "not disclosing relative app-server control endpoint to MCP providers");
         return None;
     }
     let path = socket_path.to_str()?;
@@ -1657,96 +2170,19 @@ fn mcp_control_endpoint_uri(transport: &AppServerTransport) -> Option<String> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::AppServerTransport;
-    use super::LogFormat;
-    use super::ShutdownAction;
-    use super::ShutdownSignal;
-    use super::ShutdownState;
-    #[cfg(debug_assertions)]
-    use super::loader_overrides_with_test_user_config_file;
-    use super::mcp_control_endpoint_uri;
-    use super::turn_admission::TurnAdmission;
-    #[cfg(debug_assertions)]
-    use codex_config::LoaderOverrides;
-    use codex_utils_absolute_path::AbsolutePathBuf;
-    use pretty_assertions::assert_eq;
+#[path = "lib_tests.rs"]
+mod tests;
 
+#[cfg(test)]
+mod shutdown_outcome_tests {
+    use super::AppServerExit;
     #[test]
-    fn shutdown_waits_for_admitted_requests_but_force_remains_available() {
-        let admission = TurnAdmission::default();
-        let active = admission.subscribe_active();
-        let in_flight = admission.admit().expect("request admitted");
-        let mut shutdown = ShutdownState::default();
-        let connection_count = 1;
-        let running_turn_count = 0;
-        shutdown.on_signal(
-            ShutdownSignal::Forceable,
-            connection_count,
-            running_turn_count,
-            &admission,
-        );
-        assert!(matches!(
-            shutdown.update(running_turn_count, *active.borrow(), connection_count),
-            ShutdownAction::Noop
-        ));
-        shutdown.on_signal(
-            ShutdownSignal::Forceable,
-            connection_count,
-            running_turn_count,
-            &admission,
-        );
-        assert!(shutdown.forced());
-        assert!(matches!(
-            shutdown.update(running_turn_count, *active.borrow(), connection_count),
-            ShutdownAction::Finish
-        ));
-        drop(in_flight);
-    }
-
-    #[test]
-    fn log_format_from_env_value_matches_json_values_case_insensitively() {
-        assert_eq!(LogFormat::from_env_value(Some("json")), LogFormat::Json);
-        assert_eq!(LogFormat::from_env_value(Some("JSON")), LogFormat::Json);
-        assert_eq!(LogFormat::from_env_value(Some("  Json  ")), LogFormat::Json);
-    }
-
-    #[test]
-    fn log_format_from_env_value_defaults_for_non_json_values() {
-        assert_eq!(
-            LogFormat::from_env_value(/*value*/ None),
-            LogFormat::Default
-        );
-        assert_eq!(LogFormat::from_env_value(Some("")), LogFormat::Default);
-        assert_eq!(LogFormat::from_env_value(Some("text")), LogFormat::Default);
-        assert_eq!(LogFormat::from_env_value(Some("jsonl")), LogFormat::Default);
-    }
-
-    #[test]
-    fn mcp_control_endpoint_uri_encodes_only_absolute_unix_listener_paths() {
-        assert_eq!(
-            mcp_control_endpoint_uri(&AppServerTransport::UnixSocket {
-                socket_path: AbsolutePathBuf::from_absolute_path("/tmp/kcf control.sock")
-                    .expect("absolute fixture path"),
-            }),
-            Some("unix:///tmp/kcf%20control.sock".to_string())
-        );
-        assert_eq!(mcp_control_endpoint_uri(&AppServerTransport::Stdio), None);
-    }
-
-    #[cfg(debug_assertions)]
-    #[test]
-    fn debug_test_user_config_file_overrides_loader_path() {
-        let path = std::env::temp_dir().join("codex-app-server-test-config.toml");
-        let loader_overrides = loader_overrides_with_test_user_config_file(
-            LoaderOverrides::default(),
-            Some(path.clone()),
-        )
-        .expect("test config path should be valid");
-
-        assert_eq!(
-            loader_overrides.user_config_path,
-            Some(AbsolutePathBuf::from_absolute_path(path).expect("absolute test path"))
-        );
+    fn incomplete_shutdown_is_an_error_without_forcing_the_host() {
+        assert!(AppServerExit::Graceful.into_shutdown_result().is_ok());
+        assert!(AppServerExit::Forced.into_shutdown_result().is_ok());
+        let error = AppServerExit::ShutdownIncomplete
+            .into_shutdown_result()
+            .unwrap_err();
+        assert!(error.to_string().contains("shutdown incomplete"));
     }
 }

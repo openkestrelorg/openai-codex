@@ -2,8 +2,10 @@ use std::sync::Arc;
 
 use crate::ExtensionData;
 use crate::ExtensionMetrics;
+use codex_history::HistoryInitialization;
 use codex_mcp::McpResourceClient;
 use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::TurnEnvironmentSelection;
 
 /// Trusted, host-resolved billing attribution for a thread.
@@ -16,6 +18,9 @@ pub struct ThreadOriginator(pub String);
 
 /// Input supplied when the host starts a runtime for a thread.
 pub struct ThreadStartInput<'a, C> {
+    /// Finite constructor authority for this callback. Derive before spawning;
+    /// never retain account work in the session's reusable extension state.
+    pub mcp_access: Result<codex_mcp::McpAttemptAccess<'a>, codex_mcp::McpAttemptRefused>,
     /// Host configuration visible at thread start.
     pub config: &'a C,
     /// Source that created the session for this thread.
@@ -36,10 +41,18 @@ pub struct ThreadStartInput<'a, C> {
 
 /// Input supplied after the host has registered a fully initialized thread.
 pub struct ThreadReadyInput<'a, C> {
+    /// Finite constructor authority for this notification. Derive a child before
+    /// spawning work; neither this borrow nor counted work belongs in a store.
+    /// Required missing/exhausted authority is a refusal, never an ungated input.
+    pub account_work: Result<Option<&'a dyn crate::HostOperationWork>, crate::TurnWorkRefused>,
     /// Host configuration visible after thread registration.
     pub config: &'a C,
     /// Source that created the session for this thread.
     pub session_source: &'a SessionSource,
+    /// How the host initialized the history for this runtime.
+    pub history_initialization: HistoryInitialization,
+    /// The effective history mode, including the persisted mode on resume.
+    pub history_mode: ThreadHistoryMode,
     /// Store scoped to the host session runtime.
     pub session_store: &'a ExtensionData,
     /// Store scoped to this thread runtime.
@@ -48,6 +61,10 @@ pub struct ThreadReadyInput<'a, C> {
 
 /// Input supplied when the host resumes an existing thread.
 pub struct ThreadResumeInput<'a> {
+    /// Finite constructor authority. Derive before account-bound work or spawning;
+    /// metadata-only restoration remains valid even when authority is refused.
+    /// Never retain counted work in reusable session or thread stores.
+    pub mcp_access: Result<codex_mcp::McpAttemptAccess<'a>, codex_mcp::McpAttemptRefused>,
     /// Store scoped to the host session runtime.
     pub session_store: &'a ExtensionData,
     /// Store scoped to this thread runtime.
@@ -67,6 +84,11 @@ pub enum ThreadIdleCause {
 
 /// Input supplied when the host has no immediately pending thread work.
 pub struct ThreadIdleInput<'a> {
+    /// Finite admission for this automatic idle notification, acquired before
+    /// host waits. Derive before account work; refusal never authorizes a fresh
+    /// fallback. No counted work belongs in a reusable extension store.
+    pub account_work:
+        Result<Option<&'a dyn crate::HostOperationWork>, codex_mcp::McpAttemptRefused>,
     /// Why the thread became idle.
     pub cause: ThreadIdleCause,
     /// Store scoped to the host session runtime.

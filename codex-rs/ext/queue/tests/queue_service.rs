@@ -1,3 +1,5 @@
+use codex_protocol::models::AudioReference;
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -168,18 +170,40 @@ if payload["prompt"] == "blocked":
     );
     std::fs::write(&script_path, script)
         .unwrap_or_else(|error| panic!("write queue hook script: {error}"));
+    let python = if cfg!(windows) {
+        "python.exe"
+    } else {
+        "python3"
+    };
     let hooks = serde_json::json!({
         "hooks": {
             "UserPromptSubmit": [{
                 "hooks": [{
                     "type": "command",
-                    "command": format!("python3 {}", script_path.display()),
+                    "command": format!(r#"{python} "{}""#, script_path.display()),
                 }]
             }]
         }
     });
     std::fs::write(home.join("hooks.json"), hooks.to_string())
         .unwrap_or_else(|error| panic!("write queue hooks: {error}"));
+}
+
+async fn wait_for_hooked_turn(test: &TestCodex) {
+    core_test_support::wait_for_event(test.codex.as_ref(), |event| {
+        match event {
+            EventMsg::HookCompleted(hook) => {
+                eprintln!(
+                    "queue hook finished: {:?} {:?}",
+                    hook.run.status, hook.run.entries
+                );
+            }
+            EventMsg::Error(error) => panic!("queue turn failed: {}", error.message),
+            _ => eprintln!("queue turn event: {event}"),
+        }
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
 }
 
 async fn test_queue() -> anyhow::Result<(Arc<dyn QueueStore>, TempDir)> {
@@ -232,11 +256,24 @@ async fn emit_idle_with_cause(
     thread_id: ThreadId,
     cause: ThreadIdleCause,
 ) {
+    emit_idle_with_work(service, thread_id, cause, Ok(None)).await;
+}
+
+async fn emit_idle_with_work(
+    service: &QueuedItemService,
+    thread_id: ThreadId,
+    cause: ThreadIdleCause,
+    account_work: Result<
+        Option<&dyn codex_extension_api::HostOperationWork>,
+        codex_protocol::mcp_work::McpAttemptRefused,
+    >,
+) {
     let session_store = ExtensionData::new("session");
     let thread_store = ExtensionData::new(thread_id.to_string());
     <QueuedItemService as ThreadLifecycleContributor<()>>::on_thread_idle(
         service,
         ThreadIdleInput {
+            account_work,
             cause,
             session_store: &session_store,
             thread_store: &thread_store,
@@ -293,11 +330,28 @@ async fn queued_input_and_unique_event_ids_round_trip() -> anyhow::Result<()> {
     let (queue, _home) = test_queue().await?;
     let sink = Arc::new(RecordingEventSink::default());
     let event_sink: Arc<dyn ExtensionEventSink> = sink.clone();
-    let service = QueuedItemService::new(queue, Weak::new(), event_sink);
+    let service = QueuedItemService::new(Arc::clone(&queue), Weak::new(), event_sink);
     let thread_id = ThreadId::new();
     let input = structured_user_input("structured message");
 
-    let first = service.enqueue(thread_id, input.clone()).await?;
+    let first = service
+        .enqueue_with_metadata(
+            thread_id,
+            input.clone(),
+            Some(HashMap::from([(
+                "client_type".to_string(),
+                "ios_app".to_string(),
+            )])),
+        )
+        .await?;
+    // Old workers still read TurnInput directly from the stored payload.
+    let records = queue
+        .list_page(thread_id, /*offset*/ 0, /*limit*/ 1)
+        .await?;
+    assert_eq!(
+        input,
+        serde_json::from_str::<TurnInput>(&records[0].payload)?
+    );
     let second = service.enqueue(thread_id, user_input("next")).await?;
     let TurnInput::UserInput {
         client_id: Some(generated_client_id),
@@ -339,7 +393,14 @@ async fn editing_reordering_and_deleting_preserve_queue_identity() -> anyhow::Re
     let service = QueuedItemService::new(queue, Weak::new(), Arc::new(NoopExtensionEventSink));
     let thread_id = ThreadId::new();
     let first = service
-        .enqueue(thread_id, structured_user_input("first"))
+        .enqueue_with_metadata(
+            thread_id,
+            structured_user_input("first"),
+            Some(HashMap::from([(
+                "client_type".to_string(),
+                "desktop_app".to_string(),
+            )])),
+        )
         .await?;
     let second = service.enqueue(thread_id, user_input("second")).await?;
     let edited = service
@@ -351,6 +412,21 @@ async fn editing_reordering_and_deleting_preserve_queue_identity() -> anyhow::Re
         anyhow::bail!("edited queue item does not contain user input");
     };
     assert_eq!(Some("stable-client-message"), client_id.as_deref());
+    assert_eq!(
+        first.responsesapi_client_metadata,
+        edited.responsesapi_client_metadata
+    );
+    let mobile_metadata = HashMap::from([("client_type".to_string(), "ios_app".to_string())]);
+    let edited = service
+        .update_with_metadata(
+            thread_id,
+            first.id.clone(),
+            user_input("edited on phone"),
+            Some(mobile_metadata.clone()),
+        )
+        .await?
+        .context("queued item missing")?;
+    assert_eq!(Some(mobile_metadata), edited.responsesapi_client_metadata);
     assert!(matches!(
         service.reorder(thread_id, vec![first.id.clone()]).await,
         Err(QueueServiceError::Storage(
@@ -380,7 +456,14 @@ async fn starting_a_selected_item_preserves_the_remaining_queue() -> anyhow::Res
     let service = QueuedItemService::new(queue, Weak::new(), Arc::new(NoopExtensionEventSink));
     let first = service.enqueue(thread_id, user_input("first")).await?;
     let second = service
-        .enqueue(thread_id, structured_user_input("second"))
+        .enqueue_with_metadata(
+            thread_id,
+            structured_user_input("second"),
+            Some(HashMap::from([(
+                "client_type".to_string(),
+                "ios_app".to_string(),
+            )])),
+        )
         .await?;
 
     let submission = service
@@ -393,7 +476,7 @@ async fn starting_a_selected_item_preserves_the_remaining_queue() -> anyhow::Res
 
     assert!(matches!(
         submission,
-        StartIfIdleSubmission::Started { turn_id } if !turn_id.is_empty()
+        StartIfIdleSubmission::Started { turn_id, .. } if !turn_id.is_empty()
     ));
     assert_eq!(vec![first], service.list(thread_id).await?);
     wait_for_event_match(test.codex.as_ref(), |event| match event {
@@ -409,6 +492,13 @@ async fn starting_a_selected_item_preserves_the_remaining_queue() -> anyhow::Res
             .last()
             .map(String::as_str)
     );
+    let body = response.single_request().body_json();
+    let metadata: serde_json::Value = serde_json::from_str(
+        body["client_metadata"]["x-codex-turn-metadata"]
+            .as_str()
+            .context("missing turn metadata")?,
+    )?;
+    assert_eq!(metadata["client_type"], "ios_app");
     Ok(())
 }
 
@@ -699,7 +789,6 @@ async fn externally_changed_queues_dispatch_independently_and_retry_failed_wakes
             test.thread_manager.auth_manager(),
             /*parent_trace*/ None,
             Default::default(),
-            /*control_endpoint*/ None,
         )
         .await?;
     advance_queue_poll().await;
@@ -743,6 +832,7 @@ async fn rejected_queue_messages_are_consumed_without_retrying_or_blocking_follo
     let test = test_codex()
         .with_extensions(extensions)
         .with_pre_build_hook(write_rejecting_prompt_hook)
+        .with_windows_cmd_shell()
         .with_config(trust_discovered_hooks)
         .with_config(|config| config.include_environment_context = false)
         .build_with_auto_env(&server)
@@ -758,17 +848,13 @@ async fn rejected_queue_messages_are_consumed_without_retrying_or_blocking_follo
     }
     let queue = install_registered_queue(&test, installed.as_ref())?;
 
-    tokio::time::timeout(Duration::from_secs(10), async {
-        test.submit_text_turn("A").await?;
-        for _ in 0..2 {
-            wait_for_event_match(test.codex.as_ref(), |event| {
-                matches!(event, EventMsg::TurnComplete(_)).then_some(())
-            })
-            .await;
-        }
-        anyhow::Ok(())
-    })
-    .await??;
+    // Each turn runs an external hook. Use the event waits' progress deadlines
+    // instead of sharing one wall-clock deadline across all three turns.
+    test.submit_text_turn("A").await?;
+    for _ in 0..2 {
+        wait_for_hooked_turn(&test).await;
+    }
+    wait_for_queue_empty(&queue, thread_id).await?;
 
     let prompts = responses
         .requests()
@@ -786,7 +872,6 @@ async fn rejected_queue_messages_are_consumed_without_retrying_or_blocking_follo
         vec!["A", "blocked", "C"],
         hook_log.lines().collect::<Vec<_>>()
     );
-    assert!(queue.list(thread_id).await?.is_empty());
     assert_eq!(2, responses.requests().len());
     Ok(())
 }
@@ -798,6 +883,7 @@ async fn explicitly_started_rejected_queue_messages_are_consumed() -> anyhow::Re
         responses::mount_sse_once(&server, responses::sse_completed("unexpected-turn")).await;
     let test = test_codex()
         .with_pre_build_hook(write_rejecting_prompt_hook)
+        .with_windows_cmd_shell()
         .with_config(trust_discovered_hooks)
         .with_config(|config| config.include_environment_context = false)
         .build_with_auto_env(&server)
@@ -817,10 +903,7 @@ async fn explicitly_started_rejected_queue_messages_are_consumed() -> anyhow::Re
     .await?
     .expect("explicitly started input should be submitted");
     assert!(matches!(submission, StartIfIdleSubmission::Started { .. }));
-    wait_for_event_match(test.codex.as_ref(), |event| {
-        matches!(event, EventMsg::TurnComplete(_)).then_some(())
-    })
-    .await;
+    wait_for_hooked_turn(&test).await;
     assert!(queue.list(thread_id).await?.is_empty());
     let hook_log = std::fs::read_to_string(test.codex_home_path().join("queue_prompt_hook.log"))?;
     assert_eq!(vec!["blocked"], hook_log.lines().collect::<Vec<_>>());
@@ -860,7 +943,9 @@ async fn local_attachments_are_snapshotted_before_enqueue_and_update() -> anyhow
             detail: Some(ImageDetail::Original),
         },
         UserInput::Audio {
-            audio_url: "data:audio/mpeg;base64,YXVkaW8=".to_string(),
+            audio: AudioReference::Inline {
+                audio_url: "data:audio/mpeg;base64,YXVkaW8=".to_string(),
+            },
         },
     );
 
@@ -902,7 +987,9 @@ async fn local_attachments_are_snapshotted_before_enqueue_and_update() -> anyhow
             detail: Some(ImageDetail::High),
         },
         UserInput::Audio {
-            audio_url: "data:audio/mp4;base64,ZWRpdGVkIGF1ZGlv".to_string(),
+            audio: AudioReference::Inline {
+                audio_url: "data:audio/mp4;base64,ZWRpdGVkIGF1ZGlv".to_string(),
+            },
         },
     );
 
@@ -941,7 +1028,9 @@ async fn invalid_local_attachments_do_not_mutate_queue() -> anyhow::Result<()> {
             detail: Some(ImageDetail::Original),
         },
         UserInput::Audio {
-            audio_url: "data:audio/mpeg;base64,YXVkaW8=".to_string(),
+            audio: AudioReference::Inline {
+                audio_url: "data:audio/mpeg;base64,YXVkaW8=".to_string(),
+            },
         },
     );
 
@@ -1088,7 +1177,8 @@ async fn invalid_head_is_skipped_and_a_live_user_turn_is_accepted() -> anyhow::R
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn resumed_idle_dispatches_input_without_a_loaded_manager() -> anyhow::Result<()> {
     let server = start_mock_server().await;
-    responses::mount_sse_once(&server, responses::sse_completed("resumed-turn")).await;
+    let response =
+        responses::mount_sse_once(&server, responses::sse_completed("resumed-turn")).await;
     let test = test_codex().build_with_auto_env(&server).await?;
     let thread_id = test.session_configured.thread_id;
     let queue = loaded_thread_queue(&test)?;
@@ -1097,7 +1187,14 @@ async fn resumed_idle_dispatches_input_without_a_loaded_manager() -> anyhow::Res
         Weak::new(),
         Arc::new(NoopExtensionEventSink),
     )
-    .enqueue(thread_id, user_input("queued while unloaded"))
+    .enqueue_with_metadata(
+        thread_id,
+        user_input("queued while unloaded"),
+        Some(HashMap::from([(
+            "client_type".to_string(),
+            "ios_app".to_string(),
+        )])),
+    )
     .await?;
     let service = QueuedItemService::new(
         queue,
@@ -1106,5 +1203,462 @@ async fn resumed_idle_dispatches_input_without_a_loaded_manager() -> anyhow::Res
     );
     emit_idle(&service, thread_id).await;
     assert!(service.list(thread_id).await?.is_empty());
+    wait_for_event_match(test.codex.as_ref(), |event| match event {
+        EventMsg::TurnComplete(_) => Some(()),
+        _ => None,
+    })
+    .await;
+    let body = response.single_request().body_json();
+    let metadata: serde_json::Value = serde_json::from_str(
+        body["client_metadata"]["x-codex-turn-metadata"]
+            .as_str()
+            .context("missing turn metadata")?,
+    )?;
+    assert_eq!(metadata["client_type"], "ios_app");
+    Ok(())
+}
+
+#[derive(Debug, Default)]
+struct ExhaustedIdleWork(std::sync::atomic::AtomicUsize);
+impl codex_extension_api::HostOperationWork for ExhaustedIdleWork {
+    fn derive_operation(
+        &self,
+    ) -> Result<Box<dyn codex_extension_api::HostOperationWork>, codex_extension_api::TurnWorkRefused>
+    {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Err(codex_extension_api::TurnWorkRefused::Unavailable)
+    }
+    fn derive_turn_work(
+        &self,
+        _: &ExtensionData,
+        _: ExtensionFuture<'static, ()>,
+    ) -> Result<
+        Box<dyn codex_protocol::host_turn_work::HostTurnWork>,
+        codex_extension_api::TurnWorkRefused,
+    > {
+        panic!("exhausted callback must never submit a turn")
+    }
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refused_or_exhausted_idle_authority_preserves_queue_until_an_authorized_wake()
+-> anyhow::Result<()> {
+    let server = start_mock_server().await;
+    let response =
+        responses::mount_sse_once(&server, responses::sse_completed("authorized-queued-turn"))
+            .await;
+    let test = test_codex().build_with_auto_env(&server).await?;
+    let thread_id = test.session_configured.thread_id;
+    let queue = loaded_thread_queue(&test)?;
+    let item = QueuedItemService::new(queue.clone(), Weak::new(), Arc::new(NoopExtensionEventSink))
+        .enqueue(thread_id, user_input("retain this exact queued item"))
+        .await?;
+    let service = QueuedItemService::new(
+        queue,
+        Arc::downgrade(&test.thread_manager),
+        Arc::new(NoopExtensionEventSink),
+    );
+    let exhausted = ExhaustedIdleWork::default();
+    for access in [
+        Err(codex_protocol::mcp_work::McpAttemptRefused),
+        Ok(Some(
+            &exhausted as &dyn codex_extension_api::HostOperationWork,
+        )),
+    ] {
+        emit_idle_with_work(&service, thread_id, ThreadIdleCause::Completed, access).await;
+        assert_eq!(vec![item.clone()], service.list(thread_id).await?);
+        assert!(response.requests().is_empty());
+    }
+    assert_eq!(exhausted.0.load(Ordering::SeqCst), 1);
+    emit_idle(&service, thread_id).await;
+    wait_for_event_match(test.codex.as_ref(), |event| {
+        matches!(event, EventMsg::TurnComplete(_)).then_some(())
+    })
+    .await;
+    assert!(service.list(thread_id).await?.is_empty());
+    let mut messages = response.single_request().message_input_texts("user");
+    assert_eq!(messages.len(), 2);
+    let environment = messages.remove(0);
+    assert!(environment.starts_with("<environment_context>\n"));
+    assert!(environment.ends_with("</environment_context>"));
+    assert_eq!(messages, vec!["retain this exact queued item"]);
+    Ok(())
+}
+
+#[derive(Debug, Default)]
+struct QueueWorkState {
+    live: std::sync::atomic::AtomicUsize,
+    operations: std::sync::atomic::AtomicUsize,
+    turns: std::sync::atomic::AtomicUsize,
+    bound: Mutex<Vec<String>>,
+    joins: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+}
+#[derive(Debug)]
+struct QueueOperationWork {
+    state: Arc<QueueWorkState>,
+    thread: ThreadId,
+}
+impl Drop for QueueOperationWork {
+    fn drop(&mut self) {
+        self.state.live.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+impl codex_extension_api::HostOperationWork for QueueOperationWork {
+    fn derive_operation(
+        &self,
+    ) -> Result<Box<dyn codex_extension_api::HostOperationWork>, codex_extension_api::TurnWorkRefused>
+    {
+        self.state.operations.fetch_add(1, Ordering::SeqCst);
+        self.state.live.fetch_add(1, Ordering::SeqCst);
+        Ok(Box::new(Self {
+            state: self.state.clone(),
+            thread: self.thread,
+        }))
+    }
+    fn derive_turn_work(
+        &self,
+        store: &ExtensionData,
+        termination: ExtensionFuture<'static, ()>,
+    ) -> Result<
+        Box<dyn codex_protocol::host_turn_work::HostTurnWork>,
+        codex_extension_api::TurnWorkRefused,
+    > {
+        assert_eq!(store.level_id(), self.thread.to_string());
+        self.state.turns.fetch_add(1, Ordering::SeqCst);
+        self.state.live.fetch_add(1, Ordering::SeqCst);
+        Ok(Box::new(QueueTurnCustody {
+            work: Self {
+                state: self.state.clone(),
+                thread: self.thread,
+            },
+            termination,
+        }))
+    }
+}
+struct QueueTurnCustody {
+    work: QueueOperationWork,
+    termination: ExtensionFuture<'static, ()>,
+}
+impl std::fmt::Debug for QueueTurnCustody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("QueueTurnCustody")
+    }
+}
+impl codex_protocol::host_turn_work::HostTurnWork for QueueTurnCustody {
+    fn bind_submission(&mut self, turn: &str) {
+        self.work
+            .state
+            .bound
+            .lock()
+            .unwrap_or_else(|error| panic!("queue bound-turn lock poisoned: {error:?}"))
+            .push(turn.to_owned());
+    }
+    fn retain_until_terminal(self: Box<Self>) {
+        // This synthetic host deliberately uses the exact loop receipt. It does
+        // not pretend logical turn completion certifies physical loop cleanup.
+        let QueueTurnCustody { work, termination } = *self;
+        let state = work.state.clone();
+        let join = tokio::spawn(async move {
+            termination.await;
+            drop(work);
+        });
+        state
+            .joins
+            .lock()
+            .unwrap_or_else(|error| panic!("queue join lock poisoned: {error:?}"))
+            .push(join);
+    }
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admitted_idle_queue_dispatch_binds_derived_turn_to_the_actual_loop_receipt()
+-> anyhow::Result<()> {
+    let server = start_mock_server().await;
+    let response =
+        responses::mount_sse_once(&server, responses::sse_completed("derived-queued-turn")).await;
+    let test = test_codex().build_with_auto_env(&server).await?;
+    let thread_id = test.session_configured.thread_id;
+    let queue = loaded_thread_queue(&test)?;
+    QueuedItemService::new(queue.clone(), Weak::new(), Arc::new(NoopExtensionEventSink))
+        .enqueue(thread_id, user_input("dispatch with explicit custody"))
+        .await?;
+    let service = QueuedItemService::new(
+        queue,
+        Arc::downgrade(&test.thread_manager),
+        Arc::new(NoopExtensionEventSink),
+    );
+    let state = Arc::new(QueueWorkState::default());
+    state.live.store(1, Ordering::SeqCst);
+    let work = QueueOperationWork {
+        state: state.clone(),
+        thread: thread_id,
+    };
+    emit_idle_with_work(
+        &service,
+        thread_id,
+        ThreadIdleCause::Completed,
+        Ok(Some(&work)),
+    )
+    .await;
+    let turn_id = wait_for_event_match(test.codex.as_ref(), |event| match event {
+        EventMsg::TurnComplete(event) => Some(event.turn_id.clone()),
+        _ => None,
+    })
+    .await;
+    assert!(service.list(thread_id).await?.is_empty());
+    assert_eq!(state.operations.load(Ordering::SeqCst), 1);
+    assert_eq!(state.turns.load(Ordering::SeqCst), 1);
+    assert_eq!(*state.bound.lock().unwrap(), vec![turn_id]);
+    assert_eq!(state.live.load(Ordering::SeqCst), 2);
+    assert_eq!(response.requests().len(), 1);
+    assert_eq!(
+        response
+            .single_request()
+            .message_input_texts("user")
+            .last()
+            .map(String::as_str),
+        Some("dispatch with explicit custody")
+    );
+    drop(work);
+    assert_eq!(state.live.load(Ordering::SeqCst), 1);
+    test.codex.shutdown_and_wait().await?;
+    let joins = std::mem::take(&mut *state.joins.lock().unwrap());
+    assert_eq!(joins.len(), 1);
+    for join in joins {
+        tokio::time::timeout(Duration::from_secs(5), join).await??;
+    }
+    assert_eq!(state.live.load(Ordering::SeqCst), 0);
+    Ok(())
+}
+
+tokio::task_local! { static MANUAL_QUEUE_REQUEST_SCOPE: (); }
+#[derive(Debug, Default)]
+struct ManualRequestGate {
+    enabled: AtomicBool,
+    mode: std::sync::atomic::AtomicUsize,
+    requests: std::sync::atomic::AtomicUsize,
+    state: Arc<QueueWorkState>,
+    thread: Mutex<Option<ThreadId>>,
+}
+impl TurnStartAdmission for ManualRequestGate {
+    fn admit_turn_start(&self) -> Option<Box<dyn Send>> {
+        Some(Box::new(()))
+    }
+    fn requires_account_work(&self) -> bool {
+        self.enabled.load(Ordering::SeqCst) && self.mode.load(Ordering::SeqCst) != 0
+    }
+    fn derive_request_operation_work(
+        &self,
+    ) -> Result<
+        Option<Box<dyn codex_extension_api::HostOperationWork>>,
+        codex_extension_api::TurnWorkRefused,
+    > {
+        if !self.enabled.load(Ordering::SeqCst)
+            || MANUAL_QUEUE_REQUEST_SCOPE.try_with(|_| ()).is_err()
+        {
+            return Ok(None);
+        }
+        self.requests.fetch_add(1, Ordering::SeqCst);
+        match self.mode.load(Ordering::SeqCst) {
+            1 => Err(codex_extension_api::TurnWorkRefused::Unavailable),
+            2 => Ok(None),
+            3 => Err(codex_extension_api::TurnWorkRefused::RetryAfter(Box::pin(
+                std::future::pending(),
+            ))),
+            _ => {
+                self.state.live.fetch_add(1, Ordering::SeqCst);
+                Ok(Some(Box::new(QueueOperationWork {
+                    state: self.state.clone(),
+                    thread: self
+                        .thread
+                        .lock()
+                        .unwrap_or_else(|error| {
+                            panic!("manual gate thread lock poisoned: {error:?}")
+                        })
+                        .unwrap_or_else(|| {
+                            panic!("manual gate thread is bound before work derivation")
+                        }),
+                })))
+            }
+        }
+    }
+    fn admit_operation_work(
+        &self,
+    ) -> Result<
+        Option<Box<dyn codex_extension_api::HostOperationWork>>,
+        codex_extension_api::TurnWorkRefused,
+    > {
+        panic!("manual request must never fall back to fresh operation admission")
+    }
+    fn admit_turn_work(
+        &self,
+        _: &ExtensionData,
+        _: ExtensionFuture<'static, ()>,
+    ) -> Result<
+        Option<Box<dyn codex_protocol::host_turn_work::HostTurnWork>>,
+        codex_extension_api::TurnWorkRefused,
+    > {
+        panic!("manual request must use its explicit derived turn, not fresh admission")
+    }
+}
+struct HeldQueueStore {
+    inner: Arc<dyn QueueStore>,
+    hold: AtomicBool,
+    reads: std::sync::atomic::AtomicUsize,
+}
+impl QueueStore for HeldQueueStore {
+    fn change_version(&self) -> codex_thread_store::ThreadStoreFuture<'_, i64> {
+        self.inner.change_version()
+    }
+    fn changes_since<'a>(
+        &'a self,
+        revision: i64,
+        thread_ids: &'a [ThreadId],
+    ) -> codex_thread_store::ThreadStoreFuture<'a, Vec<(ThreadId, i64)>> {
+        self.inner.changes_since(revision, thread_ids)
+    }
+    fn enqueue(
+        &self,
+        thread_id: ThreadId,
+        payload: String,
+    ) -> codex_thread_store::ThreadStoreFuture<'_, codex_state::QueuedUserSubmissionRecord> {
+        self.inner.enqueue(thread_id, payload)
+    }
+    fn list_page(
+        &self,
+        thread_id: ThreadId,
+        offset: usize,
+        limit: usize,
+    ) -> codex_thread_store::ThreadStoreFuture<'_, Vec<codex_state::QueuedUserSubmissionRecord>>
+    {
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        if self.hold.load(Ordering::SeqCst) {
+            Box::pin(std::future::pending())
+        } else {
+            self.inner.list_page(thread_id, offset, limit)
+        }
+    }
+    fn update(
+        &self,
+        thread_id: ThreadId,
+        item_id: String,
+        payload: String,
+    ) -> codex_thread_store::ThreadStoreFuture<'_, Option<codex_state::QueuedUserSubmissionRecord>>
+    {
+        self.inner.update(thread_id, item_id, payload)
+    }
+    fn delete(
+        &self,
+        thread_id: ThreadId,
+        item_id: String,
+    ) -> codex_thread_store::ThreadStoreFuture<'_, bool> {
+        self.inner.delete(thread_id, item_id)
+    }
+    fn reorder(
+        &self,
+        thread_id: ThreadId,
+        item_ids: Vec<String>,
+    ) -> codex_thread_store::ThreadStoreFuture<'_, ()> {
+        self.inner.reorder(thread_id, item_ids)
+    }
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manual_queue_captures_request_before_store_wait_and_never_reopens_admission()
+-> anyhow::Result<()> {
+    let server = start_mock_server().await;
+    let response =
+        responses::mount_sse_once(&server, responses::sse_completed("manual-request-turn")).await;
+    let gate = Arc::new(ManualRequestGate::default());
+    let mut extensions = ExtensionRegistryBuilder::new();
+    extensions.turn_start_admission(gate.clone());
+    let test = test_codex()
+        .with_extensions(Arc::new(extensions.build()))
+        .build_with_auto_env(&server)
+        .await?;
+    let thread_id = test.session_configured.thread_id;
+    *gate.thread.lock().unwrap() = Some(thread_id);
+    gate.enabled.store(true, Ordering::SeqCst);
+    let queue = loaded_thread_queue(&test)?;
+    let staged =
+        QueuedItemService::new(queue.clone(), Weak::new(), Arc::new(NoopExtensionEventSink));
+    let item = staged
+        .enqueue(thread_id, user_input("manual request-owned message"))
+        .await?;
+    let observed = Arc::new(HeldQueueStore {
+        inner: queue,
+        hold: AtomicBool::new(true),
+        reads: Default::default(),
+    });
+    let service = QueuedItemService::new(
+        observed.clone(),
+        Arc::downgrade(&test.thread_manager),
+        Arc::new(NoopExtensionEventSink),
+    );
+    let mut start = Box::pin(MANUAL_QUEUE_REQUEST_SCOPE.scope(
+        (),
+        service.start(test.codex.as_ref(), Some(item.id.clone()), None),
+    ));
+    assert!(
+        std::future::poll_fn(|cx| std::task::Poll::Ready(
+            std::future::Future::poll(start.as_mut(), cx).is_pending()
+        ))
+        .await
+    );
+    assert_eq!(gate.requests.load(Ordering::SeqCst), 1);
+    assert_eq!(observed.reads.load(Ordering::SeqCst), 1);
+    assert_eq!(gate.state.live.load(Ordering::SeqCst), 1);
+    drop(start);
+    assert_eq!(gate.state.live.load(Ordering::SeqCst), 0);
+    assert_eq!(gate.state.turns.load(Ordering::SeqCst), 0);
+    assert_eq!(staged.list(thread_id).await?, vec![item.clone()]);
+    for mode in [1, 2, 3] {
+        gate.mode.store(mode, Ordering::SeqCst);
+        let result = MANUAL_QUEUE_REQUEST_SCOPE
+            .scope(
+                (),
+                service.start(test.codex.as_ref(), Some(item.id.clone()), None),
+            )
+            .await?;
+        assert!(matches!(
+            result,
+            StartIfIdleSubmission::NotSubmitted {
+                reason: NotSubmittedReason::ServerDraining
+            }
+        ));
+        assert_eq!(observed.reads.load(Ordering::SeqCst), 1);
+        assert_eq!(gate.state.live.load(Ordering::SeqCst), 0);
+        assert_eq!(staged.list(thread_id).await?, vec![item.clone()]);
+        assert!(response.requests().is_empty());
+    }
+    gate.mode.store(0, Ordering::SeqCst);
+    observed.hold.store(false, Ordering::SeqCst);
+    let result = MANUAL_QUEUE_REQUEST_SCOPE
+        .scope((), service.start(test.codex.as_ref(), Some(item.id), None))
+        .await?;
+    let StartIfIdleSubmission::Started { turn_id, .. } = result else {
+        panic!("valid explicit request must start");
+    };
+    wait_for_event_match(test.codex.as_ref(), |event| {
+        matches!(event, EventMsg::TurnComplete(_)).then_some(())
+    })
+    .await;
+    assert_eq!(gate.requests.load(Ordering::SeqCst), 5);
+    assert_eq!(gate.state.turns.load(Ordering::SeqCst), 1);
+    assert_eq!(*gate.state.bound.lock().unwrap(), vec![turn_id]);
+    assert_eq!(gate.state.live.load(Ordering::SeqCst), 1);
+    assert!(staged.list(thread_id).await?.is_empty());
+    assert_eq!(
+        response
+            .single_request()
+            .message_input_texts("user")
+            .last()
+            .map(String::as_str),
+        Some("manual request-owned message")
+    );
+    test.codex.shutdown_and_wait().await?;
+    let joins = std::mem::take(&mut *gate.state.joins.lock().unwrap());
+    assert_eq!(joins.len(), 1);
+    for join in joins {
+        tokio::time::timeout(Duration::from_secs(5), join).await??;
+    }
+    assert_eq!(gate.state.live.load(Ordering::SeqCst), 0);
     Ok(())
 }

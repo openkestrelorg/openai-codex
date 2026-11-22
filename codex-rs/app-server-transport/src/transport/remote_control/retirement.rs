@@ -16,11 +16,20 @@ pub(super) struct Retirement {
 
 impl Retirement {
     pub(super) fn retain(&self, receipt: Receipt) {
+        // Poll originals outside the census lock: completing a join can drop
+        // arbitrary panic payloads that re-enter this owner. Compact only the
+        // successful receipts observed in this snapshot; concurrent additions
+        // remain in custody.
+        let clean = self
+            .snapshot()
+            .into_iter()
+            .filter(|receipt| receipt.clone().now_or_never() == Some(true))
+            .collect::<Vec<_>>();
         let mut receipts = self
             .receipts
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        receipts.retain(|receipt| receipt.clone().now_or_never() != Some(true));
+        receipts.retain(|receipt| !clean.iter().any(|done| receipt.ptr_eq(done)));
         receipts.push(receipt);
     }
 

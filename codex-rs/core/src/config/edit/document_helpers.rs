@@ -123,14 +123,14 @@ fn serialize_mcp_server_table(config: &McpServerConfig) -> anyhow::Result<TomlTa
     if config.supports_parallel_tool_calls {
         entry["supports_parallel_tool_calls"] = value(true);
     }
-    if let Some(budget) = config.tool_input_schema_max_bytes {
-        entry["tool_input_schema_max_bytes"] = value(i64::try_from(budget.get())?);
-    }
     if config.thread_identity_eligible {
         entry["thread_identity_eligible"] = value(true);
     }
     if config.control_endpoint_eligible {
         entry["control_endpoint_eligible"] = value(true);
+    }
+    if let Some(budget) = config.tool_input_schema_max_bytes {
+        entry["tool_input_schema_max_bytes"] = value(i64::try_from(budget.get())?);
     }
     if let Some(omit_tools_from) = &config.omit_tools_from {
         entry["omit_tools_from"] = array_from_iter(omit_tools_from.iter().map(ToString::to_string));
@@ -174,6 +174,9 @@ fn serialize_mcp_server_table(config: &McpServerConfig) -> anyhow::Result<TomlTa
         }
         if let Some(client_secret) = &oauth.client_secret {
             oauth_table["client_secret"] = value(client_secret.as_str());
+        }
+        if let Some(method) = oauth.token_endpoint_auth_method {
+            oauth_table["token_endpoint_auth_method"] = value(method.as_str());
         }
         if let Some(callback_url) = &oauth.callback_url {
             oauth_table["callback_url"] = value(callback_url.clone());

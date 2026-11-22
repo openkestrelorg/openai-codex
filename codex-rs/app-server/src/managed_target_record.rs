@@ -117,6 +117,10 @@ struct ManagedTargetRecordPublication {
 #[derive(Debug)]
 struct PublishedTargetRecord {
     path: PathBuf,
+    // Keeping the published inode open prevents unlink/recreate from reusing
+    // its inode number while this rollback authority still exists.
+    #[cfg(unix)]
+    _publication_file: File,
     #[cfg(unix)]
     device: u64,
     #[cfg(unix)]
@@ -138,11 +142,15 @@ impl ManagedTargetRecordPublication {
         // Linking a complete same-directory temporary inode publishes the
         // record atomically and refuses if the selected path already exists.
         // Dropping `temporary` removes only its private link.
-        std::fs::hard_link(temporary.path(), &self.path)?;
         #[cfg(unix)]
-        let metadata = std::fs::metadata(&self.path)?;
+        let publication_file = temporary.as_file().try_clone()?;
+        #[cfg(unix)]
+        let metadata = publication_file.metadata()?;
+        std::fs::hard_link(temporary.path(), &self.path)?;
         Ok(PublishedTargetRecord {
             path: self.path,
+            #[cfg(unix)]
+            _publication_file: publication_file,
             #[cfg(unix)]
             device: metadata.dev(),
             #[cfg(unix)]
@@ -155,7 +163,13 @@ impl ManagedTargetRecordPublication {
 
 impl PublishedTargetRecord {
     fn remove_if_unchanged(&self) -> io::Result<()> {
-        let metadata = std::fs::metadata(&self.path)?;
+        let metadata = std::fs::symlink_metadata(&self.path)?;
+        if metadata.file_type().is_symlink() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "published target record replaced by a symlink before rollback",
+            ));
+        }
         #[cfg(unix)]
         let unchanged = metadata.dev() == self.device && metadata.ino() == self.inode;
         #[cfg(not(unix))]
@@ -245,6 +259,7 @@ fn sha256_file(path: &Path) -> io::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codex_utils_absolute_path::AbsolutePathBuf;
     use pretty_assertions::assert_eq;
 
     fn publication(path: PathBuf, artifact: &Path) -> ManagedTargetRecordPublication {
@@ -260,6 +275,50 @@ mod tests {
                 record_identity: "publication-record".to_owned(),
             },
         }
+    }
+
+    #[test]
+    fn from_env_without_opt_in_publishes_nothing() {
+        // Never mutate the process environment; opt-in-present coverage uses
+        // disposable parent processes instead of racing this unit test.
+        assert!(std::env::var_os(MANAGED_TARGET_RECORD_ENV_VAR).is_none());
+        let directory = tempfile::tempdir().unwrap();
+        let socket_path =
+            AbsolutePathBuf::from_absolute_path(directory.path().join("control.sock")).unwrap();
+        let mut setup = ManagedTargetRecordSetup::from_env(&AppServerTransport::UnixSocket {
+            socket_path: socket_path.clone(),
+        })
+        .unwrap();
+        assert!(setup.process_instance_id.is_none());
+        assert_eq!(
+            setup.control_endpoint,
+            Some(socket_path.display().to_string())
+        );
+        assert!(setup.publication.is_none());
+        setup.publish_after_socket_bound().unwrap();
+        setup.remove_after_startup_failure().unwrap();
+        assert!(setup.published.is_none());
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publication_refuses_a_preexisting_symlink_without_following_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let artifact = directory.path().join("codex");
+        std::fs::write(&artifact, b"synthetic artifact").unwrap();
+        let sentinel = directory.path().join("sentinel.json");
+        let preimage = b"sentinel must not change";
+        std::fs::write(&sentinel, preimage).unwrap();
+        let record_path = directory.path().join("target.json");
+        std::os::unix::fs::symlink(&sentinel, &record_path).unwrap();
+        let error = publication(record_path.clone(), &artifact)
+            .publish()
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&sentinel).unwrap(), preimage);
+        assert!(record_path.is_symlink());
+        assert_eq!(std::fs::read_link(&record_path).unwrap(), sentinel);
     }
 
     #[test]
@@ -320,5 +379,25 @@ mod tests {
         let error = published.remove_if_unchanged().unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert_eq!(std::fs::read(record_path).unwrap(), replacement);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn published_record_cleanup_refuses_a_replacement_symlink_to_the_same_inode() {
+        let directory = tempfile::tempdir().unwrap();
+        let artifact = directory.path().join("codex");
+        std::fs::write(&artifact, b"synthetic artifact").unwrap();
+        let record_path = directory.path().join("target.json");
+        let published = publication(record_path.clone(), &artifact)
+            .publish()
+            .unwrap();
+        let retained = directory.path().join("retained.json");
+        std::fs::rename(&record_path, &retained).unwrap();
+        std::os::unix::fs::symlink(&retained, &record_path).unwrap();
+
+        let error = published.remove_if_unchanged().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(record_path.is_symlink());
+        assert!(retained.is_file());
     }
 }

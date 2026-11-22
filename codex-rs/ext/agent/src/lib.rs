@@ -71,7 +71,7 @@ impl AgentRunner {
                 parent_thread_id,
                 StartThreadOptions {
                     parent_trace: parent_trace.clone(),
-                    ..StartThreadOptions::new(config, None)
+                    ..StartThreadOptions::new(config, /*control_endpoint*/ None)
                 },
             )
             .await?;
@@ -85,7 +85,7 @@ impl AgentRunner {
             )
             .await?
         {
-            StartIfIdleSubmission::Started { turn_id } => turn_id,
+            StartIfIdleSubmission::Started { turn_id, .. } => turn_id,
             StartIfIdleSubmission::NotSubmitted { reason } => {
                 return Err(CodexErr::InvalidRequest(format!(
                     "agent prompt was not submitted: {reason:?}"

@@ -10,7 +10,6 @@ use super::protocol::StreamId;
 use crate::outgoing_message::ConnectionId;
 use crate::outgoing_message::QueuedOutgoingMessage;
 use crate::transport::ConnectionOrigin;
-use crate::transport::ConnectionProvenance;
 use crate::transport::remote_control::QueuedServerEnvelope;
 use codex_app_server_protocol::JSONRPCMessage;
 use std::collections::HashMap;
@@ -180,8 +179,8 @@ impl ClientTracker {
                 self.send_transport_event(TransportEvent::ConnectionOpened {
                     connection_id,
                     origin: ConnectionOrigin::RemoteControl,
+                    provenance: crate::transport::ConnectionProvenance::Unproven,
                     auth: self.auth.clone(),
-                    provenance: ConnectionProvenance::Unproven,
                     writer: writer_tx,
                     disconnect_sender: Some(disconnect_token.clone()),
                 })
@@ -532,9 +531,13 @@ mod tests {
         {
             TransportEvent::ConnectionOpened {
                 connection_id,
+                provenance,
                 disconnect_sender: Some(disconnect_sender),
                 ..
-            } => (connection_id, disconnect_sender),
+            } => {
+                assert_eq!(provenance, crate::transport::ConnectionProvenance::Unproven);
+                (connection_id, disconnect_sender)
+            }
             other => panic!("expected connection opened, got {other:?}"),
         };
         match transport_event_rx

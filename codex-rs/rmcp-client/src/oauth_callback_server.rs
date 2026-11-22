@@ -156,16 +156,23 @@ pub(crate) struct Server {
 }
 
 impl Server {
-    pub(crate) fn start(listener: TcpListener) -> io::Result<(Self, mpsc::Receiver<Request>)> {
+    pub(crate) fn start(
+        listener: TcpListener,
+        closed: CancellationToken,
+    ) -> io::Result<(Self, mpsc::Receiver<Request>)> {
         let state = Arc::new(Mutex::new(State::default()));
         let shutdown = CancellationToken::new();
         let (requests, receiver) = mpsc::channel(16);
+        let owner = ListenerOwner {
+            listener,
+            _closed: closed.drop_guard(),
+        };
         {
             let mut state_guard = state
                 .lock()
                 .map_err(|_| io::Error::other("OAuth callback custody unavailable"))?;
             state_guard.acceptor = Some(JoinOwner::spawn(accept(
-                listener,
+                owner,
                 requests,
                 Arc::downgrade(&state),
                 shutdown.clone(),
@@ -248,8 +255,15 @@ fn register(
     Ok(())
 }
 
-async fn accept(
+// Field order guarantees listener release before the closure signal, even when
+// the acceptor is aborted before its first poll. Never move the listener out.
+struct ListenerOwner {
     listener: TcpListener,
+    _closed: tokio_util::sync::DropGuard,
+}
+
+async fn accept(
+    owner: ListenerOwner,
     requests: mpsc::Sender<Request>,
     state: Weak<Mutex<State>>,
     shutdown: CancellationToken,
@@ -258,7 +272,7 @@ async fn accept(
         let stream = tokio::select! {
             biased;
             _ = shutdown.cancelled() => return WorkerOutcome::Joined,
-            accepted = listener.accept() => match accepted {
+            accepted = owner.listener.accept() => match accepted {
                 Ok((stream, _)) => stream,
                 Err(_) => return WorkerOutcome::Failed,
             },
@@ -332,13 +346,43 @@ mod tests {
     use tokio::io::AsyncReadExt;
     use tokio::io::AsyncWriteExt;
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn unpolled_acceptor_releases_listener_before_signalling_closed() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind callback listener");
+        let address = listener.local_addr().expect("listener address");
+        let closed = CancellationToken::new();
+        let (server, _requests) =
+            Server::start(listener, closed.clone()).expect("start callback server");
+        // The current-thread runtime cannot poll the production acceptor before
+        // this abort. Exercise Server::start rather than rebuilding its owner.
+        server.close();
+        server
+            .state
+            .lock()
+            .expect("callback state")
+            .acceptor
+            .as_ref()
+            .expect("owned acceptor")
+            .abort
+            .abort();
+        let report = server.wait().await;
+        assert_eq!(report.acceptor, WorkerOutcome::Cancelled);
+        assert!(closed.is_cancelled());
+        let _rebound = TcpListener::bind(address)
+            .await
+            .expect("closed listener can be rebound");
+    }
+
     #[tokio::test]
     async fn response_ack_and_server_report_observe_real_connection_retirement() {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind callback listener");
         let address = listener.local_addr().expect("callback listener address");
-        let (server, mut requests) = Server::start(listener).expect("start callback server");
+        let (server, mut requests) =
+            Server::start(listener, CancellationToken::new()).expect("start callback server");
 
         let client = tokio::spawn(async move {
             let mut stream = TcpStream::connect(address)
@@ -383,7 +427,8 @@ mod tests {
             .await
             .expect("bind callback listener");
         let address = listener.local_addr().expect("callback listener address");
-        let (server, mut requests) = Server::start(listener).expect("start callback server");
+        let (server, mut requests) =
+            Server::start(listener, CancellationToken::new()).expect("start callback server");
 
         let client = tokio::spawn(async move {
             let mut stream = TcpStream::connect(address)

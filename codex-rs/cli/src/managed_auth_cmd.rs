@@ -90,6 +90,7 @@ async fn connect(socket_path: String) -> Result<RemoteAppServerClient> {
     let socket_path = AbsolutePathBuf::from_absolute_path_checked(&socket_path)
         .with_context(|| format!("--socket must be an absolute path: {socket_path}"))?;
     RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+        required_human_approval: false,
         endpoint: RemoteAppServerEndpoint::UnixSocket { socket_path },
         client_name: "codex-managed-auth".to_owned(),
         client_version: env!("CARGO_PKG_VERSION").to_owned(),

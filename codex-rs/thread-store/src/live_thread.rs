@@ -28,6 +28,7 @@ use crate::ThreadStore;
 use crate::ThreadStoreError;
 use crate::ThreadStoreFuture;
 use crate::ThreadStoreResult;
+use crate::ThreadStoreResumePreparation;
 use crate::UpdateThreadMetadataParams;
 use crate::thread_metadata_sync::ThreadMetadataSync;
 
@@ -42,7 +43,7 @@ pub struct LiveThread {
     history_mode: ThreadHistoryMode,
     thread_store: Arc<dyn ThreadStore>,
     metadata_sync: Arc<Mutex<ThreadMetadataSync>>,
-    // Shared by every clone; serialize mutations with irreversible writer sealing.
+    // Shared by clones of this incarnation, never by a successor writer.
     write_gate: Arc<Mutex<bool>>,
     persistence_telemetry: RolloutPersistenceTelemetry,
 }
@@ -100,24 +101,25 @@ impl LiveThreadInitGuard {
         self.live_thread = None;
     }
 
-    pub async fn discard(&mut self) {
-        let _ = self.finish_acquisition().await;
-        let Some(live_thread) = self.live_thread.take() else {
-            return;
-        };
-        if let Err(err) = live_thread.discard().await {
-            warn!("failed to discard thread persistence for failed session init: {err}");
-        }
-    }
-
-    /// Finish retained acquisition and report disposal to an external cleanup owner.
-    /// The caller must retain this guard until the returned future is terminal.
-    pub async fn discard_with_result(&mut self) -> ThreadStoreResult<()> {
+    pub async fn discard(&mut self) -> ThreadStoreResult<()> {
         self.finish_acquisition().await?;
         let Some(live_thread) = self.live_thread.take() else {
             return Ok(());
         };
         live_thread.discard().await
+    }
+
+    /// Disposal for an externally retained cleanup transaction. The caller must
+    /// retain this guard and the original future until a terminal receipt.
+    /// On failure or cancellation, retain the actual writer handle in the guard.
+    pub async fn discard_with_result(&mut self) -> ThreadStoreResult<()> {
+        self.finish_acquisition().await?;
+        let Some(live_thread) = self.live_thread.as_ref() else {
+            return Ok(());
+        };
+        live_thread.discard().await?;
+        self.live_thread = None;
+        Ok(())
     }
 }
 
@@ -153,7 +155,16 @@ impl LiveThread {
     ) -> ThreadStoreResult<Self> {
         let thread_id = params.thread_id;
         let history_mode = params.history_mode;
-        let metadata_sync = ThreadMetadataSync::for_create(&params).await;
+        let inherited_preview = if params.forked_from_id.is_some() {
+            thread_store
+                .read_pending_thread_metadata(thread_id)
+                .await?
+                .and_then(|patch| patch.preview)
+        } else {
+            None
+        };
+        let metadata_sync =
+            ThreadMetadataSync::for_create(&params, inherited_preview.as_deref()).await;
         thread_store.create_thread(params).await?;
         Ok(Self {
             thread_id,
@@ -194,14 +205,14 @@ impl LiveThread {
         Ok(live_thread)
     }
 
+    /// Reopens persistence and returns the replay history selected under writer ownership.
     pub async fn resume(
         thread_store: Arc<dyn ThreadStore>,
         history_mode: ThreadHistoryMode,
-        params: ResumeThreadParams,
-    ) -> ThreadStoreResult<Self> {
+        mut params: ResumeThreadParams,
+        resume_preparation: Option<ThreadStoreResumePreparation>,
+    ) -> ThreadStoreResult<(Self, Arc<Vec<RolloutItem>>)> {
         let thread_id = params.thread_id;
-        let should_load_history = params.history.is_none();
-        let include_archived = params.include_archived;
         let metadata = if history_mode == ThreadHistoryMode::Paginated
             && let Some(local_store) = thread_store.as_any().downcast_ref::<LocalThreadStore>()
             && let Some(state_db) = local_store.state_db().await
@@ -215,35 +226,27 @@ impl LiveThread {
         } else {
             None
         };
-        let mut metadata_sync = ThreadMetadataSync::for_resume(&params, metadata.as_ref());
-        thread_store.resume_thread(params).await?;
-        if should_load_history {
-            match thread_store
-                .load_history(LoadThreadHistoryParams {
-                    thread_id,
-                    include_archived,
-                })
-                .await
-            {
-                Ok(history) => metadata_sync.record_resume_history(&history.items),
-                Err(err) => {
-                    if let Err(discard_err) = thread_store.discard_thread(thread_id).await {
-                        warn!(
-                            "failed to discard thread persistence after resume history load failed: {discard_err}"
-                        );
-                    }
-                    return Err(err);
-                }
+        let history = match resume_preparation {
+            Some(preparation) => {
+                thread_store
+                    .resume_thread_with_preparation(params.clone(), preparation)
+                    .await?
             }
-        }
-        Ok(Self {
-            thread_id,
-            history_mode,
-            thread_store,
-            metadata_sync: Arc::new(Mutex::new(metadata_sync)),
-            write_gate: Arc::new(Mutex::new(false)),
-            persistence_telemetry: RolloutPersistenceTelemetry::new(thread_id),
-        })
+            None => thread_store.resume_thread(params.clone()).await?,
+        };
+        params.history = Some(Arc::clone(&history));
+        let metadata_sync = ThreadMetadataSync::for_resume(&params, metadata.as_ref());
+        Ok((
+            Self {
+                thread_id,
+                history_mode,
+                thread_store,
+                metadata_sync: Arc::new(Mutex::new(metadata_sync)),
+                write_gate: Arc::new(Mutex::new(false)),
+                persistence_telemetry: RolloutPersistenceTelemetry::new(thread_id),
+            },
+            history,
+        ))
     }
 
     #[tracing::instrument(
@@ -439,6 +442,18 @@ impl LiveThread {
             .live_rollout_path(self.thread_id)
             .await
             .map(Some)
+    }
+
+    /// Selects a local feedback input only after its writer has materialized it.
+    pub async fn feedback_rollout_path(&self) -> ThreadStoreResult<Option<PathBuf>> {
+        let Some(local_store) = self
+            .thread_store
+            .as_any()
+            .downcast_ref::<LocalThreadStore>()
+        else {
+            return Ok(None);
+        };
+        local_store.feedback_rollout_path(self.thread_id).await
     }
 
     async fn flush_pending_metadata_update(&self) -> ThreadStoreResult<()> {

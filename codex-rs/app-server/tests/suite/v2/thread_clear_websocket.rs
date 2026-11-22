@@ -56,6 +56,9 @@ mod clear_recovery;
 #[path = "thread_clear_settings.rs"]
 mod clear_settings;
 
+#[path = "thread_clear_idle_fence.rs"]
+mod clear_idle_fence;
+
 #[derive(Debug)]
 enum ClearEvidence {
     Ended(ThreadClearEndedNotification),
@@ -820,14 +823,18 @@ async fn cleared_and_control_threads_keep_operational_other_idle_unload() -> Res
     )]));
     let predecessor = start_thread_with_config(&mut client, 2, config.clone()).await?;
     send_clear(&mut client, 3, &predecessor).await?;
-    let (response, _) = read_clear_outcome(&mut client, 3).await?;
+    let (response, _, closed_before_response) =
+        read_clear_outcome_observing_closed(&mut client, 3).await?;
     // Neither subscription retains its runtime. Observe both closures without
     // assuming an order between the predecessor and its unretained successor.
+    // The unretained predecessor's idle deadline is independent of the clear,
+    // so its `thread/closed` broadcast may precede the clear response.
     timeout(Duration::from_secs(10), async {
         let mut pending = std::collections::BTreeSet::from([
             predecessor.as_str(),
             response.successor_thread.id.as_str(),
         ]);
+        pending.retain(|thread_id| !closed_before_response.contains(*thread_id));
         while !pending.is_empty() {
             if let JSONRPCMessage::Notification(notification) =
                 read_jsonrpc_message(&mut client).await?
@@ -1239,6 +1246,7 @@ async fn send_clear(stream: &mut WsClient, id: i64, thread_id: &str) -> Result<(
                 model: Some("mock-model".to_string()),
                 reasoning_effort: None,
             }),
+            retain_for_connection: false,
         })?),
     )
     .await
@@ -1248,8 +1256,24 @@ async fn read_clear_outcome(
     stream: &mut WsClient,
     id: i64,
 ) -> Result<(ThreadClearResponse, Vec<ClearEvidence>)> {
+    let (response, evidence, _) = read_clear_outcome_observing_closed(stream, id).await?;
+    Ok((response, evidence))
+}
+
+/// Like `read_clear_outcome`, but also returns the ids from every
+/// `thread/closed` broadcast that arrived before the clear response instead of
+/// silently discarding them.
+async fn read_clear_outcome_observing_closed(
+    stream: &mut WsClient,
+    id: i64,
+) -> Result<(
+    ThreadClearResponse,
+    Vec<ClearEvidence>,
+    std::collections::BTreeSet<String>,
+)> {
     let target = RequestId::Integer(id);
     let mut evidence = Vec::new();
+    let mut closed = std::collections::BTreeSet::new();
     loop {
         match read_jsonrpc_message(stream).await? {
             JSONRPCMessage::Error(error) if error.id == target => {
@@ -1259,7 +1283,19 @@ async fn read_clear_outcome(
                 if evidence.len() != 2 {
                     bail!("thread/clear responded before its complete evidence pair");
                 }
-                return Ok((to_response(response)?, evidence));
+                return Ok((to_response(response)?, evidence, closed));
+            }
+            JSONRPCMessage::Notification(notification)
+                if notification.method == "thread/closed" =>
+            {
+                if let Some(thread_id) = notification
+                    .params
+                    .as_ref()
+                    .and_then(|params| params.get("threadId"))
+                    .and_then(serde_json::Value::as_str)
+                {
+                    closed.insert(thread_id.to_string());
+                }
             }
             JSONRPCMessage::Notification(notification)
                 if notification.method == "thread/clear/ended" =>

@@ -34,7 +34,9 @@ pub enum ThreadLoopOutcome {
 /// Cleanup execution receipt. API failures are not internal-task join proofs.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ThreadCleanupOutcome {
-    Finished { persistence_failed: bool },
+    Finished {
+        persistence_failed: bool,
+    },
     Panicked,
     TimedOut,
     AuthorityUnavailable,
@@ -43,6 +45,34 @@ pub enum ThreadCleanupOutcome {
     TaskJoinFailed,
     ConversationShutdownFailed,
     CodeModeShutdownFailed,
+    /// Session cleanup otherwise finished cleanly, but the session's census
+    /// holds sandbox helper cleanup that is not proven complete (a missing
+    /// or non-complete receipt); `timed_out` when some cleanup passed its
+    /// deadline. Retirement must keep ownership rather than claim clean.
+    SandboxCleanupUnproven {
+        timed_out: bool,
+    },
+}
+
+impl ThreadCleanupOutcome {
+    /// The cleanup outcome as observed together with the session's sandbox
+    /// cleanup census. Only an otherwise clean receipt is qualified; any
+    /// other failure stays exactly as recorded.
+    pub(crate) fn with_sandbox_cleanup_census(
+        cleanup: CleanupExecution,
+        census: crate::sandboxing::cleanup_census::SandboxCleanupCensusTotals,
+    ) -> Self {
+        let outcome = Self::from(cleanup);
+        let clean = Self::Finished {
+            persistence_failed: false,
+        };
+        if outcome == clean && census.has_unproven() {
+            return Self::SandboxCleanupUnproven {
+                timed_out: census.has_timed_out(),
+            };
+        }
+        outcome
+    }
 }
 
 impl From<CleanupExecution> for ThreadCleanupOutcome {
@@ -59,6 +89,9 @@ impl From<CleanupExecution> for ThreadCleanupOutcome {
             CleanupExecution::TaskJoinFailed => Self::TaskJoinFailed,
             CleanupExecution::ConversationShutdownFailed => Self::ConversationShutdownFailed,
             CleanupExecution::CodeModeShutdownFailed => Self::CodeModeShutdownFailed,
+            CleanupExecution::SandboxCleanupUnproven { timed_out } => {
+                Self::SandboxCleanupUnproven { timed_out }
+            }
         }
     }
 }
@@ -131,10 +164,66 @@ impl ThreadRetirement {
 }
 
 impl CodexThread {
+    /// Read-only receipt census; this never drives cleanup or certifies release.
+    pub fn sandbox_cleanup_outcome(&self) -> Option<ThreadCleanupOutcome> {
+        let totals = self.session.services.sandbox_cleanup_census().totals();
+        totals
+            .has_unproven()
+            .then_some(ThreadCleanupOutcome::SandboxCleanupUnproven {
+                timed_out: totals.has_timed_out(),
+            })
+    }
+
+    /// Bind this runtime's cleanup deadline before any Shutdown submission,
+    /// so session cleanup runs deadline-bound instead of legacy (no internal
+    /// 30s budgets, no polling after expiry). Creates no retirement ticket and
+    /// closes no admission; an earlier, tighter binding is kept (min).
+    pub fn bind_shutdown_deadline(
+        &self,
+        deadline: Instant,
+    ) -> Result<Instant, ThreadRetirementError> {
+        self.session
+            .cleanup_owner()
+            .bind_deadline(deadline)
+            .map_err(|error| match error {
+                DeadlineBindingError::LegacyCleanupStarted => {
+                    ThreadRetirementError::LegacyCleanupStarted
+                }
+                DeadlineBindingError::AuthorityUnavailable => {
+                    ThreadRetirementError::AuthorityUnavailable
+                }
+            })
+    }
+
+    /// Permanent host/manager shutdown edge only: as `bind_shutdown_deadline`, and a cleanup
+    /// that already started in Legacy mode is additionally clamped live to
+    /// `deadline` (still refused). Ordinary reset and retirement must use
+    /// `bind_shutdown_deadline`, which leaves Legacy cleanup free to finish.
+    pub(crate) fn bind_shutdown_edge_deadline(
+        &self,
+        deadline: Instant,
+    ) -> Result<Instant, ThreadRetirementError> {
+        self.session
+            .cleanup_owner()
+            .bind_shutdown_edge_deadline(deadline)
+            .map_err(|error| match error {
+                DeadlineBindingError::LegacyCleanupStarted => {
+                    ThreadRetirementError::LegacyCleanupStarted
+                }
+                DeadlineBindingError::AuthorityUnavailable => {
+                    ThreadRetirementError::AuthorityUnavailable
+                }
+            })
+    }
+
     /// Previously recorded resource cleanup plus this exact loop's join.
     /// Used for custody compaction, not to invent an ordinary classification
     /// or certify that legacy work ran under a newly supplied deadline.
     pub(crate) fn observed_terminal_cleanup(&self) -> Option<SessionLoopOutcome> {
+        // Unproven sandbox cleanup is never terminal: keep custody retained.
+        if self.sandbox_cleanup_outcome().is_some() {
+            return None;
+        }
         if !self.session.cleanup_owner().reconciled()
             && self.session.cleanup_owner().completed()
                 != Some(CleanupExecution::Finished {
@@ -144,6 +233,31 @@ impl CodexThread {
             return None;
         }
         self.io.session_loop_termination.observed()
+    }
+
+    /// Separate, passive observation that this exact runtime released its
+    /// session resources, possibly after its retirement deadline.
+    ///
+    /// Resolves once this exact session loop has joined. Yields `true` only
+    /// when the loop joined normally and the cleanup owner attached at loop
+    /// birth had already recorded `Finished { persistence_failed: false }`.
+    /// It only awaits the loop join and peeks the recorded receipt: it never
+    /// polls, resumes, rebinds, or refreshes cleanup, and it never changes a
+    /// `ThreadRetirement` report. A timed-out report stays timed out; callers
+    /// may use a `true` result only as independent release evidence. Cleanup
+    /// abandoned at its deadline records no receipt and yields `false`.
+    pub fn observe_resource_release(
+        &self,
+    ) -> impl std::future::Future<Output = bool> + Send + 'static + use<> {
+        let termination = self.io.session_loop_termination.clone();
+        async move {
+            let joined = termination.clone().await;
+            joined == SessionLoopOutcome::Normal
+                && termination.cleanup_completed()
+                    == Some(CleanupExecution::Finished {
+                        persistence_failed: false,
+                    })
+        }
     }
 
     /// Atomically checks idle work and closes task admission before returning
@@ -287,6 +401,8 @@ impl ThreadRetirement {
             }
             // Aborting the loop can drop its cleanup observer, but not the
             // owner's original. Drive that same cleanup independently now.
+            let sandbox_cleanup_census =
+                std::sync::Arc::clone(session.services.sandbox_cleanup_census());
             let (session_loop, cleanup) = tokio::join!(
                 tokio::time::timeout_at(deadline, io.session_loop_termination.clone()),
                 owner.observe(session),
@@ -299,7 +415,10 @@ impl ThreadRetirement {
                     Ok(SessionLoopOutcome::Panicked) => ThreadLoopOutcome::Panicked,
                     Err(_) => ThreadLoopOutcome::TimedOut,
                 },
-                cleanup: cleanup.into(),
+                cleanup: ThreadCleanupOutcome::with_sandbox_cleanup_census(
+                    cleanup,
+                    sandbox_cleanup_census.totals(),
+                ),
             }
         }
         .boxed()

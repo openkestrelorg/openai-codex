@@ -77,11 +77,12 @@ const SESSION_ALREADY_ATTACHED_ERROR_CODE: i64 = -32010;
 struct DirectExecutorAuth;
 
 impl AuthProvider for DirectExecutorAuth {
-    fn add_auth_headers(&self, headers: &mut HeaderMap) {
+    fn add_auth_headers(&self, headers: &mut HeaderMap) -> Result<(), codex_api::AuthError> {
         headers.insert(
             http::header::AUTHORIZATION,
             HeaderValue::from_static("AWS4-HMAC-SHA256 test-signature"),
         );
+        Ok(())
     }
 }
 
@@ -319,7 +320,7 @@ async fn accepted_websocket_interoperates_and_recovers_with_real_direct_executor
         }
         timeout(
             TEST_TIMEOUT,
-            connection_state.wait_for(|state| *state == EnvironmentConnectionState::Disconnected),
+            connection_state.wait_for(|state| *state == EnvironmentConnectionState::Recovering),
         )
         .await??;
         tokio::fs::write(&gate_path, b"").await?;
@@ -407,7 +408,7 @@ async fn accepted_websocket_interoperates_and_recovers_with_real_direct_executor
                     last_seq = seq;
                     saw_exit = true;
                 }
-                ExecProcessEvent::Closed { seq } => {
+                ExecProcessEvent::Closed { seq, .. } => {
                     assert!(saw_exit, "closed must be delivered after exit");
                     assert_eq!(seq, last_seq + 1);
                     break;
@@ -632,6 +633,7 @@ async fn accepted_websocket_reconnect_recovers_running_process_and_output() -> R
         JSONRPCMessage::Response(JSONRPCResponse {
             id,
             result: serde_json::to_value(ReadResponse {
+                sandbox_cleanup: None,
                 chunks: Vec::new(),
                 next_seq: 1,
                 exited: false,
@@ -665,6 +667,7 @@ async fn accepted_websocket_reconnect_recovers_running_process_and_output() -> R
         }
     );
     let response = ReadResponse {
+        sandbox_cleanup: None,
         chunks: Vec::new(),
         next_seq: 1,
         exited: false,

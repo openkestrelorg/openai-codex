@@ -87,6 +87,17 @@ impl ConnectionTransport {
     }
 }
 
+pub(crate) fn record_recovery_retention_expired(reason: &str, retention: Duration) {
+    tracing::event!(
+        target: "codex_otel.log_only",
+        parent: None,
+        tracing::Level::INFO,
+        event.name = "codex.exec_server.recovery_retention_expired",
+        reason,
+        retention_limit_ms = retention.as_millis() as u64,
+    );
+}
+
 #[derive(Clone, Default)]
 pub struct ExecServerTelemetry {
     inner: Option<Arc<ExecServerTelemetryInner>>,
@@ -217,6 +228,28 @@ impl ExecServerTelemetry {
         let _ = metrics.counter("codex.shell_snapshot", /*inc*/ 1, &tags);
     }
 
+    /// One observation per eligible execution preparation, excluding prewarm.
+    /// `used` means selected for replay, not that restoration or execution succeeded.
+    #[cfg(unix)]
+    pub(crate) fn shell_snapshot_command(
+        &self,
+        wait: Duration,
+        state: &'static str,
+        outcome: &'static str,
+    ) {
+        let Some(metrics) = self
+            .inner
+            .as_ref()
+            .map(|inner| inner.metrics.clone())
+            .or_else(codex_otel::global)
+        else {
+            return;
+        };
+        let tags = [("version", "v2"), ("state", state), ("outcome", outcome)];
+        let _ = metrics.counter("codex.shell_snapshot.command", /*inc*/ 1, &tags);
+        let _ = metrics.record_duration("codex.shell_snapshot.wait_ms", wait, &tags);
+    }
+
     pub(crate) fn remote_registration_completed(&self, result: &'static str, duration: Duration) {
         self.record_operation(REMOTE_REGISTRATION_METRICS, result, duration);
     }
@@ -240,10 +273,8 @@ impl ExecServerTelemetry {
             inner.adjust_process_count(/*delta*/ 1);
         });
         let parent = codex_otel::current_span_w3c_trace_context();
-        // `parent:` accepts a local tracing span/ID, not a W3C context. A local
-        // parent would keep the request span alive until process exit and delay
-        // its export. Select the W3C parent at creation while keeping this a
-        // tracing root, including under the managed eager telemetry layer.
+        // Keep this a tracing root so process lifetime does not retain the
+        // request span; select its W3C parent before eager managed construction.
         let span = codex_otel::root_span_with_w3c_parent(parent.as_ref(), || {
             tracing::info_span!(
                 parent: None,
@@ -426,3 +457,7 @@ fn register_active_gauge(
         warn!(metric = name, "failed to register exec-server gauge");
     }
 }
+
+#[cfg(test)]
+#[path = "managed_trace_parent_tests.rs"]
+mod managed_trace_parent_tests;

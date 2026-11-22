@@ -1,4 +1,5 @@
 use crate::command_migration::migrate_plugin_commands;
+use crate::manifest::ManifestCache;
 use crate::manifest::PluginManifest;
 use crate::manifest::PluginManifestFormat;
 use crate::manifest::load_plugin_manifest;
@@ -19,6 +20,7 @@ use std::io;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 pub use codex_core_plugin_common::installed::DEFAULT_PLUGIN_VERSION;
 pub use codex_core_plugin_common::installed::PLUGINS_CACHE_DIR;
@@ -39,6 +41,7 @@ pub struct PluginInstallResult {
 
 #[derive(Debug, Clone)]
 pub struct PluginStore {
+    pub(crate) manifest_cache: Arc<ManifestCache>,
     codex_home: AbsolutePathBuf,
     root: AbsolutePathBuf,
     data_root: AbsolutePathBuf,
@@ -91,6 +94,7 @@ impl PluginStore {
             .map_err(|err| PluginStoreError::io("failed to resolve Codex home", err))?;
 
         Ok(Self {
+            manifest_cache: Arc::new(ManifestCache::default()),
             codex_home,
             root,
             data_root,
@@ -553,6 +557,8 @@ fn replace_plugin_root_atomically(
     plugin_version: &str,
     manifest: InstallManifest<'_>,
 ) -> Result<(), PluginStoreError> {
+    crate::retirement::ensure_worker_running("plugin cache staging")
+        .map_err(PluginStoreError::Invalid)?;
     let Some(parent) = target_root.parent() else {
         return Err(PluginStoreError::Invalid(format!(
             "plugin cache path has no parent: {}",
@@ -641,6 +647,8 @@ fn replace_plugin_root_atomically(
         tracing::warn!(%err, "failed to migrate plugin commands into skills");
     }
 
+    crate::retirement::ensure_worker_running("plugin cache activation")
+        .map_err(PluginStoreError::Invalid)?;
     let target_version_root = target_root.join(plugin_version);
     if target_root.exists() && !target_version_root.exists() {
         fs::rename(&staged_version_root, &target_version_root).map_err(|err| {
@@ -730,6 +738,8 @@ fn compare_plugin_versions(left: &str, right: &str) -> Ordering {
 }
 
 fn copy_dir_recursive(source: &Path, target: &Path) -> Result<(), PluginStoreError> {
+    crate::retirement::ensure_worker_running("plugin source copy")
+        .map_err(PluginStoreError::Invalid)?;
     fs::create_dir_all(target)
         .map_err(|err| PluginStoreError::io("failed to create plugin target directory", err))?;
 
@@ -738,6 +748,8 @@ fn copy_dir_recursive(source: &Path, target: &Path) -> Result<(), PluginStoreErr
     {
         let entry =
             entry.map_err(|err| PluginStoreError::io("failed to enumerate plugin source", err))?;
+        crate::retirement::ensure_worker_running("next plugin copy entry")
+            .map_err(PluginStoreError::Invalid)?;
         let source_path = entry.path();
         let target_path = target.join(entry.file_name());
         let file_type = entry

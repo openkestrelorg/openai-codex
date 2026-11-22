@@ -8,6 +8,7 @@ use codex_protocol::auth::KnownPlan as InternalKnownPlan;
 use codex_protocol::auth::PlanType as InternalPlanType;
 use codex_protocol::protocol::SessionSource;
 
+use anyhow::Context;
 use base64::Engine;
 use codex_protocol::config_types::ForcedLoginMethod;
 use codex_protocol::config_types::ModelProviderAuthInfo;
@@ -59,116 +60,126 @@ fn header_auth_exposes_a_valid_chatgpt_account_id() {
 }
 
 #[tokio::test]
-async fn managed_account_projection_is_exact_guarded_and_credential_free() {
-    let home = tempdir().unwrap();
-    write_managed_auth_file(
+#[serial(codex_auth_env)]
+async fn cancelled_refresh_marks_only_started_exchanges_as_unsettled() -> anyhow::Result<()> {
+    let _access_token_guard = remove_access_token_env_var();
+    let home = tempdir()?;
+    write_auth_file(
         AuthFileParams {
             openai_api_key: None,
-            chatgpt_plan_type: Some("pro".to_owned()),
-            chatgpt_account_id: Some("projection-account".to_owned()),
+            chatgpt_plan_type: Some("pro".into()),
+            chatgpt_account_id: Some(WORKSPACE_ID_ALLOWED.into()),
         },
         home.path(),
-    )
-    .unwrap();
-    let manager = AuthManager::new(
-        home.path().to_path_buf(),
-        /*enable_codex_api_key_env*/ false,
-        AuthCredentialsStoreMode::File,
-        /*forced_chatgpt_workspace_id*/ None,
-        /*chatgpt_base_url*/ None,
-        AuthKeyringBackendKind::default(),
-        crate::test_support::transport_default_auth_route_config(),
-    )
-    .await;
-    let fingerprint = AuthManager::managed_account_fingerprint("projection-account");
-    let revision = *manager.auth_change_receiver().borrow();
-    let projected = manager
-        .with_managed_account_projection(Some(&fingerprint), |mode, plan| {
-            assert!(
-                manager.inner.try_write().is_err(),
-                "cache guard must span the callback"
-            );
-            assert!(
-                manager.external_auth.try_write().is_err(),
-                "external authority stays fenced"
-            );
-            (mode, plan)
+    )?;
+    let server = MockServer::start().await;
+    let storage = FileAuthStorage::new(home.path().to_path_buf());
+    let mut stored = storage.load()?.context("stored credentials")?;
+    let tokens = stored.tokens.as_mut().context("stored tokens")?;
+    tokens.oauth_provenance = Some(AccountOAuthProvenance {
+        issuer: server.uri(),
+        client_id: "codex-client".into(),
+    });
+    // Workspace switching retains the original ID and refresh tokens.
+    tokens.account_id = Some(WORKSPACE_ID_SECOND_ALLOWED.into());
+    tokens.access_token = fake_jwt_for_auth_file_params(&AuthFileParams {
+        openai_api_key: None,
+        chatgpt_plan_type: Some("business".into()),
+        chatgpt_account_id: Some(WORKSPACE_ID_SECOND_ALLOWED.into()),
+    })?;
+    storage.save(&stored)?;
+    let manager = Arc::new(
+        AuthManager::new_from_auth_config(
+            build_config(
+                home.path(),
+                /*forced_login_method*/ None,
+                /*forced_chatgpt_workspace_id*/ None,
+            )
+            .await,
+            /*enable_codex_api_key_env*/ false,
+            /*allowed_auth_modes*/ None,
+        )
+        .await,
+    );
+    let initial = manager.auth_cached().context("initial auth")?;
+
+    // Poll directly while the guard is held, then cancel before any OAuth request.
+    let guard = manager.refresh_lock.acquire().await?;
+    let mut waiting = Box::pin(manager.refresh_token_if_unchanged(&initial));
+    assert!(
+        waiting
+            .as_mut()
+            .poll(&mut std::task::Context::from_waker(
+                std::task::Waker::noop(),
+            ))
+            .is_pending()
+    );
+    drop(waiting);
+    assert!(!manager.is_chatgpt_refresh_unsettled(&initial)?);
+    assert!(server.received_requests().await.unwrap().is_empty());
+    drop(guard);
+
+    let received = Arc::new(tokio::sync::Notify::new());
+    let notify = Arc::clone(&received);
+    Mock::given(path("/oauth/token"))
+        .respond_with(move |_: &wiremock::Request| {
+            notify.notify_one();
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_secs(60))
+                .set_body_json(json!({"access_token": "late", "refresh_token": "late-refresh"}))
         })
-        .unwrap();
-    assert_eq!(
-        projected,
-        (Some(AuthMode::Chatgpt), Some(AccountPlanType::Pro))
-    );
-    assert_eq!(*manager.auth_change_receiver().borrow(), revision);
-    let terminal = manager
-        .prepare_managed_terminal_commit(Some(&fingerprint))
-        .await
-        .unwrap();
-    let storage = create_auth_storage(
-        home.path().to_path_buf(),
-        AuthCredentialsStoreMode::File,
-        AuthKeyringBackendKind::default(),
-    );
-    let mut raw = storage.load().unwrap().unwrap();
-    let competing_writer = storage.lock_managed_source().unwrap();
-    assert!(matches!(
-        manager.with_managed_terminal_projection(&terminal, |_, _| panic!(
-            "contended source must not publish"
-        )),
-        Err(ManagedTerminalVerificationError::SourceUnavailable(
-            ManagedAuthStorageError::ReadFailed(ManagedAuthStorageFailure::CoordinationContended)
-        ))
-    ));
-    drop(competing_writer);
-    // Contention did not consume the proof or obscure the cached authority;
-    // the same unchanged precondition can be checked after the writer leaves.
-    assert_eq!(
-        manager
-            .with_managed_terminal_projection(&terminal, |mode, plan| {
-                assert!(manager.inner.try_write().is_err());
-                assert!(manager.external_auth.try_write().is_err());
-                assert!(
-                    storage.save(&raw).is_err(),
-                    "cooperating writer must be excluded through callback"
-                );
-                (mode, plan)
-            })
-            .unwrap(),
-        (Some(AuthMode::Chatgpt), Some(AccountPlanType::Pro))
-    );
-    raw.tokens.as_mut().unwrap().access_token = "replaced-after-final-verification".to_owned();
-    storage.save(&raw).unwrap();
-    assert!(matches!(
-        manager.with_managed_terminal_projection(&terminal, |_, _| panic!(
-            "changed durable source must not publish"
-        )),
-        Err(ManagedTerminalVerificationError::SourceChanged)
-    ));
-    assert!(matches!(
-        manager.with_managed_account_projection(Some("wrong"), |_, _| {
-            panic!("mismatched cache must not publish")
-        }),
-        Err(ManagedAdoptionVerificationError::IntendedResultMismatch)
-    ));
-    manager.inner.write().unwrap().auth = None;
+        .expect(1)
+        .mount(&server)
+        .await;
+    let refreshing = Arc::clone(&manager);
+    let task = tokio::spawn(async move { refreshing.refresh_token_from_authority().await });
+    received.notified().await;
+    assert!(manager.is_chatgpt_refresh_unsettled(&initial)?);
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    assert!(manager.is_chatgpt_refresh_unsettled(&initial)?);
+
+    // A later known failure cannot resolve an earlier cancelled exchange.
+    server.reset().await;
+    Mock::given(path("/oauth/token"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(1)
+        .mount(&server)
+        .await;
+    assert!(manager.refresh_token_from_authority().await.is_err());
+    assert!(manager.is_chatgpt_refresh_unsettled(&initial)?);
+
+    // A replacement is usable, and a completed refresh settles its own generation.
+    server.reset().await;
+    Mock::given(path("/oauth/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "completed", "refresh_token": "completed-refresh",
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let tokens = stored.tokens.as_mut().context("replacement tokens")?;
+    tokens.access_token = "replacement".into();
+    tokens.refresh_token = "replacement-refresh".into();
+    storage.save(&stored)?;
+    manager.reload().await;
+    let replacement = manager.auth_cached().context("replacement auth")?;
+    assert!(!manager.is_chatgpt_refresh_unsettled(&replacement)?);
+    manager.refresh_token_from_authority().await?;
+    assert!(!manager.is_chatgpt_refresh_unsettled(&replacement)?);
     assert_eq!(
         manager
-            .with_managed_account_projection(None, |mode, plan| (mode, plan))
-            .unwrap(),
-        (None, None)
+            .auth_cached()
+            .context("refreshed auth")?
+            .get_token()?,
+        "completed"
     );
-    manager.inner.write().unwrap().initial_load_failed = true;
-    assert!(matches!(
-        manager.with_managed_account_projection(None, |_, _| {
-            panic!("unavailable authority must not publish absence")
-        }),
-        Err(ManagedAdoptionVerificationError::CacheUnavailable)
-    ));
+    Ok(())
 }
 
 #[tokio::test]
-async fn refresh_without_id_token() {
-    let codex_home = tempdir().unwrap();
+async fn refresh_without_id_token() -> anyhow::Result<()> {
+    let codex_home = tempdir()?;
     let fake_jwt = write_auth_file(
         AuthFileParams {
             openai_api_key: None,
@@ -176,26 +187,67 @@ async fn refresh_without_id_token() {
             chatgpt_account_id: None,
         },
         codex_home.path(),
-    )
-    .expect("failed to write auth file");
+    )?;
 
     let storage = create_auth_storage(
         codex_home.path().to_path_buf(),
         AuthCredentialsStoreMode::File,
         AuthKeyringBackendKind::default(),
     );
+    let provenance = AccountOAuthProvenance {
+        issuer: "https://idp.example".to_string(),
+        client_id: "codex-client".to_string(),
+    };
+    let initial = storage
+        .load()?
+        .context("stored auth")?
+        .tokens
+        .context("stored tokens")?;
     let updated = super::persist_tokens(
         &storage,
+        &initial,
+        Some(provenance.clone()),
         /*id_token*/ None,
         Some("new-access-token".to_string()),
         Some("new-refresh-token".to_string()),
-    )
-    .expect("update_tokens should succeed");
+    )?;
 
-    let tokens = updated.tokens.expect("tokens should exist");
+    let tokens = updated.tokens.context("persisted auth is missing tokens")?;
     assert_eq!(tokens.id_token.raw_jwt, fake_jwt);
     assert_eq!(tokens.access_token, "new-access-token");
     assert_eq!(tokens.refresh_token, "new-refresh-token");
+    assert_eq!(tokens.oauth_provenance, Some(provenance.clone()));
+
+    let updated = super::persist_tokens(
+        &storage,
+        &tokens,
+        /*provenance*/ None,
+        /*id_token*/ None,
+        Some("later-access-token".to_string()),
+        /*refresh_token*/ None,
+    )?;
+    let previous = tokens;
+    let tokens = updated.tokens.context("persisted auth is missing tokens")?;
+    assert_eq!(tokens.refresh_token, "new-refresh-token");
+    assert_eq!(tokens.oauth_provenance, None);
+
+    // Reject this stale refresh response: newer tokens have already been saved
+    // for the same account.
+    let before = storage.load()?;
+    assert!(
+        super::persist_tokens(
+            &storage,
+            &previous,
+            Some(provenance),
+            /*id_token*/ None,
+            Some("stale-access-token".into()),
+            Some("stale-refresh-token".into()),
+        )
+        .is_err()
+    );
+    assert_eq!(storage.load()?, before);
+
+    Ok(())
 }
 
 #[test]
@@ -211,26 +263,32 @@ fn login_with_api_key_overwrites_existing_auth_json() {
             "account_id": "stale-acc"
         }
     });
-    std::fs::write(
-        &auth_path,
-        serde_json::to_string_pretty(&stale_auth).unwrap(),
-    )
-    .unwrap();
-
-    super::login_with_api_key(
-        dir.path(),
+    for api_key in [
         "sk-new",
-        AuthCredentialsStoreMode::File,
-        AuthKeyringBackendKind::default(),
-    )
-    .expect("login_with_api_key should succeed");
+        "sk-proj-fedramp-synthetic-test-key",
+        "sk-svcacct-fedramp-synthetic-test-key",
+    ] {
+        std::fs::write(
+            &auth_path,
+            serde_json::to_string_pretty(&stale_auth).unwrap(),
+        )
+        .unwrap();
 
-    let storage = FileAuthStorage::new(dir.path().to_path_buf());
-    let auth = storage
-        .try_read_auth_json(&auth_path)
-        .expect("auth.json should parse");
-    assert_eq!(auth.openai_api_key.as_deref(), Some("sk-new"));
-    assert!(auth.tokens.is_none(), "tokens should be cleared");
+        super::login_with_api_key(
+            dir.path(),
+            api_key,
+            AuthCredentialsStoreMode::File,
+            AuthKeyringBackendKind::default(),
+        )
+        .expect("login_with_api_key should succeed");
+
+        let storage = FileAuthStorage::new(dir.path().to_path_buf());
+        let auth = storage
+            .try_read_auth_json(&auth_path)
+            .expect("auth.json should parse");
+        assert_eq!(auth.openai_api_key.as_deref(), Some(api_key));
+        assert!(auth.tokens.is_none(), "tokens should be cleared");
+    }
 }
 
 #[tokio::test]
@@ -494,6 +552,8 @@ async fn stored_agent_identity_jwt_keeps_auth_json_unchanged() -> anyhow::Result
         AuthKeyringBackendKind::Direct,
         Some(&authapi_base_url),
         &crate::test_support::transport_default_auth_route_config(),
+        /*cached_auth*/ None,
+        /*allowed_auth_modes*/ None,
     )
     .await?
     .expect("auth should load");
@@ -674,6 +734,10 @@ async fn chatgpt_auth_registers_agent_identity_when_enabled() -> anyhow::Result<
         },
         codex_home.path(),
     )?;
+    let storage = FileAuthStorage::new(codex_home.path().to_path_buf());
+    let mut stored = storage.load()?.expect("auth should exist");
+    stored.tokens.as_mut().unwrap().login_owner_id = Some("login-a".into());
+    storage.save(&stored)?;
     let auth = super::load_auth(
         codex_home.path(),
         /*enable_codex_api_key_env*/ false,
@@ -684,9 +748,15 @@ async fn chatgpt_auth_registers_agent_identity_when_enabled() -> anyhow::Result<
         AuthKeyringBackendKind::Direct,
         /*agent_identity_authapi_base_url*/ None,
         &crate::test_support::transport_default_auth_route_config(),
+        /*cached_auth*/ None,
+        /*allowed_auth_modes*/ None,
     )
     .await?
     .expect("auth should load");
+
+    // An older client rewrites the same credentials without login metadata.
+    stored.tokens.as_mut().unwrap().login_owner_id = None;
+    storage.save(&stored)?;
 
     assert!(
         auth.agent_identity_auth(
@@ -756,6 +826,8 @@ async fn chatgpt_auth_registers_agent_identity_when_enabled() -> anyhow::Result<
         .expect("identity should persist");
     assert_eq!(persisted.agent_runtime_id, "agent-runtime-123");
     assert_eq!(persisted.task_id.as_deref(), Some("task-123"));
+    stored.agent_identity = Some(AgentIdentityStorage::Record(agent_auth.record().clone()));
+    assert_eq!(storage.load()?, Some(stored));
 
     let reloaded = super::load_auth(
         codex_home.path(),
@@ -767,6 +839,8 @@ async fn chatgpt_auth_registers_agent_identity_when_enabled() -> anyhow::Result<
         AuthKeyringBackendKind::Direct,
         /*agent_identity_authapi_base_url*/ None,
         &crate::test_support::transport_default_auth_route_config(),
+        /*cached_auth*/ None,
+        /*allowed_auth_modes*/ None,
     )
     .await?
     .expect("auth should reload");
@@ -810,6 +884,8 @@ async fn chatgpt_auth_retries_transient_agent_identity_registration() -> anyhow:
         AuthKeyringBackendKind::Direct,
         /*agent_identity_authapi_base_url*/ None,
         &crate::test_support::transport_default_auth_route_config(),
+        /*cached_auth*/ None,
+        /*allowed_auth_modes*/ None,
     )
     .await?
     .expect("auth should load");
@@ -877,6 +953,8 @@ async fn chatgpt_auth_registration_retry_exhaustion_is_fallback_eligible() -> an
         AuthKeyringBackendKind::Direct,
         /*agent_identity_authapi_base_url*/ None,
         &crate::test_support::transport_default_auth_route_config(),
+        /*cached_auth*/ None,
+        /*allowed_auth_modes*/ None,
     )
     .await?
     .expect("auth should load");
@@ -939,6 +1017,8 @@ async fn chatgpt_auth_task_registration_retry_exhaustion_is_fallback_eligible() 
         AuthKeyringBackendKind::Direct,
         /*agent_identity_authapi_base_url*/ None,
         &crate::test_support::transport_default_auth_route_config(),
+        /*cached_auth*/ None,
+        /*allowed_auth_modes*/ None,
     )
     .await?
     .expect("auth should load");
@@ -996,6 +1076,8 @@ async fn chatgpt_auth_non_retryable_registration_error_is_hard_failure() -> anyh
         AuthKeyringBackendKind::Direct,
         /*agent_identity_authapi_base_url*/ None,
         &crate::test_support::transport_default_auth_route_config(),
+        /*cached_auth*/ None,
+        /*allowed_auth_modes*/ None,
     )
     .await?
     .expect("auth should load");
@@ -1142,6 +1224,8 @@ async fn pro_account_with_no_api_key_uses_chatgpt_auth() {
         AuthKeyringBackendKind::Direct,
         /*agent_identity_authapi_base_url*/ None,
         &crate::test_support::transport_default_auth_route_config(),
+        /*cached_auth*/ None,
+        /*allowed_auth_modes*/ None,
     )
     .await
     .unwrap()
@@ -1172,6 +1256,8 @@ async fn pro_account_with_no_api_key_uses_chatgpt_auth() {
                 },
                 access_token: "test-access-token".to_string(),
                 refresh_token: "test-refresh-token".to_string(),
+                oauth_provenance: None,
+                login_owner_id: None,
                 account_id: None,
             }),
             last_refresh: Some(last_refresh),
@@ -1190,30 +1276,62 @@ async fn loads_api_key_from_auth_json() {
     let dir = tempdir().unwrap();
     let _access_token_guard = remove_access_token_env_var();
     let auth_file = dir.path().join("auth.json");
-    std::fs::write(
-        auth_file,
-        r#"{"OPENAI_API_KEY":"sk-test-key","tokens":null,"last_refresh":null}"#,
-    )
-    .unwrap();
+    for (api_key, expected_fedramp) in [
+        ("sk-test-key", false),
+        ("sk-proj-fedramp-synthetic-test-key", true),
+        ("sk-svcacct-fedramp-synthetic-test-key", true),
+        ("sk-proj-synthetic-test-key", false),
+        ("sk-svcacct-synthetic-test-key", false),
+        ("sk-proj-fedramp", false),
+        ("sk-svcacct-fedrampish-test-key", false),
+        ("sk-proj-FEDRAMP-test-key", false),
+        ("sk-admin-fedramp-test-key", false),
+        ("other-sk-proj-fedramp-test-key", false),
+    ] {
+        std::fs::write(
+            &auth_file,
+            json!({"OPENAI_API_KEY": api_key, "tokens": null, "last_refresh": null}).to_string(),
+        )
+        .unwrap();
 
-    let auth = super::load_auth(
-        dir.path(),
-        /*enable_codex_api_key_env*/ false,
+        let auth = super::load_auth(
+            dir.path(),
+            /*enable_codex_api_key_env*/ false,
+            AuthCredentialsStoreMode::File,
+            /*allowed_login_methods*/ None,
+            /*forced_chatgpt_workspace_id*/ None,
+            /*chatgpt_base_url*/ None,
+            AuthKeyringBackendKind::Direct,
+            /*agent_identity_authapi_base_url*/ None,
+            &crate::test_support::transport_default_auth_route_config(),
+            /*cached_auth*/ None,
+            /*allowed_auth_modes*/ None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(auth.auth_mode(), AuthMode::ApiKey);
+        assert_eq!(auth.api_key(), Some(api_key));
+        assert_eq!(
+            (auth.get_token().unwrap(), auth.is_fedramp_account()),
+            (api_key.to_string(), expected_fedramp)
+        );
+
+        assert!(auth.get_token_data().is_err());
+    }
+}
+
+#[test]
+fn logout_does_not_create_a_missing_file_store() -> std::io::Result<()> {
+    let root = tempdir()?;
+    let missing_home = root.path().join("missing");
+    assert!(!logout(
+        &missing_home,
         AuthCredentialsStoreMode::File,
-        /*allowed_login_methods*/ None,
-        /*forced_chatgpt_workspace_id*/ None,
-        /*chatgpt_base_url*/ None,
-        AuthKeyringBackendKind::Direct,
-        /*agent_identity_authapi_base_url*/ None,
-        &crate::test_support::transport_default_auth_route_config(),
-    )
-    .await
-    .unwrap()
-    .unwrap();
-    assert_eq!(auth.auth_mode(), AuthMode::ApiKey);
-    assert_eq!(auth.api_key(), Some("sk-test-key"));
-
-    assert!(auth.get_token_data().is_err());
+        AuthKeyringBackendKind::default()
+    )?);
+    assert!(!missing_home.exists());
+    Ok(())
 }
 
 #[test]
@@ -1261,20 +1379,20 @@ async fn unauthorized_recovery_reports_mode_and_step_names() {
     )
     .await;
     let managed = UnauthorizedRecovery {
-        expected_credential_fingerprint: None,
         manager: Arc::clone(&manager),
         step: UnauthorizedRecoveryStep::Reload,
         expected_account_id: None,
+        expected_credential_fingerprint: None,
         mode: UnauthorizedRecoveryMode::Managed,
     };
     assert_eq!(managed.mode_name(), "managed");
     assert_eq!(managed.step_name(), "reload");
 
     let external = UnauthorizedRecovery {
-        expected_credential_fingerprint: None,
         manager,
         step: UnauthorizedRecoveryStep::ExternalRefresh,
         expected_account_id: None,
+        expected_credential_fingerprint: None,
         mode: UnauthorizedRecoveryMode::External,
     };
     assert_eq!(external.mode_name(), "external");
@@ -1306,6 +1424,8 @@ async fn refresh_failure_is_scoped_to_the_matching_auth_snapshot() {
         AuthKeyringBackendKind::Direct,
         /*agent_identity_authapi_base_url*/ None,
         &crate::test_support::transport_default_auth_route_config(),
+        /*cached_auth*/ None,
+        /*allowed_auth_modes*/ None,
     )
     .await
     .expect("load auth")
@@ -1327,6 +1447,7 @@ async fn refresh_failure_is_scoped_to_the_matching_auth_snapshot() {
         AuthKeyringBackendKind::Direct,
         /*agent_identity_authapi_base_url*/ None,
         &crate::test_support::transport_default_auth_route_config(),
+        /*cached_auth*/ None,
     )
     .await
     .expect("updated auth should parse");
@@ -1340,6 +1461,51 @@ async fn refresh_failure_is_scoped_to_the_matching_auth_snapshot() {
 
     assert_eq!(manager.refresh_failure_for_auth(&auth), Some(error));
     assert_eq!(manager.refresh_failure_for_auth(&updated_auth), None);
+}
+
+#[tokio::test]
+async fn provider_credentials_follow_the_primary_network_policy() {
+    let script = ProviderAuthScript::new(&["provider-key", "rotated-provider-key"]).unwrap();
+    let controller = codex_http_client::NetworkPolicyController::default();
+    let policy = controller.policy();
+    let factory = HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault)
+        .with_network_policy(policy.clone());
+    let mut primary = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("login-key"));
+    Arc::get_mut(&mut primary).unwrap().auth_route_config =
+        AuthRouteConfig::from_http_client_factory(factory);
+    assert!(controller.publish(
+        policy.revision(),
+        codex_http_client::DestinationPolicy::Restricted {
+            allowed_hosts: ["allowed.example".to_string()].into_iter().collect(),
+        },
+    ));
+
+    let provider =
+        AuthManager::external_bearer_with_runtime(script.auth_config(), primary.runtime_config());
+    let transport = provider.http_client_factory();
+    let allowed = "https://allowed.example/".parse().unwrap();
+    let blocked = "https://blocked.example/".parse().unwrap();
+    let permit = transport.network_policy().acquire(&allowed).unwrap();
+    assert_eq!(
+        provider.auth().await.unwrap().api_key(),
+        Some("provider-key"),
+    );
+    permit.check().unwrap();
+    let first_owner = provider.auth_owner();
+
+    provider.refresh_token().await.unwrap();
+    assert_eq!(
+        provider.auth_cached().unwrap().api_key(),
+        Some("rotated-provider-key"),
+    );
+    assert!(!first_owner.is_current());
+    permit.check().unwrap();
+    assert!(transport.network_policy().acquire(&allowed).is_ok());
+    assert!(transport.network_policy().acquire(&blocked).is_err());
+
+    primary.set_cached_auth(Some(CodexAuth::from_api_key("another-login-key")));
+    assert!(permit.check().is_err());
+    assert!(transport.network_policy().acquire(&allowed).is_err());
 }
 
 #[tokio::test]
@@ -1559,6 +1725,180 @@ async fn external_auth_keeps_cached_credentials_after_permanent_reload_failure()
     assert_eq!(external_auth.resolve_count.load(Ordering::SeqCst), 2);
 }
 
+struct RecoveringExternalAuth {
+    initial: CodexAuth,
+    recovered: CodexAuth,
+    resolve_count: AtomicUsize,
+}
+
+impl ExternalAuth for RecoveringExternalAuth {
+    fn resolve(&self) -> ExternalAuthFuture<'_, CodexAuth> {
+        let attempt = self.resolve_count.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move {
+            match attempt {
+                0 => Ok(self.initial.clone()),
+                1 => Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "external credential exchange timed out",
+                )),
+                _ => Ok(self.recovered.clone()),
+            }
+        })
+    }
+
+    fn refresh(&self, _context: ExternalAuthRefreshContext) -> ExternalAuthFuture<'_, CodexAuth> {
+        self.resolve()
+    }
+}
+
+#[tokio::test]
+async fn external_auth_keeps_its_identity_through_a_transient_reload_failure() {
+    let manager = AuthManager::from_optional_auth_for_testing(/*auth*/ None);
+    let initial = CodexAuth::from_api_key("initial-token");
+    let recovered = CodexAuth::from_api_key("recovered-token");
+    manager
+        .set_external_auth(Arc::new(RecoveringExternalAuth {
+            initial: initial.clone(),
+            recovered,
+            resolve_count: AtomicUsize::new(0),
+        }))
+        .await
+        .expect("external auth should install");
+    let mut changes = manager.auth_change_state_receiver();
+    let mut revisions = manager.auth_change_receiver();
+    let initial_state = *changes.borrow_and_update();
+    let initial_revision = *revisions.borrow_and_update();
+
+    let retained = manager
+        .auth()
+        .await
+        .expect("cached auth should be retained");
+    assert_eq!(retained.api_key(), Some("initial-token"));
+    assert_eq!(*changes.borrow(), initial_state);
+    assert!(
+        !changes
+            .has_changed()
+            .expect("auth state sender remains alive")
+    );
+    assert_eq!(*revisions.borrow(), initial_revision);
+    assert!(
+        !revisions
+            .has_changed()
+            .expect("auth revision sender remains alive")
+    );
+    assert!(manager.refresh_failure_for_auth(&initial).is_none());
+
+    let recovered = manager.auth().await.expect("provider should recover");
+    assert_eq!(recovered.api_key(), Some("recovered-token"));
+    let cached = manager
+        .auth_cached()
+        .expect("recovered auth should be cached");
+    assert_eq!(cached.api_key(), Some("recovered-token"));
+    tokio::time::timeout(std::time::Duration::from_secs(5), changes.changed())
+        .await
+        .expect("recovery should notify auth state watchers")
+        .expect("auth state sender remains alive");
+    tokio::time::timeout(std::time::Duration::from_secs(5), revisions.changed())
+        .await
+        .expect("recovery should notify auth revision watchers")
+        .expect("auth revision sender remains alive");
+    assert!(changes.borrow().generation > initial_state.generation);
+    assert!(*revisions.borrow() > initial_revision);
+}
+
+#[tokio::test]
+async fn workspace_policy_change_rejects_pending_transient_auth_fallback() {
+    let manager = AuthManager::from_optional_auth_for_testing(/*auth*/ None);
+    manager.set_forced_chatgpt_workspace_id(Some(vec![WORKSPACE_ID_ALLOWED.to_string()]));
+    manager
+        .set_external_auth(Arc::new(RecoveringExternalAuth {
+            initial: external_header_auth(Some(WORKSPACE_ID_ALLOWED)),
+            recovered: external_header_auth(Some(WORKSPACE_ID_SECOND_ALLOWED)),
+            resolve_count: AtomicUsize::new(0),
+        }))
+        .await
+        .expect("external auth should install");
+
+    let generation = manager.auth_change_state_receiver().borrow().generation;
+    let fallback = manager
+        .load_auth(/*cached_auth*/ None)
+        .await
+        .expect("external auth fallback should load");
+    assert_eq!(
+        fallback
+            .as_ref()
+            .and_then(CodexAuth::get_account_id)
+            .as_deref(),
+        Some(WORKSPACE_ID_ALLOWED)
+    );
+
+    // Change policy after the fallback was validated but before it can be published.
+    manager.set_forced_chatgpt_workspace_id(Some(vec![WORKSPACE_ID_SECOND_ALLOWED.to_string()]));
+    assert!(
+        manager
+            .publish_reloaded_auth(generation, fallback)
+            .expect("native publication remains available")
+            .is_none()
+    );
+
+    let recovered = manager
+        .auth()
+        .await
+        .expect("new workspace should be allowed");
+    assert_eq!(
+        recovered.get_account_id().as_deref(),
+        Some(WORKSPACE_ID_SECOND_ALLOWED)
+    );
+}
+
+#[tokio::test]
+async fn external_auth_does_not_reuse_disallowed_credentials_after_a_transient_failure() {
+    let manager = AuthManager::from_optional_auth_for_testing(/*auth*/ None);
+    manager.set_forced_chatgpt_workspace_id(Some(vec![WORKSPACE_ID_ALLOWED.to_string()]));
+    let initial = external_header_auth(Some(WORKSPACE_ID_ALLOWED));
+    let recovered = external_header_auth(Some(WORKSPACE_ID_SECOND_ALLOWED));
+    manager
+        .set_external_auth(Arc::new(RecoveringExternalAuth {
+            initial,
+            recovered: recovered.clone(),
+            resolve_count: AtomicUsize::new(0),
+        }))
+        .await
+        .expect("external auth should install");
+
+    manager.set_forced_chatgpt_workspace_id(Some(vec![WORKSPACE_ID_SECOND_ALLOWED.to_string()]));
+
+    assert_eq!(manager.auth().await, None);
+    assert_eq!(manager.auth_cached(), None);
+    assert_eq!(manager.auth().await, Some(recovered));
+}
+
+#[tokio::test]
+#[serial_test::serial(codex_auth_env)]
+async fn failed_storage_reload_preserves_cached_identity() -> anyhow::Result<()> {
+    let _access_token = remove_access_token_env_var();
+    let home = tempdir()?;
+    let auth = CodexAuth::from_api_key("stored-key");
+    let manager =
+        AuthManager::from_auth_for_testing_with_home(auth.clone(), home.path().to_path_buf());
+    let initial = manager
+        .auth_change_state_for(&auth)
+        .expect("the cached credential has a source");
+    std::fs::create_dir(get_auth_file(home.path()))?;
+
+    assert!(
+        manager.reload_with_cached_auth().await.is_err(),
+        "the fixture must fail the storage read"
+    );
+    assert!(
+        !manager.reload().await,
+        "failed storage reads must not publish a logout"
+    );
+    assert_eq!(manager.auth_cached(), Some(auth.clone()));
+    assert_eq!(manager.auth_change_state_for(&auth), Some(initial));
+    Ok(())
+}
+
 #[tokio::test]
 async fn replacing_external_auth_clears_permanent_failure() {
     let manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("seed"));
@@ -1613,6 +1953,13 @@ async fn external_auth_provider_can_install_headers() {
     headers.insert("x-external-auth", http::HeaderValue::from_static("enabled"));
     let auth = CodexAuth::Headers(AuthHeaders::new(headers));
     let codex_home = tempdir().expect("tempdir");
+    login_with_api_key(
+        codex_home.path(),
+        "stored-key",
+        AuthCredentialsStoreMode::Ephemeral,
+        AuthKeyringBackendKind::default(),
+    )
+    .unwrap();
     let manager = AuthManager::new(
         codex_home.path().to_path_buf(),
         /*enable_codex_api_key_env*/ false,
@@ -1629,6 +1976,7 @@ async fn external_auth_provider_can_install_headers() {
         .await
         .expect("external auth should install");
 
+    assert!(!manager.reload_with_cached_auth().await.unwrap());
     assert_eq!(manager.auth_cached(), Some(auth));
     assert!(
         manager
@@ -1764,7 +2112,7 @@ impl ProviderAuthScript {
         #[cfg(unix)]
         let (command, args) = {
             let script_path = tempdir.path().join("print-token.sh");
-            std::fs::write(
+            codex_utils_cargo_bin::write_executable(
                 &script_path,
                 r#"#!/bin/sh
 if [ -f fail-once ]; then
@@ -1777,12 +2125,6 @@ tail -n +2 tokens.txt > tokens.next
 mv tokens.next tokens.txt
 "#,
             )?;
-            let mut permissions = std::fs::metadata(&script_path)?.permissions();
-            {
-                use std::os::unix::fs::PermissionsExt;
-                permissions.set_mode(0o755);
-            }
-            std::fs::set_permissions(&script_path, permissions)?;
             ("./print-token.sh".to_string(), Vec::new())
         };
 
@@ -1831,18 +2173,12 @@ move /y tokens.next tokens.txt >nul
         #[cfg(unix)]
         let (command, args) = {
             let script_path = tempdir.path().join("fail.sh");
-            std::fs::write(
+            codex_utils_cargo_bin::write_executable(
                 &script_path,
                 r#"#!/bin/sh
 exit 1
 "#,
             )?;
-            let mut permissions = std::fs::metadata(&script_path)?.permissions();
-            {
-                use std::os::unix::fs::PermissionsExt;
-                permissions.set_mode(0o755);
-            }
-            std::fs::set_permissions(&script_path, permissions)?;
             ("./fail.sh".to_string(), Vec::new())
         };
 
@@ -2123,6 +2459,8 @@ async fn load_auth_reads_access_token_from_env() {
         AuthKeyringBackendKind::Direct,
         Some(&authapi_base_url),
         &crate::test_support::transport_default_auth_route_config(),
+        /*cached_auth*/ None,
+        /*allowed_auth_modes*/ None,
     )
     .await
     .expect("env auth should load")
@@ -2172,6 +2510,8 @@ async fn load_auth_reads_personal_access_token_from_env() {
             AuthKeyringBackendKind::default(),
             /*agent_identity_authapi_base_url*/ None,
             &crate::test_support::transport_default_auth_route_config(),
+            /*cached_auth*/ None,
+            /*allowed_auth_modes*/ None,
         )
         .await
         .expect("env auth should load")
@@ -2346,6 +2686,8 @@ async fn load_auth_keeps_codex_api_key_env_precedence() {
         AuthKeyringBackendKind::Direct,
         /*agent_identity_authapi_base_url*/ None,
         &crate::test_support::transport_default_auth_route_config(),
+        /*cached_auth*/ None,
+        /*allowed_auth_modes*/ None,
     )
     .await
     .expect("env auth should load")
@@ -3035,6 +3377,8 @@ async fn plan_type_maps_known_plan() {
         AuthKeyringBackendKind::Direct,
         /*agent_identity_authapi_base_url*/ None,
         &crate::test_support::transport_default_auth_route_config(),
+        /*cached_auth*/ None,
+        /*allowed_auth_modes*/ None,
     )
     .await
     .expect("load auth")
@@ -3068,6 +3412,8 @@ async fn plan_type_maps_self_serve_business_usage_based_plan() {
         AuthKeyringBackendKind::Direct,
         /*agent_identity_authapi_base_url*/ None,
         &crate::test_support::transport_default_auth_route_config(),
+        /*cached_auth*/ None,
+        /*allowed_auth_modes*/ None,
     )
     .await
     .expect("load auth")
@@ -3104,6 +3450,8 @@ async fn plan_type_maps_enterprise_cbp_usage_based_plan() {
         AuthKeyringBackendKind::Direct,
         /*agent_identity_authapi_base_url*/ None,
         &crate::test_support::transport_default_auth_route_config(),
+        /*cached_auth*/ None,
+        /*allowed_auth_modes*/ None,
     )
     .await
     .expect("load auth")
@@ -3140,49 +3488,14 @@ async fn plan_type_maps_unknown_to_unknown() {
         AuthKeyringBackendKind::Direct,
         /*agent_identity_authapi_base_url*/ None,
         &crate::test_support::transport_default_auth_route_config(),
+        /*cached_auth*/ None,
+        /*allowed_auth_modes*/ None,
     )
     .await
     .expect("load auth")
     .expect("auth available");
 
     pretty_assertions::assert_eq!(auth.account_plan_type(), Some(AccountPlanType::Unknown));
-}
-
-#[test]
-fn authoritative_cached_auth_distinguishes_initial_failure_from_logged_out() {
-    let manager =
-        AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
-    assert!(manager.authoritative_auth_cached().is_ok());
-    manager
-        .inner
-        .write()
-        .expect("test cache lock")
-        .initial_load_failed = true;
-    assert_eq!(
-        manager.authoritative_auth_cached(),
-        Err(AuthoritativeAuthUnavailable::InitialLoadFailed)
-    );
-}
-
-#[test]
-fn authoritative_cached_auth_reports_cache_lock_unavailable_when_poisoned() {
-    let manager =
-        AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
-    assert!(manager.authoritative_auth_cached().is_ok());
-
-    let poisoning_manager = Arc::clone(&manager);
-    let poisoned = std::thread::spawn(move || {
-        let _guard = poisoning_manager.inner.write().expect("test cache lock");
-        panic!("deliberately poison the cache lock for this test");
-    })
-    .join();
-    assert!(poisoned.is_err(), "the spawned thread must have panicked");
-
-    assert_eq!(
-        manager.authoritative_auth_cached(),
-        Err(AuthoritativeAuthUnavailable::CacheLockUnavailable),
-        "a poisoned cache lock must fail closed as unavailable, never as logged-out"
-    );
 }
 
 #[tokio::test]
@@ -3210,6 +3523,8 @@ async fn missing_plan_type_maps_to_unknown() {
         AuthKeyringBackendKind::Direct,
         /*agent_identity_authapi_base_url*/ None,
         &crate::test_support::transport_default_auth_route_config(),
+        /*cached_auth*/ None,
+        /*allowed_auth_modes*/ None,
     )
     .await
     .expect("load auth")
@@ -3218,506 +3533,1120 @@ async fn missing_plan_type_maps_to_unknown() {
     pretty_assertions::assert_eq!(auth.account_plan_type(), Some(AccountPlanType::Unknown));
 }
 
-// --- Issue 05 Slice 4 managed-auth-transition adoption (R014, R001, R002,
-// R044, R045, R064) -----------------------------------------------------
+#[path = "authoritative_cache_tests.rs"]
+mod authoritative_cache;
 
-fn write_managed_auth_file(params: AuthFileParams, codex_home: &Path) -> std::io::Result<()> {
-    let account_id = params.chatgpt_account_id.clone();
-    write_auth_file(params, codex_home)?;
-    let path = get_auth_file(codex_home);
-    let mut value: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
-    value["tokens"]["account_id"] = serde_json::json!(account_id);
-    std::fs::write(path, serde_json::to_vec(&value)?)
+#[path = "managed_adoption_tests.rs"]
+mod managed_adoption;
+
+#[path = "cache_observation_tests.rs"]
+mod cache_observation;
+
+#[cfg(target_os = "macos")]
+fn command_constructor_environment() -> Vec<EnvVarGuard> {
+    vec![
+        EnvVarGuard::set(
+            "CODEX_CHATGPT_AUTH_COMMAND",
+            "/nonexistent/synthetic-auth-command",
+        ),
+        EnvVarGuard::set("CODEX_CHATGPT_AUTH_BINDING", "fixture#example"),
+        EnvVarGuard::set("CODEX_CHATGPT_AUTH_SOURCE", "source"),
+        EnvVarGuard::set("CODEX_CHATGPT_AUTH_ACCOUNT", "account"),
+        EnvVarGuard::set("CODEX_CHATGPT_AUTH_PRINCIPAL", "principal"),
+        EnvVarGuard::remove(OPENAI_FEDERATION_RULE_ID_ENV_VAR),
+        EnvVarGuard::remove(OPENAI_IDENTITY_TOKEN_FILE_ENV_VAR),
+    ]
 }
 
-fn write_api_key_auth_file(codex_home: &Path, api_key: &str) {
-    let auth_dot_json = AuthDotJson {
-        auth_mode: Some(AuthMode::ApiKey),
-        openai_api_key: Some(api_key.to_owned()),
-        tokens: None,
-        last_refresh: None,
-        agent_identity: None,
-        personal_access_token: None,
-        bedrock_api_key: None,
-        bedrock_access_keys: None,
-    };
-    super::save_auth(
-        codex_home,
-        &auth_dot_json,
-        AuthCredentialsStoreMode::File,
-        AuthKeyringBackendKind::default(),
-    )
-    .expect("write api key auth.json");
-}
-
-/// R044/R045: external auth authority (agent identity, injected tokens) is
-/// excluded from managed-auth-transition adoption regardless of what it
-/// would resolve to -- the production source reader must refuse before any
-/// resolution could be treated as an adoptable managed source.
+#[cfg(target_os = "macos")]
 #[tokio::test]
-async fn managed_adoption_snapshot_excludes_external_auth_authority() {
-    let codex_home = tempdir().unwrap();
-    let manager = AuthManager::new(
-        codex_home.path().to_path_buf(),
-        /*enable_codex_api_key_env*/ false,
-        AuthCredentialsStoreMode::Ephemeral,
-        /*forced_chatgpt_workspace_id*/ None,
-        /*chatgpt_base_url*/ None,
-        AuthKeyringBackendKind::default(),
-        crate::test_support::transport_default_auth_route_config(),
+#[serial(codex_auth_env)]
+async fn command_shared_constructor_uses_owned_record_and_shared_authority_not_ambient_auth()
+-> anyhow::Result<()> {
+    let _environment = command_constructor_environment();
+    let _ambient = EnvVarGuard::set(CODEX_ACCESS_TOKEN_ENV_VAR, "unusable-ambient-token");
+    let _api = EnvVarGuard::set("OPENAI_API_KEY", "synthetic-ambient-api-key");
+    let home = tempdir()?;
+    let record = super::command_cache_publication_tests::record(1);
+    super::super::command_store::commit(home.path(), &record, &record.auth()?)?;
+    let original = std::fs::read(home.path().join("auth.json"))?;
+    let first = AuthManager::shared_from_auth_config_with_modes(
+        build_config(home.path(), None, None).await,
+        true,
+        Some(vec![AuthMode::ChatgptAuthTokens]),
     )
-    .await;
-    manager
-        .set_external_auth(Arc::new(StaticExternalAuth(CodexAuth::from_api_key(
-            "sk-external",
-        ))))
+    .await?;
+    let second = AuthManager::shared_from_auth_config_with_modes(
+        build_config(home.path(), None, None).await,
+        true,
+        Some(vec![AuthMode::ChatgptAuthTokens]),
+    )
+    .await?;
+    assert!(!first.enable_codex_api_key_env);
+    assert!(Arc::ptr_eq(
+        first.command_source.as_ref().unwrap(),
+        second.command_source.as_ref().unwrap()
+    ));
+    for manager in [&first, &second] {
+        let auth = manager.auth_cached().context("owned cached auth")?;
+        assert!(auth.is_external_chatgpt_tokens());
+        assert_eq!(auth.get_token()?, record.access_token);
+        assert!(manager.has_external_auth());
+        assert!(manager.authoritative_auth_cached().is_ok());
+    }
+    assert_eq!(std::fs::read(home.path().join("auth.json"))?, original);
+    // The nonexistent command would fail if construction attempted renewal.
+    let recovered = first
+        .recover_rejected_credential(Some(
+            AuthCredentialFingerprint::from_bearer_header("Bearer older-synthetic-token").unwrap(),
+        ))
         .await
-        .expect("external auth should install");
-
-    match manager.read_managed_adoption_snapshot().await {
-        Err(error) => assert_eq!(
-            error,
-            ManagedAdoptionVerificationError::IneligibleAuthMode,
-            "external auth authority must never be treated as an adoptable managed source"
-        ),
-        Ok(_) => panic!("external auth authority was treated as an adoptable managed source"),
-    }
+        .context("selected authority")??;
+    assert_eq!(recovered.get_token()?, record.access_token);
+    Ok(())
 }
 
-/// R002: a persisted, non-ChatGPT mode (API key mode here) must refuse as
-/// `IneligibleAuthMode`, rather than slipping through as an adoptable managed
-/// source. This fixture is rejected by the serialized auth-mode gate before a
-/// `CodexAuth` is constructed, so it deliberately does not model the
-/// stable-identity handling for `AgentIdentity` or `PersonalAccessToken`.
+#[cfg(target_os = "macos")]
 #[tokio::test]
-async fn managed_adoption_snapshot_excludes_persisted_non_chatgpt_mode() {
-    let codex_home = tempdir().unwrap();
-    write_api_key_auth_file(codex_home.path(), "sk-persisted");
-    let manager = AuthManager::new(
-        codex_home.path().to_path_buf(),
-        /*enable_codex_api_key_env*/ false,
-        AuthCredentialsStoreMode::File,
-        /*forced_chatgpt_workspace_id*/ None,
-        /*chatgpt_base_url*/ None,
-        AuthKeyringBackendKind::default(),
-        crate::test_support::transport_default_auth_route_config(),
+#[serial(codex_auth_env)]
+async fn command_shared_constructor_refuses_mode_before_missing_home_access() -> anyhow::Result<()>
+{
+    let _environment = command_constructor_environment();
+    let root = tempdir()?;
+    let absent = root.path().join("must-not-be-created");
+    let result = AuthManager::shared_from_auth_config_with_modes(
+        build_config(&absent, None, None).await,
+        true,
+        Some(vec![AuthMode::ApiKey]),
     )
     .await;
-
-    match manager.read_managed_adoption_snapshot().await {
-        Err(error) => assert_eq!(
-            error,
-            ManagedAdoptionVerificationError::IneligibleAuthMode,
-            "a persisted non-ChatGPT mode must refuse as IneligibleAuthMode"
-        ),
-        Ok(_) => panic!("a persisted non-ChatGPT mode was treated as adoptable"),
-    }
+    let error = match result {
+        Ok(_) => panic!("forbidden command mode accepted"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("command auth mode forbidden"));
+    assert!(!absent.exists());
+    Ok(())
 }
 
-/// R001: deliberate managed logout is a legitimate success, not a
-/// failure -- `install_managed_logout` must clear the cache, publish the
-/// auth-change signal, and never touch the durable store (no file is
-/// written by this call).
+#[cfg(target_os = "macos")]
 #[tokio::test]
-async fn install_managed_logout_clears_the_cache_and_publishes_a_revision() {
-    let codex_home = tempdir().unwrap();
-    write_managed_auth_file(
+#[serial(codex_auth_env)]
+async fn command_shared_constructor_rejects_mismatched_owned_identity_without_fallback()
+-> anyhow::Result<()> {
+    let _environment = command_constructor_environment();
+    let _ambient = EnvVarGuard::set("OPENAI_API_KEY", "synthetic-fallback-must-not-win");
+    let home = tempdir()?;
+    let record = super::command_cache_publication_tests::record(1);
+    super::super::command_store::commit(home.path(), &record, &record.auth()?)?;
+    let original = std::fs::read(home.path().join("auth.json"))?;
+    let _wrong = EnvVarGuard::set("CODEX_CHATGPT_AUTH_ACCOUNT", "wrong-account");
+    let result = AuthManager::shared_from_auth_config_with_modes(
+        build_config(home.path(), None, None).await,
+        true,
+        None,
+    )
+    .await;
+    assert!(result.is_err());
+    assert_eq!(std::fs::read(home.path().join("auth.json"))?, original);
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[serial(codex_auth_env)]
+async fn command_shared_constructor_refuses_wif_conflict_before_command_storage()
+-> anyhow::Result<()> {
+    let _environment = command_constructor_environment();
+    let _rule = EnvVarGuard::set(OPENAI_FEDERATION_RULE_ID_ENV_VAR, "synthetic-rule");
+    let _assertion = EnvVarGuard::set(
+        OPENAI_IDENTITY_TOKEN_FILE_ENV_VAR,
+        "/nonexistent/synthetic-assertion",
+    );
+    let home = tempdir()?;
+    let absent = home.path().join("must-not-be-created");
+    let result = AuthManager::shared_from_auth_config_with_modes(
+        build_config(&absent, None, None).await,
+        true,
+        None,
+    )
+    .await;
+    let error = match result {
+        Ok(_) => panic!("competing authorities accepted"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("conflicting external auth authorities")
+    );
+    assert!(!absent.exists());
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[serial(codex_auth_env)]
+async fn command_shared_constructor_keeps_partial_wif_configuration_fail_closed()
+-> anyhow::Result<()> {
+    let _environment = command_constructor_environment();
+    let _rule = EnvVarGuard::set(OPENAI_FEDERATION_RULE_ID_ENV_VAR, "synthetic-rule");
+    let home = tempdir()?;
+    let absent = home.path().join("must-not-be-created");
+    let result = AuthManager::shared_from_auth_config_with_modes(
+        build_config(&absent, None, None).await,
+        true,
+        None,
+    )
+    .await;
+    let error = match result {
+        Ok(_) => panic!("partial workload configuration accepted"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains(OPENAI_IDENTITY_TOKEN_FILE_ENV_VAR)
+    );
+    assert!(!absent.exists());
+    Ok(())
+}
+
+#[test]
+fn native_refresh_commit_refusal_preserves_exact_stored_bytes() -> anyhow::Result<()> {
+    let home = tempdir()?;
+    write_auth_file(
         AuthFileParams {
             openai_api_key: None,
-            chatgpt_plan_type: Some("pro".to_owned()),
-            chatgpt_account_id: Some("managed-before-logout".to_owned()),
+            chatgpt_plan_type: Some("pro".into()),
+            chatgpt_account_id: Some("account".into()),
         },
-        codex_home.path(),
-    )
-    .expect("write managed prior auth");
-    let manager = AuthManager::new(
-        codex_home.path().to_path_buf(),
-        /*enable_codex_api_key_env*/ false,
-        AuthCredentialsStoreMode::File,
-        /*forced_chatgpt_workspace_id*/ None,
-        /*chatgpt_base_url*/ None,
-        AuthKeyringBackendKind::default(),
-        crate::test_support::transport_default_auth_route_config(),
-    )
-    .await;
-    manager.reload().await;
-    let previous = manager.auth_cached();
-    assert!(previous.is_some(), "precondition: an auth was cached");
-    let revisions = manager.auth_change_receiver();
-    let owner_before = *manager.auth_change_state_receiver().borrow();
-    let precondition = manager
-        .capture_managed_adoption_precondition(Some(&AuthManager::managed_account_fingerprint(
-            "managed-before-logout",
-        )))
-        .unwrap();
-
-    let outcome = manager.install_managed_logout(previous, &precondition);
-    assert!(
-        matches!(outcome, ManagedAdoptionInstallOutcome::LoggedOut),
-        "expected LoggedOut, got {outcome:?}"
-    );
-    assert_eq!(manager.auth_cached(), None);
-    assert!(manager.is_managed_auth_change(*manager.auth_change_receiver().borrow()));
-    assert_eq!(
-        *manager.auth_change_state_receiver().borrow(),
-        AuthChangeState {
-            generation: owner_before.generation + 1,
-            owner_generation: owner_before.owner_generation + 1,
-        }
-    );
-    assert!(
-        revisions.has_changed().unwrap_or(false),
-        "logout must publish an auth-change signal like any other adoption"
-    );
-    assert!(
-        get_auth_file(codex_home.path()).exists(),
-        "managed logout must never touch the durable store -- the writer boundary is separately owned"
-    );
-}
-
-/// R014's manager-owned CAS: installing must refuse rather than
-/// overwrite when the cache no longer holds the snapshot observed
-/// immediately before the read that produced the value being installed
-/// -- an ordinary non-managed login/logout landing concurrently during
-/// adoption must not be silently clobbered.
-#[tokio::test]
-async fn install_managed_adoption_refuses_when_the_cache_changed_concurrently() {
-    let codex_home = tempdir().unwrap();
-    write_managed_auth_file(
-        AuthFileParams {
-            openai_api_key: None,
-            chatgpt_plan_type: Some("pro".to_owned()),
-            chatgpt_account_id: Some("admission-account".to_owned()),
-        },
-        codex_home.path(),
-    )
-    .unwrap();
-    let manager = AuthManager::new(
-        codex_home.path().to_path_buf(),
-        /*enable_codex_api_key_env*/ false,
-        AuthCredentialsStoreMode::File,
-        /*forced_chatgpt_workspace_id*/ None,
-        /*chatgpt_base_url*/ None,
-        AuthKeyringBackendKind::default(),
-        crate::test_support::transport_default_auth_route_config(),
-    )
-    .await;
-    let observed_previous = manager.auth_cached();
-    assert!(matches!(observed_previous, Some(CodexAuth::Chatgpt(_))));
-    let precondition = manager
-        .capture_managed_adoption_precondition(Some(&AuthManager::managed_account_fingerprint(
-            "admission-account",
-        )))
-        .unwrap();
-
-    // Something else installs concurrently while the (simulated) read was
-    // in flight.
-    manager
-        .set_external_auth(Arc::new(StaticExternalAuth(CodexAuth::from_api_key(
-            "sk-concurrent-writer",
-        ))))
-        .await
-        .expect("concurrent external auth should install");
-
-    let new_auth = CodexAuth::from_api_key("sk-intended-adoption");
-    let outcome = manager.install_managed_adoption(
-        new_auth,
-        observed_previous,
-        "intended-account",
-        &precondition,
-    );
-    assert!(
-        matches!(
-            outcome,
-            ManagedAdoptionInstallOutcome::CacheChangedConcurrently
-        ),
-        "expected CacheChangedConcurrently, got {outcome:?}"
-    );
-    assert_eq!(
-        manager.auth_cached().as_ref().and_then(CodexAuth::api_key),
-        Some("sk-concurrent-writer"),
-        "a refused install must never overwrite the concurrent value"
-    );
-}
-
-#[tokio::test]
-async fn managed_admission_and_logout_refuse_absent_or_api_key_current_auth() {
-    let codex_home = tempdir().unwrap();
-    let manager = AuthManager::new(
-        codex_home.path().to_path_buf(),
-        /*enable_codex_api_key_env*/ false,
-        AuthCredentialsStoreMode::File,
-        /*forced_chatgpt_workspace_id*/ None,
-        /*chatgpt_base_url*/ None,
-        AuthKeyringBackendKind::default(),
-        crate::test_support::transport_default_auth_route_config(),
-    )
-    .await;
-    for auth in [None, Some(CodexAuth::from_api_key("excluded-current-key"))] {
-        manager.set_cached_auth(auth.clone());
-        let revision = *manager.auth_change_receiver().borrow();
-        assert_eq!(manager.managed_transition_eligible(), Ok(false));
-        assert!(manager.capture_managed_adoption_precondition(None).is_err());
-        assert_eq!(manager.auth_cached(), auth);
-        assert_eq!(*manager.auth_change_receiver().borrow(), revision);
-    }
-}
-
-#[tokio::test]
-async fn managed_adoption_preserves_upstream_credential_and_owner_generations() {
-    for (next_account, owner_delta) in [("owner-a", 0), ("owner-b", 1)] {
-        let home = tempdir().unwrap();
-        let write_account = |account: &str, plan: &str| {
-            write_managed_auth_file(
-                AuthFileParams {
-                    openai_api_key: None,
-                    chatgpt_plan_type: Some(plan.to_owned()),
-                    chatgpt_account_id: Some(account.to_owned()),
-                },
-                home.path(),
-            )
-            .unwrap();
-        };
-        write_account("owner-a", "pro");
-        let manager = AuthManager::new(
-            home.path().to_path_buf(),
-            /*enable_codex_api_key_env*/ false,
-            AuthCredentialsStoreMode::File,
-            /*forced_chatgpt_workspace_id*/ None,
-            /*chatgpt_base_url*/ None,
-            AuthKeyringBackendKind::default(),
-            crate::test_support::transport_default_auth_route_config(),
-        )
-        .await;
-        let before = *manager.auth_change_state_receiver().borrow();
-        let precondition = manager
-            .capture_managed_adoption_precondition(Some(&AuthManager::managed_account_fingerprint(
-                "owner-a",
-            )))
-            .unwrap();
-        // Changing the ID token forces a credential change even for the same owner.
-        write_account(next_account, "plus");
-        let prepared = manager
-            .prepare_managed_adoption(
-                Some(&AuthManager::managed_account_fingerprint(next_account)),
-                &precondition,
-            )
-            .await
-            .unwrap();
-        assert!(matches!(
-            manager.install_prepared_managed_adoption(&prepared, &precondition),
-            ManagedAdoptionInstallOutcome::Installed { .. }
-        ));
-        let after = *manager.auth_change_state_receiver().borrow();
-        let managed_revision = *manager.auth_change_receiver().borrow();
-        assert!(manager.is_managed_auth_change(managed_revision));
-        assert!(!manager.is_managed_auth_change(0));
-        assert_eq!(
-            after,
-            AuthChangeState {
-                generation: before.generation + 1,
-                owner_generation: before.owner_generation + owner_delta,
-            }
-        );
-        // A refused reuse must not publish another owner or credential change.
-        assert!(matches!(
-            manager.install_prepared_managed_adoption(&prepared, &precondition),
-            ManagedAdoptionInstallOutcome::IntendedResultMismatch
-        ));
-        assert_eq!(*manager.auth_change_state_receiver().borrow(), after);
-        manager.set_cached_auth(None);
-        let ordinary_revision = *manager.auth_change_receiver().borrow();
-        assert!(ordinary_revision > managed_revision);
-        assert!(!manager.is_managed_auth_change(ordinary_revision));
-    }
-}
-
-#[tokio::test]
-async fn prepared_managed_candidate_refuses_changed_source_and_installs_only_once() {
-    let home = tempdir().unwrap();
-    let write_account = |account: &str| {
-        write_managed_auth_file(
-            AuthFileParams {
-                openai_api_key: None,
-                chatgpt_plan_type: Some("pro".to_owned()),
-                chatgpt_account_id: Some(account.to_owned()),
-            },
-            home.path(),
-        )
-        .unwrap()
-    };
-    write_account("prepared-a");
-    let manager = AuthManager::new(
+        home.path(),
+    )?;
+    let storage = create_auth_storage(
         home.path().to_path_buf(),
-        false,
         AuthCredentialsStoreMode::File,
-        None,
-        None,
         AuthKeyringBackendKind::default(),
-        crate::test_support::transport_default_auth_route_config(),
-    )
-    .await;
-    let precondition = manager
-        .capture_managed_adoption_precondition(Some(&AuthManager::managed_account_fingerprint(
-            "prepared-a",
-        )))
-        .unwrap();
-    write_account("prepared-b");
-    let original_b = std::fs::read(get_auth_file(home.path())).unwrap();
-    let prepared = manager
-        .prepare_managed_adoption(
-            Some(&AuthManager::managed_account_fingerprint("prepared-b")),
-            &precondition,
-        )
-        .await
-        .unwrap();
-    let revision = *manager.auth_change_receiver().borrow();
-    write_account("unexpected-c");
-    assert!(matches!(
-        manager.install_prepared_managed_adoption(&prepared, &precondition),
-        ManagedAdoptionInstallOutcome::SourceChanged
-    ));
-    assert_eq!(
-        manager.auth_cached().unwrap().get_account_id().as_deref(),
-        Some("prepared-a")
     );
-    assert_eq!(*manager.auth_change_receiver().borrow(), revision);
-    std::fs::write(get_auth_file(home.path()), &original_b).unwrap();
-    assert!(matches!(
-        manager.install_prepared_managed_adoption(&prepared, &precondition),
-        ManagedAdoptionInstallOutcome::IntendedResultMismatch
-    ));
-    let malformed_candidate = manager
-        .prepare_managed_adoption(
-            Some(&AuthManager::managed_account_fingerprint("prepared-b")),
-            &precondition,
-        )
-        .await
-        .unwrap();
-    // A malformed replacement is rejected by raw preimage comparison, not
-    // parsed as a new candidate or collapsed into authoritative absence.
-    std::fs::write(get_auth_file(home.path()), b"not auth JSON").unwrap();
-    assert!(matches!(
-        manager.install_prepared_managed_adoption(&malformed_candidate, &precondition),
-        ManagedAdoptionInstallOutcome::SourceChanged
-    ));
-    std::fs::write(get_auth_file(home.path()), original_b).unwrap();
-    assert!(matches!(
-        manager.install_prepared_managed_adoption(&malformed_candidate, &precondition),
-        ManagedAdoptionInstallOutcome::IntendedResultMismatch
-    ));
-    let prepared = manager
-        .prepare_managed_adoption(
-            Some(&AuthManager::managed_account_fingerprint("prepared-b")),
-            &precondition,
-        )
-        .await
-        .unwrap();
-    assert!(matches!(
-        manager.install_prepared_managed_adoption(&prepared, &precondition),
-        ManagedAdoptionInstallOutcome::Installed { .. }
-    ));
-    assert_eq!(
-        manager.auth_cached().unwrap().get_account_id().as_deref(),
-        Some("prepared-b")
+    let original = std::fs::read(home.path().join("auth.json"))?;
+    let expected = storage
+        .load()?
+        .context("stored auth")?
+        .tokens
+        .context("stored tokens")?;
+    let calls = AtomicUsize::new(0);
+    let result = super::persist_tokens_with_commit(
+        &storage,
+        &expected,
+        None,
+        RefreshResponse {
+            id_token: None,
+            access_token: Some("new".into()),
+            refresh_token: Some("rotated".into()),
+        },
+        |_, _| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Err(std::io::Error::other("synthetic owner changed"))
+        },
     );
-    let installed_revision = *manager.auth_change_receiver().borrow();
-    assert!(matches!(
-        manager.install_prepared_managed_adoption(&prepared, &precondition),
-        ManagedAdoptionInstallOutcome::IntendedResultMismatch
-    ));
-    assert_eq!(*manager.auth_change_receiver().borrow(), installed_revision);
+    assert!(result.is_err());
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(std::fs::read(home.path().join("auth.json"))?, original);
+    Ok(())
 }
 
-#[tokio::test]
-async fn managed_recovery_verifies_durable_and_cached_result_without_installing() {
-    let codex_home = tempdir().unwrap();
-    write_managed_auth_file(
+#[test]
+fn stale_native_refresh_never_reaches_owner_commit_callback() -> anyhow::Result<()> {
+    let home = tempdir()?;
+    write_auth_file(
         AuthFileParams {
             openai_api_key: None,
-            chatgpt_plan_type: Some("pro".to_owned()),
-            chatgpt_account_id: Some("recovery-account".to_owned()),
+            chatgpt_plan_type: Some("pro".into()),
+            chatgpt_account_id: Some("account".into()),
         },
-        codex_home.path(),
-    )
-    .unwrap();
-    let manager = AuthManager::new(
-        codex_home.path().to_path_buf(),
-        /*enable_codex_api_key_env*/ false,
+        home.path(),
+    )?;
+    let storage = create_auth_storage(
+        home.path().to_path_buf(),
         AuthCredentialsStoreMode::File,
-        /*forced_chatgpt_workspace_id*/ None,
-        /*chatgpt_base_url*/ None,
         AuthKeyringBackendKind::default(),
-        crate::test_support::transport_default_auth_route_config(),
-    )
-    .await;
-    let fingerprint = AuthManager::managed_account_fingerprint("recovery-account");
-    let revision = *manager.auth_change_receiver().borrow();
-    match manager
-        .prepare_managed_terminal_commit(Some(&fingerprint))
-        .await
-    {
-        Ok(_) => {}
-        Err(error) => panic!("matching durable and cached result must verify: {error:?}"),
-    }
-    match manager
-        .prepare_managed_terminal_commit(Some("wrong-result"))
-        .await
-    {
-        Err(error) => assert_eq!(
-            error,
-            ManagedAdoptionVerificationError::IntendedResultMismatch,
-            "a different intended result must be rejected"
-        ),
-        Ok(_) => panic!("a different intended result was accepted"),
-    }
-    assert_eq!(*manager.auth_change_receiver().borrow(), revision);
-
-    // Durable absence alone is insufficient while the cache still holds A.
-    std::fs::remove_file(get_auth_file(codex_home.path())).unwrap();
-    match manager.prepare_managed_terminal_commit(None).await {
-        Err(error) => assert_eq!(
-            error,
-            ManagedAdoptionVerificationError::CacheChangedConcurrently,
-            "durable absence must not override a stale cached account"
-        ),
-        Ok(_) => {
-            panic!("durable absence was treated as a verified logout while cache held an account")
-        }
-    }
-    assert_eq!(*manager.auth_change_receiver().borrow(), revision);
-    let precondition = manager
-        .capture_managed_adoption_precondition(Some(&fingerprint))
-        .unwrap();
-    assert!(matches!(
-        manager.install_managed_logout(manager.auth_cached(), &precondition),
-        ManagedAdoptionInstallOutcome::LoggedOut
-    ));
-    let logout_revision = *manager.auth_change_receiver().borrow();
-    match manager.prepare_managed_terminal_commit(None).await {
-        Ok(_) => {}
-        Err(error) => panic!("installed managed logout must verify: {error:?}"),
-    }
-    assert_eq!(*manager.auth_change_receiver().borrow(), logout_revision);
+    );
+    let expected = storage
+        .load()?
+        .context("stored auth")?
+        .tokens
+        .context("stored tokens")?;
+    super::persist_tokens(
+        &storage,
+        &expected,
+        None,
+        None,
+        Some("newer".into()),
+        Some("rotated".into()),
+    )?;
+    let before = std::fs::read(home.path().join("auth.json"))?;
+    let calls = AtomicUsize::new(0);
+    let result = super::persist_tokens_with_commit(
+        &storage,
+        &expected,
+        None,
+        RefreshResponse {
+            id_token: None,
+            access_token: Some("late".into()),
+            refresh_token: Some("stale".into()),
+        },
+        |_, _| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        },
+    );
+    assert!(result.is_err());
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(std::fs::read(home.path().join("auth.json"))?, before);
+    Ok(())
 }
 
-/// The credential-bearing install outcome must never render key/token
-/// material through `{:?}`, matching the existing `CachedAuth` Debug
-/// precedent in this same file.
+#[test]
+fn native_refresh_guarded_callback_commits_exact_validated_candidate() -> anyhow::Result<()> {
+    let home = tempdir()?;
+    write_auth_file(
+        AuthFileParams {
+            openai_api_key: None,
+            chatgpt_plan_type: Some("pro".into()),
+            chatgpt_account_id: Some("account".into()),
+        },
+        home.path(),
+    )?;
+    let storage = create_auth_storage(
+        home.path().to_path_buf(),
+        AuthCredentialsStoreMode::File,
+        AuthKeyringBackendKind::default(),
+    );
+    let expected = storage
+        .load()?
+        .context("stored auth")?
+        .tokens
+        .context("stored tokens")?;
+    let calls = AtomicUsize::new(0);
+    let updated = super::persist_tokens_with_commit(
+        &storage,
+        &expected,
+        None,
+        RefreshResponse {
+            id_token: None,
+            access_token: Some("renewed".into()),
+            refresh_token: Some("rotated".into()),
+        },
+        |before, after| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            storage.compare_and_save(before, after)
+        },
+    )?;
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(storage.load()?, Some(updated));
+    Ok(())
+}
+
+#[derive(Debug, Default)]
+struct NativePersistenceHost {
+    originals: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+}
+impl codex_protocol::host_auth_work::AuthTaskSpawner for NativePersistenceHost {
+    fn spawn(
+        &self,
+        _: codex_protocol::host_auth_work::AuthTaskFuture,
+    ) -> Result<
+        codex_protocol::host_auth_work::AuthTaskObservation,
+        codex_protocol::host_auth_work::AuthTaskFailure,
+    > {
+        Err(codex_protocol::host_auth_work::AuthTaskFailure::Refused)
+    }
+    fn spawn_blocking(
+        &self,
+        task: codex_protocol::host_auth_work::AuthTaskBlocking,
+    ) -> Result<
+        codex_protocol::host_auth_work::AuthTaskObservation,
+        codex_protocol::host_auth_work::AuthTaskFailure,
+    > {
+        let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
+        self.originals
+            .lock()
+            .unwrap()
+            .push(tokio::task::spawn_blocking(move || {
+                task();
+                let _ = completed_tx.send(());
+            }));
+        Ok(Box::pin(async move {
+            completed_rx
+                .await
+                .map_err(|_| codex_protocol::host_auth_work::AuthTaskFailure::Panicked)
+        }))
+    }
+}
+
+#[derive(Debug)]
+struct NativePersistenceGate {
+    file: FileAuthStorage,
+    entered: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+}
+impl AuthStorageBackend for NativePersistenceGate {
+    fn load(&self) -> std::io::Result<Option<AuthDotJson>> {
+        self.file.load()
+    }
+    fn save(&self, auth: &AuthDotJson) -> std::io::Result<()> {
+        self.file.save(auth)
+    }
+    fn delete(&self) -> std::io::Result<bool> {
+        self.file.delete()
+    }
+    fn lock_for_write(
+        &self,
+    ) -> std::io::Result<(std::sync::MutexGuard<'static, ()>, Option<std::fs::File>)> {
+        let guard = self.file.lock_for_write()?;
+        if let Some(entered) = self.entered.lock().unwrap().take() {
+            let _ = entered.send(());
+        }
+        self.release
+            .lock()
+            .unwrap()
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .map_err(std::io::Error::other)?;
+        Ok(guard)
+    }
+}
+
 #[tokio::test]
-async fn managed_adoption_outcomes_never_debug_print_credential_material() {
-    let fingerprint = AuthManager::managed_account_fingerprint("opaque-account");
-    let install_outcome = ManagedAdoptionInstallOutcome::Installed {
-        fingerprint: fingerprint.clone(),
-    };
-    let rendered = format!("{install_outcome:?}");
+async fn native_persistence_original_keeps_refresh_permit_after_observer_cancellation()
+-> anyhow::Result<()> {
+    let home = tempdir()?;
+    write_auth_file(
+        AuthFileParams {
+            openai_api_key: None,
+            chatgpt_plan_type: Some("pro".into()),
+            chatgpt_account_id: Some("account".into()),
+        },
+        home.path(),
+    )?;
+    let file = FileAuthStorage::new(home.path().to_path_buf());
+    let tokens = file
+        .load()?
+        .context("native auth")?
+        .tokens
+        .context("tokens")?;
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let storage: Arc<dyn AuthStorageBackend> = Arc::new(NativePersistenceGate {
+        file,
+        entered: std::sync::Mutex::new(Some(entered_tx)),
+        release: std::sync::Mutex::new(release_rx),
+    });
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+    let guard = Arc::new(Arc::clone(&semaphore).acquire_owned().await?);
+    let host = Arc::new(NativePersistenceHost::default());
+    let owner: Arc<dyn codex_protocol::host_auth_work::AuthTaskSpawner> = host.clone();
+    let observer = tokio::spawn(async move {
+        codex_protocol::host_auth_task::with_auth_task_scope(
+            codex_protocol::host_auth_task::AuthTaskAccess::Admitted(owner),
+            super::persist_native_refresh(
+                storage,
+                tokens,
+                None,
+                RefreshResponse {
+                    id_token: None,
+                    access_token: Some("renewed-native-access".into()),
+                    refresh_token: Some("renewed-native-refresh".into()),
+                },
+                guard,
+            ),
+        )
+        .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), entered_rx).await??;
+    observer.abort();
+    assert!(observer.await.unwrap_err().is_cancelled());
+    assert!(
+        Arc::clone(&semaphore).try_acquire_owned().is_err(),
+        "physical persistence still owns the refresh exclusion"
+    );
+    release_tx.send(())?;
+    let originals = std::mem::take(&mut *host.originals.lock().unwrap());
+    assert_eq!(originals.len(), 1);
+    for original in originals {
+        tokio::time::timeout(std::time::Duration::from_secs(5), original).await??;
+    }
+    assert_eq!(semaphore.available_permits(), 1);
+    let updated = FileAuthStorage::new(home.path().to_path_buf())
+        .load()?
+        .context("committed native auth")?
+        .tokens
+        .context("committed tokens")?;
+    assert_eq!(updated.access_token, "renewed-native-access");
+    assert_eq!(updated.refresh_token, "renewed-native-refresh");
+    Ok(())
+}
+
+#[tokio::test]
+async fn native_persistence_required_custody_refusal_preserves_storage_and_permit()
+-> anyhow::Result<()> {
+    let home = tempdir()?;
+    write_auth_file(
+        AuthFileParams {
+            openai_api_key: None,
+            chatgpt_plan_type: Some("pro".into()),
+            chatgpt_account_id: Some("account".into()),
+        },
+        home.path(),
+    )?;
+    let original = std::fs::read(home.path().join("auth.json"))?;
+    let storage: Arc<dyn AuthStorageBackend> =
+        Arc::new(FileAuthStorage::new(home.path().to_path_buf()));
+    let tokens = storage
+        .load()?
+        .context("native auth")?
+        .tokens
+        .context("tokens")?;
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+    let guard = Arc::new(Arc::clone(&semaphore).acquire_owned().await?);
+    let result = codex_protocol::host_auth_task::with_auth_task_scope(
+        codex_protocol::host_auth_task::AuthTaskAccess::Required,
+        super::persist_native_refresh(
+            storage,
+            tokens,
+            None,
+            RefreshResponse {
+                id_token: None,
+                access_token: Some("must-not-save".into()),
+                refresh_token: None,
+            },
+            guard,
+        ),
+    )
+    .await;
+    assert!(result.is_err());
+    assert_eq!(std::fs::read(home.path().join("auth.json"))?, original);
+    assert_eq!(semaphore.available_permits(), 1);
+    Ok(())
+}
+
+async fn native_owner_fixture(home: &Path, endpoint: &str) -> anyhow::Result<Arc<AuthManager>> {
+    write_auth_file(
+        AuthFileParams {
+            openai_api_key: None,
+            chatgpt_plan_type: Some("pro".into()),
+            chatgpt_account_id: Some(WORKSPACE_ID_ALLOWED.into()),
+        },
+        home,
+    )?;
+    let storage = FileAuthStorage::new(home.to_path_buf());
+    let mut stored = storage.load()?.context("stored auth")?;
+    // 0.169 reads the selected workspace from tokens.account_id; the ID-token
+    // claim alone is not an account selection. Keep both fixture identities.
+    stored.tokens.as_mut().context("tokens")?.account_id = Some(WORKSPACE_ID_ALLOWED.into());
+    stored.tokens.as_mut().context("tokens")?.oauth_provenance = Some(AccountOAuthProvenance {
+        issuer: endpoint.to_owned(),
+        client_id: "synthetic-native-owner-client".into(),
+    });
+    storage.save(&stored)?;
+    Ok(Arc::new(
+        AuthManager::new_from_auth_config(build_config(home, None, None).await, false, None).await,
+    ))
+}
+
+#[tokio::test]
+#[serial(codex_auth_env)]
+async fn native_bound_renewal_refuses_changed_owner_before_http() -> anyhow::Result<()> {
+    let _access_token_guard = remove_access_token_env_var();
+    let home = tempdir()?;
+    let server = MockServer::start().await;
+    let manager = native_owner_fixture(home.path(), &server.uri()).await?;
+    let expected = manager.owner_snapshot().context("owner")?;
+    let binding = manager.renewal_binding().context("binding")?;
+    let before = std::fs::read(home.path().join("auth.json"))?;
+    manager.set_cached_auth(Some(CodexAuth::from_api_key("replacement-owner")));
+    assert!(
+        manager
+            .refresh_native_for_owner(&expected, &binding, RefreshReason::Forced)
+            .await
+            .is_err()
+    );
+    assert!(server.received_requests().await.unwrap().is_empty());
+    assert_eq!(std::fs::read(home.path().join("auth.json"))?, before);
+    Ok(())
+}
+
+#[tokio::test]
+#[serial(codex_auth_env)]
+async fn native_bound_renewal_refuses_owner_changed_during_response() -> anyhow::Result<()> {
+    let _access_token_guard = remove_access_token_env_var();
+    let home = tempdir()?;
+    let server = MockServer::start().await;
+    let manager = native_owner_fixture(home.path(), &server.uri()).await?;
+    let expected = manager.owner_snapshot().context("owner")?;
+    let binding = manager.renewal_binding().context("binding")?;
+    let before = std::fs::read(home.path().join("auth.json"))?;
+    let changing = Arc::clone(&manager);
+    Mock::given(path("/oauth/token"))
+        .respond_with(move |_: &wiremock::Request| {
+            changing.set_cached_auth(Some(CodexAuth::from_api_key("replacement-owner")));
+            ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "test-access-token", "refresh_token": "rotated"
+            }))
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
+    assert!(
+        manager
+            .refresh_native_for_owner(&expected, &binding, RefreshReason::Forced)
+            .await
+            .is_err()
+    );
+    assert_eq!(std::fs::read(home.path().join("auth.json"))?, before);
+    assert!(matches!(manager.auth_cached(), Some(CodexAuth::ApiKey(_))));
+    Ok(())
+}
+
+#[tokio::test]
+#[serial(codex_auth_env)]
+async fn native_bound_renewal_publishes_fresh_snapshot_and_preserves_source() -> anyhow::Result<()>
+{
+    let _access_token_guard = remove_access_token_env_var();
+    let home = tempdir()?;
+    let server = MockServer::start().await;
+    let manager = native_owner_fixture(home.path(), &server.uri()).await?;
+    let expected = manager.owner_snapshot().context("owner")?;
+    let binding = manager.renewal_binding().context("binding")?;
+    let original = manager.auth_cached().context("initial auth")?;
+    Mock::given(path("/oauth/token"))
+        .and(body_partial_json(json!({
+            "client_id": "synthetic-native-owner-client",
+            "refresh_token": "test-refresh-token"
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "test-access-token", "refresh_token": "rotated"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    manager
+        .refresh_native_for_owner(&expected, &binding, RefreshReason::Forced)
+        .await?;
     assert_eq!(
-        rendered,
-        format!("Installed {{ fingerprint: {fingerprint:?} }}"),
-        "debug output must expose only the opaque account fingerprint"
+        original.get_token_data()?.refresh_token,
+        "test-refresh-token"
+    );
+    let renewed = manager.auth_cached().context("renewed auth")?;
+    assert_eq!(renewed.get_token_data()?.refresh_token, "rotated");
+    assert_eq!(
+        FileAuthStorage::new(home.path().to_path_buf())
+            .load()?
+            .context("durable auth")?
+            .tokens
+            .context("durable tokens")?
+            .refresh_token,
+        "rotated"
+    );
+    let after = manager.owner_snapshot().context("owner after")?;
+    assert_eq!(
+        after.revisions.owner_generation,
+        expected.revisions.owner_generation
+    );
+    assert_eq!(
+        after.revisions.source_generation,
+        expected.revisions.source_generation
+    );
+    assert_eq!(
+        after.revisions.login_generation,
+        expected.revisions.login_generation
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[serial(codex_auth_env)]
+async fn native_bound_renewal_refuses_stale_storage_and_unproven_source() -> anyhow::Result<()> {
+    let _access_token_guard = remove_access_token_env_var();
+    for replace_storage in [false, true] {
+        let home = tempdir()?;
+        let server = MockServer::start().await;
+        let manager = native_owner_fixture(home.path(), &server.uri()).await?;
+        let expected = manager.owner_snapshot().context("owner")?;
+        let binding = manager.renewal_binding().context("binding")?;
+        let storage = FileAuthStorage::new(home.path().to_path_buf());
+        let original = storage.load()?.context("initial storage")?;
+        let mut replacement = original.clone();
+        replacement.tokens.as_mut().context("tokens")?.refresh_token =
+            "concurrent-login-refresh".into();
+        let expected_storage = if replace_storage {
+            replacement.clone()
+        } else {
+            original
+        };
+        Mock::given(path("/oauth/token"))
+            .respond_with(move |_: &wiremock::Request| {
+                if replace_storage {
+                    storage.save(&replacement).expect("synthetic concurrent login");
+                }
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "access_token": if replace_storage { "test-access-token" } else { "unproven-new-source" },
+                    "refresh_token": "late-renewal"
+                }))
+            })
+            .expect(1)
+            .mount(&server)
+            .await;
+        assert!(
+            manager
+                .refresh_native_for_owner(&expected, &binding, RefreshReason::Forced)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            FileAuthStorage::new(home.path().to_path_buf()).load()?,
+            Some(expected_storage)
+        );
+        assert_eq!(
+            manager
+                .auth_cached()
+                .context("unchanged cached auth")?
+                .get_token_data()?
+                .refresh_token,
+            "test-refresh-token"
+        );
+        assert_eq!(manager.owner_snapshot(), Some(expected));
+    }
+    Ok(())
+}
+
+fn pin_current_owner(source: &Arc<AuthManager>) -> Arc<AuthManager> {
+    AuthManager::owner_pinned(
+        source,
+        &source.owner_snapshot().unwrap(),
+        &source.renewal_binding().unwrap(),
+        crate::GatewayAdmission::NotConfigured,
+    )
+    .unwrap()
+}
+
+#[derive(Debug)]
+struct OwnerPinUnexpectedAuthority(Arc<AtomicUsize>);
+impl ExternalAuth for OwnerPinUnexpectedAuthority {
+    fn resolve(&self) -> ExternalAuthFuture<'_, CodexAuth> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async {
+            Err(std::io::Error::other(
+                "pinned mutation must refuse before provider resolution",
+            ))
+        })
+    }
+    fn refresh(&self, _context: ExternalAuthRefreshContext) -> ExternalAuthFuture<'_, CodexAuth> {
+        self.resolve()
+    }
+}
+
+#[tokio::test]
+#[serial(codex_auth_env)]
+async fn owner_pin_cached_observation_and_reload_do_not_select_storage() -> anyhow::Result<()> {
+    let _access_token_guard = remove_access_token_env_var();
+    let home = tempdir()?;
+    let source = native_owner_fixture(home.path(), "http://127.0.0.1:1").await?;
+    let pinned = pin_current_owner(&source);
+    let original = std::fs::read(home.path().join("auth.json"))?;
+    std::fs::rename(
+        home.path().join("auth.json"),
+        home.path().join("retained.json"),
+    )?;
+    assert_eq!(pinned.auth_observation()["stateKnown"], true);
+    assert_eq!(
+        pinned
+            .auth_cached()
+            .unwrap()
+            .get_token_data()?
+            .refresh_token,
+        "test-refresh-token"
+    );
+    assert!(!pinned.reload_with_cached_auth().await?);
+    assert!(pinned.auth().await.is_some());
+    assert!(!home.path().join("auth.json").exists());
+    assert_eq!(std::fs::read(home.path().join("retained.json"))?, original);
+    assert!(pinned.logout().await.is_err());
+    assert!(!home.path().join("auth.json").exists());
+    Ok(())
+}
+
+#[tokio::test]
+#[serial(codex_auth_env)]
+async fn owner_pin_changed_source_owner_refuses_all_credential_entrypoints() -> anyhow::Result<()> {
+    let _access_token_guard = remove_access_token_env_var();
+    let home = tempdir()?;
+    let source = native_owner_fixture(home.path(), "http://127.0.0.1:1").await?;
+    let pinned = pin_current_owner(&source);
+    let original = std::fs::read(home.path().join("auth.json"))?;
+    source.set_cached_auth(Some(CodexAuth::from_api_key("replacement-owner")));
+    assert!(pinned.auth_cached().is_none());
+    assert_eq!(pinned.auth_observation()["stateKnown"], false);
+    assert!(pinned.authoritative_auth_cached().is_err());
+    assert!(pinned.auth().await.is_none());
+    assert!(pinned.auth_with_http_client_factory().await.is_none());
+    assert!(!pinned.reload().await);
+    assert!(pinned.reload_with_cached_auth().await.is_err());
+    assert!(pinned.refresh_token().await.is_err());
+    assert!(pinned.refresh_token_from_authority().await.is_err());
+    assert!(pinned.logout().await.is_err());
+    assert!(pinned.account_oauth_grant().await.is_err());
+    assert_eq!(std::fs::read(home.path().join("auth.json"))?, original);
+    assert!(matches!(source.auth_cached(), Some(CodexAuth::ApiKey(_))));
+    Ok(())
+}
+
+#[tokio::test]
+#[serial(codex_auth_env)]
+async fn owner_pin_cannot_mutate_or_adopt_a_new_authority() -> anyhow::Result<()> {
+    let _access_token_guard = remove_access_token_env_var();
+    let home = tempdir()?;
+    let source = native_owner_fixture(home.path(), "http://127.0.0.1:1").await?;
+    let pinned = pin_current_owner(&source);
+    let before = std::fs::read(home.path().join("auth.json"))?;
+    let fingerprint = AuthManager::managed_account_fingerprint(WORKSPACE_ID_ALLOWED);
+    let precondition = source
+        .capture_managed_adoption_precondition(Some(&fingerprint))
+        .expect("native fixture adoption precondition");
+    assert!(
+        pinned
+            .prepare_managed_adoption(Some(&fingerprint), &precondition)
+            .await
+            .is_err()
     );
     assert!(
-        !rendered.contains("opaque-account"),
-        "debug output must not expose the source account identifier"
+        !pinned
+            .managed_transition_eligible()
+            .expect("pinned eligibility observation")
     );
+    let callback = AtomicUsize::new(0);
+    assert!(
+        pinned
+            .with_managed_cached_result(Some(&fingerprint), || {
+                callback.fetch_add(1, Ordering::SeqCst);
+            })
+            .is_err()
+    );
+    assert_eq!(callback.load(Ordering::SeqCst), 0);
+    assert!(
+        pinned
+            .try_set_cached_auth(Some(CodexAuth::from_api_key("forbidden")))
+            .is_err()
+    );
+    assert!(pinned.restrict_auth_modes(vec![AuthMode::ApiKey]).is_err());
+    let calls = Arc::new(AtomicUsize::new(0));
+    assert!(
+        pinned
+            .set_external_auth(Arc::new(OwnerPinUnexpectedAuthority(calls.clone())))
+            .await
+            .is_err()
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    pinned.set_forced_chatgpt_workspace_id(Some(vec!["forbidden".into()]));
+    assert!(source.forced_chatgpt_workspace_id().is_none());
+    assert_eq!(std::fs::read(home.path().join("auth.json"))?, before);
+    assert_eq!(
+        pinned.auth_cached().unwrap().get_account_id().as_deref(),
+        Some(WORKSPACE_ID_ALLOWED)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[serial(codex_auth_env)]
+async fn owner_pin_retains_native_source_and_login_revision_fences() -> anyhow::Result<()> {
+    let _access_token_guard = remove_access_token_env_var();
+    for login in [false, true] {
+        let home = tempdir()?;
+        let source = native_owner_fixture(home.path(), "http://127.0.0.1:1").await?;
+        let pinned = pin_current_owner(&source);
+        let owner = source.owner_snapshot().unwrap().revisions.owner_generation;
+        // Unit injection: isolate each newer revision while cached credentials
+        // and owner generation stay fixed; this is not a storage/login run.
+        source.auth_change_state_tx.send_modify(|state| {
+            if login {
+                state.login_generation += 1;
+            } else {
+                state.source_generation += 1;
+            }
+        });
+        assert_eq!(
+            source.owner_snapshot().unwrap().revisions.owner_generation,
+            owner
+        );
+        assert!(pinned.auth_cached().is_none());
+        assert!(pinned.reload_with_cached_auth().await.is_err());
+        assert!(pinned.refresh_token().await.is_err());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn owner_pin_host_authority_is_exact_and_recovery_requires_wire_proof() {
+    use super::command_cache_publication_tests::record;
+    use super::command_cache_publication_tests::selected_fixture;
+    let home = tempdir().unwrap();
+    let (_, source) = selected_fixture(home.path(), record(1));
+    let pinned = pin_current_owner(&source);
+    let before = std::fs::read(home.path().join("auth.json")).unwrap();
+    assert!(matches!(
+        pinned.recover_rejected_credential(None).await,
+        Some(Err(_))
+    ));
+    assert!(
+        source
+            .refresh_failure_for_auth(&source.auth_cached().unwrap())
+            .is_none(),
+        "missing wire proof is not a permanent credential failure"
+    );
+    assert_eq!(
+        std::fs::read(home.path().join("auth.json")).unwrap(),
+        before
+    );
+    let calls = Arc::new(AtomicUsize::new(0));
+    *source.external_auth.write().unwrap() =
+        Some(Arc::new(OwnerPinUnexpectedAuthority(calls.clone())));
+    assert!(pinned.auth_cached().is_none());
+    assert!(pinned.auth().await.is_none());
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+#[serial(codex_auth_env)]
+async fn owner_pin_shares_actual_agent_bootstrap_exclusion() -> anyhow::Result<()> {
+    let _access_token_guard = remove_access_token_env_var();
+    let home = tempdir()?;
+    let source = native_owner_fixture(home.path(), "http://127.0.0.1:1").await?;
+    let pinned = pin_current_owner(&source);
+    assert!(std::ptr::eq(
+        pinned.agent_identity_bootstrap_owner(),
+        source.as_ref()
+    ));
+    let guard = source.agent_identity_lock.acquire().await?;
+    let mut work = Box::pin(
+        pinned.agent_identity_auth(AgentIdentityAuthPolicy::ChatGptAuth, SessionSource::Exec),
+    );
+    assert!(
+        std::future::Future::poll(
+            work.as_mut(),
+            &mut std::task::Context::from_waker(std::task::Waker::noop())
+        )
+        .is_pending()
+    );
+    drop(work);
+    drop(guard);
+    assert_eq!(source.agent_identity_lock.available_permits(), 1);
+    Ok(())
+}
+
+async fn native_pin_grant_fixture(home: &Path) -> anyhow::Result<Arc<AuthManager>> {
+    let source = native_owner_fixture(home, "http://127.0.0.1:1").await?;
+    let storage = FileAuthStorage::new(home.to_path_buf());
+    let mut auth = storage.load()?.context("synthetic native grant")?;
+    auth.tokens.as_mut().context("tokens")?.login_owner_id = Some("pinned-login".into());
+    storage.save(&auth)?;
+    source.reload_with_cached_auth().await?;
+    Ok(source)
+}
+
+#[tokio::test]
+#[serial(codex_auth_env)]
+async fn owner_pin_grant_lease_excludes_source_refresh_and_retains_pin_after_release()
+-> anyhow::Result<()> {
+    let _access_token_guard = remove_access_token_env_var();
+    let home = tempdir()?;
+    let source = native_pin_grant_fixture(home.path()).await?;
+    let pinned = pin_current_owner(&source);
+    let expected = pinned.auth_cached().context("pinned account")?;
+    let lease = pinned
+        .lease_account_oauth_grant()
+        .await?
+        .context("eligible native grant")?;
+    assert_eq!(
+        lease.tokens().login_owner_id.as_deref(),
+        Some("pinned-login")
+    );
+    assert!(
+        source.refresh_lock.clone().try_acquire_owned().is_err(),
+        "lease must exclude the original manager's refresh"
+    );
+    assert_eq!(
+        pinned.refresh_lock.available_permits(),
+        1,
+        "a private replacement semaphore is not the lease"
+    );
+    let grant = lease.release();
+    assert_eq!(source.refresh_lock.available_permits(), 1);
+    assert!(grant.current_tokens().await?.is_some());
+    assert!(pinned.account_login_is_current(&expected).await?);
+    source.set_cached_auth(Some(CodexAuth::from_api_key("changed-owner")));
+    assert!(grant.current_tokens().await?.is_none());
+    assert!(pinned.account_oauth_grant().await.is_err());
+    Ok(())
+}
+
+#[tokio::test]
+#[serial(codex_auth_env)]
+async fn owner_pin_grant_rejects_a_foreign_durable_login_without_adopting_or_saving()
+-> anyhow::Result<()> {
+    let _access_token_guard = remove_access_token_env_var();
+    let home = tempdir()?;
+    let source = native_pin_grant_fixture(home.path()).await?;
+    let pinned = pin_current_owner(&source);
+    let expected = pinned.auth_cached().context("pinned account")?;
+    let grant = pinned
+        .account_oauth_grant()
+        .await?
+        .context("initial grant")?;
+    let storage = FileAuthStorage::new(home.path().to_path_buf());
+    let mut other = storage.load()?.context("stored account")?;
+    other.tokens.as_mut().context("tokens")?.login_owner_id = Some("different-login".into());
+    other.tokens.as_mut().context("tokens")?.refresh_token = "foreign-refresh".into();
+    storage.save(&other)?;
+    let before = std::fs::read(home.path().join("auth.json"))?;
+    assert!(grant.current_tokens().await?.is_none());
+    assert!(pinned.account_oauth_grant().await?.is_none());
+    assert!(pinned.lease_account_oauth_grant().await?.is_none());
+    assert!(!pinned.account_login_is_current(&expected).await?);
+    assert_eq!(grant.tokens().refresh_token, "test-refresh-token");
+    assert_eq!(
+        source
+            .auth_cached()
+            .unwrap()
+            .get_token_data()?
+            .refresh_token,
+        "test-refresh-token"
+    );
+    assert_eq!(std::fs::read(home.path().join("auth.json"))?, before);
+    Ok(())
+}
+
+#[tokio::test]
+#[serial(codex_auth_env)]
+async fn owner_pin_preserves_login_check_without_inventing_an_eligible_oauth_grant()
+-> anyhow::Result<()> {
+    let _access_token_guard = remove_access_token_env_var();
+    let home = tempdir()?;
+    let source = native_pin_grant_fixture(home.path()).await?;
+    let storage = FileAuthStorage::new(home.path().to_path_buf());
+    let mut auth = storage.load()?.context("stored account")?;
+    auth.tokens.as_mut().context("tokens")?.oauth_provenance = None;
+    storage.save(&auth)?;
+    source.reload_with_cached_auth().await?;
+    let pinned = pin_current_owner(&source);
+    let expected = pinned.auth_cached().context("pinned account")?;
+    assert!(pinned.account_login_is_current(&expected).await?);
+    assert!(pinned.account_oauth_grant().await?.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+#[serial(codex_auth_env)]
+async fn owner_pin_waiting_for_source_grant_lease_rechecks_owner_before_reading()
+-> anyhow::Result<()> {
+    let _access_token_guard = remove_access_token_env_var();
+    let home = tempdir()?;
+    let source = native_pin_grant_fixture(home.path()).await?;
+    let pinned = pin_current_owner(&source);
+    let before = std::fs::read(home.path().join("auth.json"))?;
+    let guard = source.refresh_lock.acquire().await?;
+    let mut waiting = Box::pin(pinned.lease_account_oauth_grant());
+    assert!(
+        std::future::Future::poll(
+            waiting.as_mut(),
+            &mut std::task::Context::from_waker(std::task::Waker::noop())
+        )
+        .is_pending()
+    );
+    source.set_cached_auth(Some(CodexAuth::from_api_key("replacement-while-waiting")));
+    drop(guard);
+    assert!(waiting.await.is_err());
+    assert_eq!(std::fs::read(home.path().join("auth.json"))?, before);
+    assert_eq!(source.refresh_lock.available_permits(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+#[serial(codex_auth_env)]
+async fn owner_admission_allows_credential_revision_but_refuses_source_login_or_owner_change()
+-> anyhow::Result<()> {
+    let _access_token_guard = remove_access_token_env_var();
+    for changed in ["source", "login", "owner"] {
+        let home = tempdir()?;
+        let source = native_owner_fixture(home.path(), "http://127.0.0.1:1").await?;
+        let (expected, renewal) = source.owner_admission_snapshot().unwrap();
+        // Revision-only unit witness: a token rotation does not create a new owner.
+        source
+            .auth_change_state_tx
+            .send_modify(|state| state.generation += 1);
+        assert!(source.verify_owner_binding(&expected, &renewal).is_ok());
+        let pinned = AuthManager::owner_pinned(
+            &source,
+            &expected,
+            &renewal,
+            crate::GatewayAdmission::NotConfigured,
+        )?;
+        let (captured, captured_renewal) = pinned.owner_admission_snapshot().unwrap();
+        assert_eq!(captured, source.owner_admission_snapshot().unwrap().0);
+        assert_eq!(captured_renewal, renewal);
+        assert!(pinned.verify_owner_binding(&expected, &renewal).is_ok());
+        source
+            .auth_change_state_tx
+            .send_modify(|state| match changed {
+                "source" => state.source_generation += 1,
+                "login" => state.login_generation += 1,
+                _ => state.owner_generation += 1,
+            });
+        assert!(source.verify_owner_binding(&expected, &renewal).is_err());
+        assert!(pinned.verify_owner_binding(&expected, &renewal).is_err());
+        assert!(
+            pinned.owner_admission_snapshot().is_none(),
+            "a retired pin cannot capture the replacement"
+        );
+        assert!(
+            AuthManager::owner_pinned(
+                &source,
+                &expected,
+                &renewal,
+                crate::GatewayAdmission::NotConfigured
+            )
+            .is_err()
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[serial(codex_auth_env)]
+async fn queued_event_factory_refuses_retired_owner_without_reselecting_credentials()
+-> anyhow::Result<()> {
+    let _access_token_guard = remove_access_token_env_var();
+    let home = tempdir()?;
+    let source = native_owner_fixture(home.path(), "http://127.0.0.1:1").await?;
+    let expected = source.owner_snapshot().unwrap().revisions.owner_generation;
+    assert!(
+        source
+            .auth_with_http_client_factory_for_owner(expected)
+            .await
+            .is_some()
+    );
+    let before = std::fs::read(home.path().join("auth.json"))?;
+    source.try_set_cached_auth(None)?;
+    assert!(
+        source
+            .auth_with_http_client_factory_for_owner(expected)
+            .await
+            .is_none()
+    );
+    assert!(
+        source.auth_cached().is_none(),
+        "old events cannot reload a durable credential"
+    );
+    assert_eq!(std::fs::read(home.path().join("auth.json"))?, before);
+    Ok(())
 }

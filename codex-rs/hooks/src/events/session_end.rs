@@ -89,7 +89,7 @@ pub(crate) async fn run(
     }
 
     run_with_serializer(engine, request, |input| {
-        serde_json::to_string(input).map_err(|error| error.to_string())
+        serde_json::to_value(input).map_err(|error| error.to_string())
     })
     .await
 }
@@ -97,14 +97,14 @@ pub(crate) async fn run(
 async fn run_with_serializer(
     engine: &ClaudeHooksEngine,
     request: SessionEndRequest,
-    serialize: impl FnOnce(&SessionEndCommandInput) -> Result<String, String>,
+    serialize: impl FnOnce(&SessionEndCommandInput) -> Result<serde_json::Value, String>,
 ) -> SessionEndOutcome {
     let matched = select_handlers(&engine.handlers, request.reason);
     if matched.is_empty() {
         return SessionEndOutcome::default();
     }
 
-    let input_json = match serialize(&SessionEndCommandInput {
+    let input = match serialize(&SessionEndCommandInput {
         session_id: request.session_id.to_string(),
         transcript_path: NullableString::from_path(request.transcript_path.clone()),
         cwd: request.cwd.display().to_string(),
@@ -112,7 +112,7 @@ async fn run_with_serializer(
         reason: request.reason.as_str().to_string(),
         clear_transition_id: request.clear_transition_id,
     }) {
-        Ok(input_json) => input_json,
+        Ok(input) => input,
         Err(error) => {
             return SessionEndOutcome {
                 hook_events: common::serialization_failure_hook_events(
@@ -127,7 +127,7 @@ async fn run_with_serializer(
     let results = dispatcher::execute_handlers(
         engine,
         matched,
-        input_json,
+        &input,
         request.cwd.as_path(),
         Some(request.turn_id),
         parse_completed,

@@ -50,6 +50,7 @@ async fn ephemeral_fork_skips_stored_title_lookup() -> anyhow::Result<()> {
             ForkSnapshot::Interrupted,
             codex_core::StartThreadOptions::new(config, /*control_endpoint*/ None),
             InitialHistory::Resumed(ResumedHistory {
+                history_revision: None,
                 conversation_id: test.session_configured.thread_id,
                 history: Arc::new(Vec::new()),
                 rollout_path: None,
@@ -224,6 +225,7 @@ async fn fork_thread_restores_history_selection_and_preserves_explicit_clear() -
     )
     .await?;
     let history = InitialHistory::Resumed(ResumedHistory {
+        history_revision: None,
         conversation_id: test.session_configured.thread_id,
         history: Arc::new(vec![thread_settings_applied_item(
             test.session_configured.thread_id,
@@ -334,7 +336,7 @@ async fn assert_copied_fork_persists_inherited_history(history_mode: ThreadHisto
     let source_meta = codex_rollout::read_session_meta_line(source_path.as_path())
         .await
         .expect("read source session metadata");
-    let mut supplied_history = vec![RolloutItem::SessionMeta(source_meta)];
+    let mut supplied_history = vec![RolloutItem::SessionMeta(Box::new(source_meta))];
     supplied_history.extend(source_items.iter().cloned());
     let NewThread {
         thread: forked_thread,
@@ -347,6 +349,7 @@ async fn assert_copied_fork_persists_inherited_history(history_mode: ThreadHisto
                 /*control_endpoint*/ None,
             ),
             InitialHistory::Resumed(ResumedHistory {
+                history_revision: None,
                 conversation_id: test.session_configured.thread_id,
                 history: Arc::new(supplied_history),
                 rollout_path: None,
@@ -387,7 +390,7 @@ async fn assert_copied_fork_persists_inherited_history(history_mode: ThreadHisto
                 ),
                 /*parent_trace*/ None,
                 ClientMcpExtensions::default(),
-                None,
+                /*control_endpoint*/ None,
             )
             .await
             .expect("resume copied paginated fork")

@@ -10,7 +10,7 @@ impl AppServerSession {
         local_settings: &LocalSettings,
         config: &Config,
         predecessor: Option<ThreadId>,
-    ) -> Result<AppServerStartedThread> {
+    ) -> Result<(AppServerStartedThread, Option<retention::PendingRetention>)> {
         // Use one connection-bound handle, never a cached capability across reconnect.
         let handle = self.request_handle();
         let support: ThreadClearRecoveryReadResponse = handle.request_typed(
@@ -36,14 +36,16 @@ impl AppServerSession {
             self.thread_params_mode(),
             self.remote_cwd_override.as_deref(),
             Some(ThreadStartSource::Clear),
-            /*clear_predecessor_thread_id*/ None,
         );
+        params.clear_predecessor_thread_id = None;
         params.clear_recovery = Some(context.clone());
         // Let this producer select its supported history mode before creating B.
         // A reconnect has not learned LegacyOnly, and recovery must not need a
         // second creation request just to discover pagination support.
         params.history_mode = None;
         self.thread_tool_transport().configure(&mut params);
+        // The recovered successor is displayed, so it is adopted like any start.
+        params.retain_for_connection = true;
         let task_tools_available = params.dynamic_tools.is_some()
             || params
                 .config
@@ -64,6 +66,21 @@ impl AppServerSession {
                 "Clear recovery outcome is unknown: server omitted or changed accepted context; do not automatically retry"
             );
         }
+        let retention = match self
+            .retention
+            .adopt_thread(
+                handle,
+                response.thread.id.clone(),
+                response.retention.clone(),
+            )
+            .await
+        {
+            Ok(retention) => Some(retention),
+            Err(error) => {
+                self.retention.warn_adoption(&response.thread.id, &error);
+                None
+            }
+        };
         let mut started = started_thread_from_start_response(
             response,
             local_settings,
@@ -75,6 +92,8 @@ impl AppServerSession {
         if task_tools_available {
             self.remember_task_tool_thread(started.session.thread_id);
         }
-        Ok(started)
+        // Installation owns the commit. Dropping a prepared successor must
+        // release a newly granted handle rather than silently keep custody.
+        Ok((started, retention))
     }
 }

@@ -1,3 +1,4 @@
+use codex_protocol::openai_models::CatalogModel;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -24,7 +25,6 @@ use crate::tools::events::ToolEventStage;
 use codex_core_plugins::PluginCommandAttribution;
 use codex_protocol::exec_output::ExecToolCallOutput;
 use codex_protocol::exec_output::StreamOutput;
-use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ExecCommandOutputDeltaEvent;
 use codex_protocol::protocol::ExecCommandSource;
@@ -186,6 +186,7 @@ pub(crate) fn spawn_exit_watcher(
             let _ = network_denial_monitor.await;
         }
         let _interaction_guard = interaction_lock.lock_owned().await;
+        process.collect_sandbox_cleanup().await;
 
         let duration = Instant::now().saturating_duration_since(started_at);
         let plugin_metrics_sidecar = plugin_metrics_sidecar
@@ -332,7 +333,7 @@ pub(crate) async fn emit_exec_end_for_unified_exec(
     sandbox_type: Option<codex_protocol::sandbox::SandboxType>,
     session_ref: Arc<Session>,
     turn_ref: Arc<TurnContext>,
-    model_info: Arc<ModelInfo>,
+    model_info: Arc<CatalogModel>,
     call_id: String,
     command: Vec<String>,
     cwd: PathUri,
@@ -384,7 +385,7 @@ pub(crate) async fn emit_failed_exec_end_for_unified_exec(
     sandbox_type: Option<codex_protocol::sandbox::SandboxType>,
     session_ref: Arc<Session>,
     turn_ref: Arc<TurnContext>,
-    model_info: Arc<ModelInfo>,
+    model_info: Arc<CatalogModel>,
     call_id: String,
     command: Vec<String>,
     cwd: PathUri,

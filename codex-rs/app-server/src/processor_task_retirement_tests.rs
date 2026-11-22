@@ -3,6 +3,49 @@ use pretty_assertions::assert_eq;
 use std::sync::Arc;
 use std::time::Duration;
 
+#[tokio::test(start_paused = true)]
+async fn synchronous_shutdown_census_closes_births_without_waiting_or_losing_original() {
+    let tasks = ProcessorTasks::default();
+    let (release, released) = tokio::sync::oneshot::channel();
+    let receipt = tasks
+        .spawn(async move {
+            let _ = released.await;
+        })
+        .unwrap();
+    let began = Instant::now();
+    let census = tasks.close_and_census(began);
+    assert_eq!(Instant::now(), began);
+    assert_eq!(census.pending, Some(1));
+    assert!(!census.drain.terminal);
+    assert!(tasks.spawn(async {}).is_err());
+    release.send(()).unwrap();
+    assert_eq!(receipt.await, ProcessorTaskJoin::Joined);
+    assert!(
+        tasks
+            .shutdown_until(began + Duration::from_secs(30))
+            .await
+            .is_clean()
+    );
+    assert_eq!(Instant::now(), began);
+    assert_eq!(tasks.census().pending, Some(0));
+}
+
+#[tokio::test]
+async fn synchronous_census_preserves_panic_and_unverified_facts() {
+    let tasks = ProcessorTasks::default();
+    let panic = tasks
+        .spawn(async { panic!("census original panic") })
+        .unwrap();
+    assert_eq!(panic.await, ProcessorTaskJoin::Panicked);
+    let unverified = tasks.spawn_unverified(async {}).unwrap();
+    assert_eq!(unverified.await, ProcessorTaskJoin::Joined);
+    let census = tasks.close_and_census(Instant::now());
+    assert_eq!(census.pending, Some(0));
+    assert!(census.drain.terminal && census.drain.panicked && census.drain.unverified);
+    assert!(!census.drain.is_clean());
+    assert_eq!(tasks.census(), census);
+}
+
 #[tokio::test]
 async fn panic_is_sticky_after_join_compaction() {
     let tasks = ProcessorTasks::default();
@@ -169,4 +212,141 @@ async fn nested_ticket_cannot_reopen_or_keep_registry_alive() {
         ticket.spawn(async {}),
         Err(ProcessorTaskAdmissionError::Unavailable)
     ));
+}
+
+#[tokio::test]
+async fn blocking_original_survives_observer_abort_and_deadline() {
+    let tasks = ProcessorTasks::default();
+    let (entered, started) = tokio::sync::oneshot::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let receipt = tasks
+        .ticket()
+        .spawn_blocking(move || {
+            entered.send(()).unwrap();
+            released.recv().unwrap();
+        })
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), started)
+        .await
+        .unwrap()
+        .unwrap();
+    let observer = tokio::spawn(receipt.clone());
+    observer.abort();
+    assert!(observer.await.unwrap_err().is_cancelled());
+    let report = tasks.shutdown_until(Instant::now()).await;
+    release.send(()).unwrap();
+    assert!(!report.terminal);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), receipt)
+            .await
+            .unwrap(),
+        ProcessorTaskJoin::Joined
+    );
+    assert!(tasks.shutdown_until(Instant::now()).await.is_clean());
+}
+
+#[tokio::test]
+async fn closed_ticket_refuses_blocking_body_before_dispatch() {
+    let tasks = ProcessorTasks::default();
+    tasks.close_registration().unwrap();
+    let polled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let work = polled.clone();
+    assert_eq!(
+        tasks
+            .ticket()
+            .spawn_blocking(move || work.store(true, std::sync::atomic::Ordering::SeqCst))
+            .err(),
+        Some(ProcessorTaskAdmissionError::Closed)
+    );
+    assert!(!polled.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(tasks.shutdown_until(Instant::now()).await.is_clean());
+}
+
+#[test]
+fn dead_ticket_and_missing_runtime_refuse_blocking_birth_without_fallback() {
+    let dead = {
+        let tasks = ProcessorTasks::default();
+        tasks.ticket()
+    };
+    assert_eq!(
+        dead.spawn_blocking(|| panic!("dead owner must not dispatch"))
+            .err(),
+        Some(ProcessorTaskAdmissionError::Unavailable)
+    );
+    let live = ProcessorTasks::default();
+    assert_eq!(
+        live.ticket()
+            .spawn_blocking(|| panic!("missing runtime must not dispatch"))
+            .err(),
+        Some(ProcessorTaskAdmissionError::Unavailable)
+    );
+    assert_eq!(live.len(), 0);
+}
+
+#[tokio::test]
+async fn blocking_panic_is_sticky_after_original_join() {
+    let tasks = ProcessorTasks::default();
+    let receipt = tasks
+        .spawn_blocking(|| panic!("synthetic physical blocking panic"))
+        .unwrap();
+    assert_eq!(receipt.await, ProcessorTaskJoin::Panicked);
+    for _ in 0..2 {
+        let report = tasks.shutdown_until(Instant::now()).await;
+        assert!(report.terminal && report.panicked && !report.is_clean());
+    }
+}
+
+#[tokio::test]
+async fn panic_payload_compaction_reenters_registry_outside_its_lock() {
+    struct Payload {
+        ticket: ProcessorTaskTicket,
+        unlocked: Arc<std::sync::atomic::AtomicBool>,
+        child_finished: Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl Drop for Payload {
+        fn drop(&mut self) {
+            let registry = self.ticket.state.upgrade().unwrap();
+            let unlocked = registry.try_lock().is_ok();
+            self.unlocked
+                .store(unlocked, std::sync::atomic::Ordering::SeqCst);
+            // Fail the old lock-holding implementation without deadlocking the
+            // test. The fixed implementation also exercises real re-entry.
+            if unlocked {
+                let finished = self.child_finished.clone();
+                self.ticket
+                    .spawn(async move {
+                        finished.store(true, std::sync::atomic::Ordering::SeqCst);
+                    })
+                    .unwrap();
+            }
+        }
+    }
+    let tasks = ProcessorTasks::default();
+    let unlocked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let child_finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let payload = Payload {
+        ticket: tasks.ticket(),
+        unlocked: unlocked.clone(),
+        child_finished: child_finished.clone(),
+    };
+    let (entered, started) = tokio::sync::oneshot::channel();
+    let receipt = tasks
+        .spawn(async move {
+            entered.send(()).unwrap();
+            std::panic::panic_any(payload);
+        })
+        .unwrap();
+    started.await.unwrap();
+    tokio::task::yield_now().await;
+    let _ = tasks.pending_len_for_test();
+    assert!(unlocked.load(std::sync::atomic::Ordering::SeqCst));
+    // The unused observation must not retain the already-disposed payload.
+    assert_eq!(receipt.peek(), Some(&ProcessorTaskJoin::Panicked));
+    let drain = tasks
+        .observe_until(Instant::now() + std::time::Duration::from_secs(1))
+        .await;
+    assert!(drain.terminal);
+    assert!(drain.panicked);
+    assert!(!drain.is_clean());
+    assert!(child_finished.load(std::sync::atomic::Ordering::SeqCst));
 }

@@ -4,14 +4,15 @@ use codex_backend_client::Client as BackendClient;
 use codex_backend_client::RequestError;
 use codex_config::types::OtelExporterKind;
 use codex_core::config::Config;
+use codex_features::RuntimeAuthMode;
 use codex_login::AuthManager;
 use codex_model_provider::SharedModelProvider;
-use codex_model_provider::create_model_provider;
 use codex_otel::SessionTelemetry;
 use codex_protocol::ThreadId;
 use codex_protocol::auth::AuthMode;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
+use codex_runtime_agent_instance::RuntimeAuthManager;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -33,7 +34,69 @@ const MAX_STALLED_POLL_ATTEMPTS: u8 = 5;
 pub(crate) struct TurnCostWorker {
     handle: TurnCostWorkerHandle,
     shutdown: CancellationToken,
-    _task: JoinHandle<()>,
+    completion: TurnCostCompletion,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TurnCostShutdown {
+    Joined,
+    Cancelled,
+    Panicked,
+    TimedOut,
+}
+
+struct TurnCostCompletion {
+    state: tokio::sync::Mutex<TurnCostOriginal>,
+}
+enum TurnCostOriginal {
+    Running(JoinHandle<()>),
+    Finished(TurnCostShutdown),
+}
+impl TurnCostCompletion {
+    fn new(task: JoinHandle<()>) -> Self {
+        Self {
+            state: tokio::sync::Mutex::new(TurnCostOriginal::Running(task)),
+        }
+    }
+
+    /// The mutex owns the sole poll right. Timeout/cancelled observers never
+    /// remove, abort or forget the original handle. The worker never takes it.
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "exclusive original join polling custody"
+    )]
+    async fn observe_until(&self, deadline: tokio::time::Instant) -> TurnCostShutdown {
+        if let Ok(state) = self.state.try_lock()
+            && let TurnCostOriginal::Finished(outcome) = &*state
+        {
+            return *outcome;
+        }
+        let mut state = tokio::select! {
+            biased;
+            _ = tokio::time::sleep_until(deadline) => return TurnCostShutdown::TimedOut,
+            state = self.state.lock() => state,
+        };
+        let original = match &mut *state {
+            TurnCostOriginal::Finished(outcome) => return *outcome,
+            TurnCostOriginal::Running(task) => task,
+        };
+        let joined = tokio::select! {
+            biased;
+            _ = tokio::time::sleep_until(deadline) => return TurnCostShutdown::TimedOut,
+            joined = original => joined,
+        };
+        let outcome = match &joined {
+            Ok(()) => TurnCostShutdown::Joined,
+            Err(error) if error.is_cancelled() => TurnCostShutdown::Cancelled,
+            Err(_) => TurnCostShutdown::Panicked,
+        };
+        *state = TurnCostOriginal::Finished(outcome);
+        drop(state);
+        // JoinError may own an arbitrary panic payload. Never destroy it while
+        // holding the completion mutex, including on a sticky failure outcome.
+        drop(joined);
+        outcome
+    }
 }
 
 #[derive(Clone)]
@@ -81,6 +144,7 @@ struct WorkerRuntime {
     config: Arc<Config>,
     backend: TurnCostBackend,
     turns: HashMap<String, TurnCostEntry>,
+    runtime_auth: Option<(Arc<RuntimeAuthManager>, RuntimeAuthMode)>,
 }
 
 #[derive(Clone)]
@@ -98,7 +162,11 @@ enum BackendAvailability {
 }
 
 impl TurnCostWorker {
-    pub(crate) fn spawn(config: Arc<Config>, auth_manager: Arc<AuthManager>) -> Option<Self> {
+    pub(crate) fn spawn(
+        config: Arc<Config>,
+        auth_manager: Arc<AuthManager>,
+        runtime_auth: Option<(Arc<RuntimeAuthManager>, RuntimeAuthMode)>,
+    ) -> Option<Self> {
         let has_otel_log_exporter = matches!(
             config.otel.exporter,
             OtelExporterKind::OtlpHttp { .. } | OtelExporterKind::OtlpGrpc { .. }
@@ -116,10 +184,13 @@ impl TurnCostWorker {
         let backend = if is_openai {
             TurnCostBackend::OpenAi(Arc::clone(&auth_manager))
         } else {
-            TurnCostBackend::ModelProvider(create_model_provider(
-                config.model_provider.clone(),
-                Some(Arc::clone(&auth_manager)),
-            ))
+            TurnCostBackend::ModelProvider(
+                codex_model_provider::ProviderAuthContext {
+                    credentials: Arc::clone(&auth_manager),
+                    runtime_auth: runtime_auth.clone(),
+                }
+                .model_provider(config.model_provider.clone()),
+            )
         };
         let (sender, receiver) = mpsc::channel(OBSERVATION_CHANNEL_CAPACITY);
         let shutdown = CancellationToken::new();
@@ -127,6 +198,7 @@ impl TurnCostWorker {
             config: Arc::clone(&config),
             backend: backend.clone(),
             turns: HashMap::new(),
+            runtime_auth,
         };
         let worker_shutdown = shutdown.clone();
         let task = tokio::spawn(async move {
@@ -139,7 +211,7 @@ impl TurnCostWorker {
                 config,
             },
             shutdown,
-            _task: task,
+            completion: TurnCostCompletion::new(task),
         })
     }
 
@@ -149,6 +221,11 @@ impl TurnCostWorker {
 
     pub(crate) fn shutdown(&self) {
         self.shutdown.cancel();
+    }
+
+    pub(crate) async fn shutdown_until(&self, deadline: tokio::time::Instant) -> TurnCostShutdown {
+        self.shutdown();
+        self.completion.observe_until(deadline).await
     }
 }
 
@@ -423,11 +500,15 @@ impl WorkerRuntime {
                     .model_provider
                     .to_api_provider(Some(AuthMode::ApiKey))
                     .map_err(|error| RequestError::Other(error.into()))?;
-                let client = BackendClient::from_auth(
-                    self.config.chatgpt_base_url.clone(),
+                let client = BackendClient::from_auth_with_runtime(
+                    self.config.chatgpt_backend_url().resolve(&auth),
                     &auth,
                     http_client_factory,
-                );
+                    self.runtime_auth.as_ref(),
+                    &provider.headers,
+                )
+                .await
+                .map_err(RequestError::Other)?;
                 client
                     .query_api_key_turn_costs(turn_ids, &provider.headers)
                     .await
@@ -448,17 +529,20 @@ impl WorkerRuntime {
                         return Ok(None);
                     }
                 }
-                let provider = model_provider
-                    .api_provider()
-                    .await
-                    .map_err(|error| RequestError::Other(error.into()))?;
-                let auth = model_provider
-                    .api_auth()
-                    .await
-                    .map_err(|error| RequestError::Other(error.into()))?;
+                let resolved = codex_model_provider::resolve_request(
+                    model_provider.as_ref(),
+                    /*scope*/ None,
+                    /*routing*/ None,
+                    http_client_factory,
+                )
+                .await
+                .map_err(|error| RequestError::Other(error.into()))?;
+                let provider = resolved.api_provider;
                 let endpoint = provider.url_for_path("analytics/codex/turn-costs");
-                let client = BackendClient::new(provider.base_url.clone(), http_client_factory)
-                    .with_auth_provider(auth);
+                let client =
+                    BackendClient::new(provider.base_url.clone(), resolved.http_client_factory)
+                        .with_auth_provider(resolved.api_auth)
+                        .map_err(RequestError::Other)?;
                 client
                     .query_api_key_turn_costs_at(&endpoint, turn_ids, &provider.headers)
                     .await
@@ -536,3 +620,7 @@ mod chatgpt;
 #[cfg(test)]
 #[path = "turn_cost_worker_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "turn_cost_retirement_tests.rs"]
+mod retirement_tests;

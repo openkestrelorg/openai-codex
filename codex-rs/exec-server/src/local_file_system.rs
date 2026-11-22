@@ -1,12 +1,22 @@
+use crate::fs_sandbox::with_fs_helper_cleanup_receipt;
+use bytes::Bytes;
+use codex_file_system::ExecutorFileSystemOutcomeFuture;
+use codex_file_system::ExecutorFileSystemReadStreamFuture;
+use codex_file_system::FILE_WRITE_CHUNK_SIZE;
+use codex_file_system::FileSystemOutcome;
 use codex_file_system::MAX_WALK_DEPTH;
 use codex_file_system::MAX_WALK_DIRECTORIES;
 use codex_file_system::MAX_WALK_ENTRIES;
 use codex_file_system::MAX_WALK_RESPONSE_BYTES;
+use codex_file_system::ReadStreamOutcome;
 use codex_file_system::WALK_RESPONSE_ITEM_OVERHEAD_BYTES;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
+use futures::StreamExt;
+use futures::stream::BoxStream;
 use std::collections::HashSet;
 use std::collections::VecDeque;
+use std::future::Future;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -14,7 +24,7 @@ use std::sync::LazyLock;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 use tokio::io;
-use tokio::io::AsyncReadExt;
+use tokio::io::AsyncWriteExt;
 use tokio_util::io::ReaderStream;
 use tokio_util::sync::CancellationToken;
 
@@ -39,17 +49,9 @@ use crate::WalkOptions;
 use crate::WalkOutcome;
 use crate::WriteFileOptions;
 use crate::no_follow;
+use crate::protocol::FsOpenMode;
 use crate::regular_file;
 use crate::sandboxed_file_system::SandboxedFileSystem;
-
-const MAX_READ_FILE_BYTES: u64 = 512 * 1024 * 1024;
-
-fn file_too_large_error() -> io::Error {
-    io::Error::new(
-        io::ErrorKind::InvalidInput,
-        format!("file is too large to read: limit is {MAX_READ_FILE_BYTES} bytes"),
-    )
-}
 
 pub static LOCAL_FS: LazyLock<Arc<dyn ExecutorFileSystem>> =
     LazyLock::new(|| -> Arc<dyn ExecutorFileSystem> { Arc::new(LocalFileSystem::unsandboxed()) });
@@ -128,20 +130,23 @@ impl LocalFileSystem {
 }
 
 impl LocalFileSystem {
-    pub(crate) async fn open_file_for_read(
+    pub(crate) async fn open_file(
         &self,
         path: &PathUri,
+        mode: FsOpenMode,
         sandbox: Option<&FileSystemSandboxContext>,
     ) -> FileSystemResult<tokio::fs::File> {
         if let Some(sandbox) = sandbox {
             sandbox.validate_file_system_paths_for_current_host()?;
+            let needs_sandbox = match mode {
+                FsOpenMode::Read => sandbox.should_read_from_sandbox(),
+                FsOpenMode::Replace => sandbox.should_write_into_sandbox(),
+            };
+            if needs_sandbox {
+                return self.sandboxed()?.open_file(path, mode, Some(sandbox)).await;
+            }
         }
-        if sandbox.is_some_and(FileSystemSandboxContext::should_read_from_sandbox) {
-            return self.sandboxed()?.open_file_for_read(path, sandbox).await;
-        }
-        self.unsandboxed
-            .open_file_for_read(path, /*sandbox*/ None)
-            .await
+        regular_file::open(path.to_abs_path()?.as_path(), mode).await
     }
 
     async fn canonicalize(
@@ -259,6 +264,35 @@ impl LocalFileSystem {
 }
 
 impl ExecutorFileSystem for LocalFileSystem {
+    fn write_file_stream<'a>(
+        &'a self,
+        path: &'a PathUri,
+        mut contents: BoxStream<'a, FileSystemResult<Bytes>>,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, u64> {
+        Box::pin(async move {
+            let mut file = self.open_file(path, FsOpenMode::Replace, sandbox).await?;
+            let mut written = 0_u64;
+            while let Some(chunk) = contents.next().await {
+                let chunk = chunk?;
+                if !(1..=FILE_WRITE_CHUNK_SIZE).contains(&chunk.len()) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "invalid file stream block length",
+                    ));
+                }
+                let next_offset = written.checked_add(chunk.len() as u64).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "file stream offset overflow")
+                })?;
+                file.write_all(&chunk).await?;
+                // Tokio can return before its blocking write finishes; finish this block before reading another.
+                file.flush().await?;
+                written = next_offset;
+            }
+            Ok(written)
+        })
+    }
+
     fn canonicalize<'a>(
         &'a self,
         path: &'a PathUri,
@@ -357,20 +391,157 @@ impl ExecutorFileSystem for LocalFileSystem {
             sandbox,
         ))
     }
+    fn write_file_stream_with_receipt<'a>(
+        &'a self,
+        path: &'a PathUri,
+        contents: BoxStream<'a, FileSystemResult<Bytes>>,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemOutcomeFuture<'a, u64> {
+        Box::pin(with_receipt(LocalFileSystem::write_file_stream(
+            self, path, contents, sandbox,
+        )))
+    }
+
+    // Sandboxed operations run filesystem helpers whose launches this executor
+    // owns; their merged cleanup receipt is returned next to the result.
+
+    /// The sandboxed open helper exits, and its launch's cleanup is collected,
+    /// before the file is handed back; the stream carries that terminal
+    /// receipt to its end.
+    fn read_file_stream_with_receipt<'a>(
+        &'a self,
+        path: &'a PathUri,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemReadStreamFuture<'a> {
+        Box::pin(async move {
+            let (result, open_receipt, launch) = with_fs_helper_cleanup_receipt(
+                LocalFileSystem::read_file_stream(self, path, sandbox),
+            )
+            .await;
+            ReadStreamOutcome::from_open(result, open_receipt, launch)
+        })
+    }
+
+    fn canonicalize_with_receipt<'a>(
+        &'a self,
+        path: &'a PathUri,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemOutcomeFuture<'a, PathUri> {
+        Box::pin(with_receipt(LocalFileSystem::canonicalize(
+            self, path, sandbox,
+        )))
+    }
+
+    fn read_file_with_receipt<'a>(
+        &'a self,
+        path: &'a PathUri,
+        options: ReadFileOptions,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemOutcomeFuture<'a, Vec<u8>> {
+        Box::pin(with_receipt(LocalFileSystem::read_file(
+            self, path, options, sandbox,
+        )))
+    }
+
+    fn write_file_with_receipt<'a>(
+        &'a self,
+        path: &'a PathUri,
+        contents: Vec<u8>,
+        options: WriteFileOptions,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemOutcomeFuture<'a, ()> {
+        Box::pin(with_receipt(LocalFileSystem::write_file(
+            self, path, contents, options, sandbox,
+        )))
+    }
+
+    fn create_directory_with_receipt<'a>(
+        &'a self,
+        path: &'a PathUri,
+        options: CreateDirectoryOptions,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemOutcomeFuture<'a, ()> {
+        Box::pin(with_receipt(LocalFileSystem::create_directory(
+            self, path, options, sandbox,
+        )))
+    }
+
+    fn get_metadata_with_receipt<'a>(
+        &'a self,
+        path: &'a PathUri,
+        options: GetMetadataOptions,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemOutcomeFuture<'a, FileMetadata> {
+        Box::pin(with_receipt(LocalFileSystem::get_metadata(
+            self, path, options, sandbox,
+        )))
+    }
+
+    fn read_directory_with_receipt<'a>(
+        &'a self,
+        path: &'a PathUri,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemOutcomeFuture<'a, Vec<ReadDirectoryEntry>> {
+        Box::pin(with_receipt(LocalFileSystem::read_directory(
+            self, path, sandbox,
+        )))
+    }
+
+    fn walk_with_receipt<'a>(
+        &'a self,
+        path: &'a PathUri,
+        options: WalkOptions,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemOutcomeFuture<'a, WalkOutcome> {
+        Box::pin(with_receipt(LocalFileSystem::walk(
+            self, path, options, sandbox,
+        )))
+    }
+
+    fn remove_with_receipt<'a>(
+        &'a self,
+        path: &'a PathUri,
+        options: RemoveOptions,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemOutcomeFuture<'a, ()> {
+        Box::pin(with_receipt(LocalFileSystem::remove(
+            self, path, options, sandbox,
+        )))
+    }
+
+    fn copy_with_receipt<'a>(
+        &'a self,
+        source_path: &'a PathUri,
+        destination_path: &'a PathUri,
+        options: CopyOptions,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemOutcomeFuture<'a, ()> {
+        Box::pin(with_receipt(LocalFileSystem::copy(
+            self,
+            source_path,
+            destination_path,
+            options,
+            sandbox,
+        )))
+    }
+}
+
+/// Runs one local operation and returns the merged cleanup receipt of the
+/// sandboxed helper launches it made, with positive "not launched" evidence
+/// when it made none (unsandboxed paths, `file_system_for_reads`/`_for_writes`
+/// without a sandbox, and non-Linux platform sandboxes never register one).
+async fn with_receipt<T>(
+    operation: impl Future<Output = FileSystemResult<T>>,
+) -> FileSystemOutcome<T> {
+    let (result, sandbox_cleanup, launch) = with_fs_helper_cleanup_receipt(operation).await;
+    FileSystemOutcome {
+        result,
+        sandbox_cleanup,
+        launch,
+    }
 }
 
 impl UnsandboxedFileSystem {
-    async fn open_file_for_read(
-        &self,
-        path: &PathUri,
-        sandbox: Option<&FileSystemSandboxContext>,
-    ) -> FileSystemResult<tokio::fs::File> {
-        reject_platform_sandbox_context(sandbox)?;
-        self.file_system
-            .open_file_for_read(path, /*sandbox*/ None)
-            .await
-    }
-
     async fn canonicalize(
         &self,
         path: &PathUri,
@@ -591,14 +762,14 @@ impl ExecutorFileSystem for UnsandboxedFileSystem {
 }
 
 impl DirectFileSystem {
-    async fn open_file_for_read(
+    async fn open_file(
         &self,
         path: &PathUri,
         sandbox: Option<&FileSystemSandboxContext>,
     ) -> FileSystemResult<tokio::fs::File> {
         reject_sandbox_context(sandbox)?;
         let path = path.to_abs_path()?;
-        regular_file::open(path.as_path()).await
+        regular_file::open(path.as_path(), FsOpenMode::Read).await
     }
 
     async fn canonicalize(
@@ -620,23 +791,8 @@ impl DirectFileSystem {
         sandbox: Option<&FileSystemSandboxContext>,
     ) -> FileSystemResult<Vec<u8>> {
         reject_sandbox_context(sandbox)?;
-        let file = if options.follow_symlinks {
-            self.open_file_for_read(path, /*sandbox*/ None).await?
-        } else {
-            no_follow::open_file(path.to_abs_path()?.as_path()).await?
-        };
-        let metadata = file.metadata().await?;
-        if metadata.len() > MAX_READ_FILE_BYTES {
-            return Err(file_too_large_error());
-        }
-        let mut bytes = Vec::with_capacity(metadata.len() as usize);
-        file.take(MAX_READ_FILE_BYTES + 1)
-            .read_to_end(&mut bytes)
-            .await?;
-        if bytes.len() as u64 > MAX_READ_FILE_BYTES {
-            return Err(file_too_large_error());
-        }
-        Ok(bytes)
+        let path = path.to_abs_path()?;
+        crate::local_file_system_read::read_file(path, options).await
     }
 
     async fn read_file_stream(
@@ -644,7 +800,7 @@ impl DirectFileSystem {
         path: &PathUri,
         sandbox: Option<&FileSystemSandboxContext>,
     ) -> FileSystemResult<FileSystemReadStream> {
-        let file = self.open_file_for_read(path, sandbox).await?;
+        let file = self.open_file(path, sandbox).await?;
         Ok(FileSystemReadStream::new(ReaderStream::with_capacity(
             file,
             FILE_READ_CHUNK_SIZE,
@@ -1450,6 +1606,64 @@ mod walk_tests {
                 truncated: true,
             },
         );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod cleanup_receipt_tests {
+    use super::*;
+    use codex_file_system::SandboxLaunch;
+
+    #[tokio::test]
+    async fn unsandboxed_stream_write_and_read_receipts_preserve_bytes() -> io::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = PathUri::from_host_native_path(temp.path().join("file"))?;
+        let fs = LocalFileSystem::unsandboxed();
+        let contents = futures::stream::iter([
+            Ok(Bytes::from_static(b"first")),
+            Ok(Bytes::from_static(b"second")),
+        ])
+        .boxed();
+        let written = fs
+            .write_file_stream_with_receipt(&path, contents, None)
+            .await;
+        assert_eq!(written.result?, 11);
+        assert_eq!(written.launch, SandboxLaunch::NotLaunched);
+        assert_eq!(written.sandbox_cleanup, None);
+        let opened = fs.read_file_stream_with_receipt(&path, None).await;
+        assert_eq!(opened.launch, SandboxLaunch::NotLaunched);
+        let mut stream = opened.result?;
+        let mut bytes = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            bytes.extend_from_slice(&chunk?);
+        }
+        assert_eq!(bytes, b"firstsecond");
+        assert_eq!(opened.sandbox_cleanup.wait().await, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_local_read_and_invalid_write_keep_positive_no_launch() -> io::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = PathUri::from_host_native_path(temp.path().join("file"))?;
+        let fs = LocalFileSystem::unsandboxed();
+        let read = fs
+            .read_file_with_receipt(&path, ReadFileOptions::default(), None)
+            .await;
+        assert_eq!(read.result.unwrap_err().kind(), io::ErrorKind::NotFound);
+        assert_eq!(read.launch, SandboxLaunch::NotLaunched);
+        assert_eq!(read.sandbox_cleanup, None);
+        let write = fs
+            .write_file_stream_with_receipt(
+                &path,
+                futures::stream::iter([Ok(Bytes::new())]).boxed(),
+                None,
+            )
+            .await;
+        assert_eq!(write.result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+        assert_eq!(write.launch, SandboxLaunch::NotLaunched);
+        assert_eq!(write.sandbox_cleanup, None);
         Ok(())
     }
 }

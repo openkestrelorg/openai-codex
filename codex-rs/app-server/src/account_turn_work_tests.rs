@@ -1,5 +1,5 @@
 use super::*;
-use crate::managed_transition::AccountWorkPermits;
+use crate::account_work_permits::AccountWorkPermits;
 use pretty_assertions::assert_eq;
 use std::time::Duration;
 use tokio::sync::oneshot;

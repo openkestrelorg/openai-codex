@@ -1,7 +1,13 @@
+//! Managed daemon lifecycle through the public CLI, using isolated standalone fixtures.
 #![cfg(unix)]
 
-use std::path::PathBuf;
-use std::process::Child;
+#[path = "app_server_daemon/support.rs"]
+mod support;
+
+use support::TestDaemon;
+use support::assert_update_disabled;
+use support::wait_for_exit;
+
 use std::process::Command;
 use std::process::Stdio;
 use std::time::Duration;
@@ -10,149 +16,221 @@ use std::time::Instant;
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::ensure;
-use codex_utils_cargo_bin::copy_executable;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
-use tempfile::TempDir;
 
-struct TestDaemon {
-    home: TempDir,
-    codex: PathBuf,
-    unmanaged: Option<Child>,
-}
-
-impl TestDaemon {
-    fn new() -> Result<Self> {
-        let home = tempfile::Builder::new().tempdir_in("/tmp")?;
-        let codex = codex_utils_cargo_bin::cargo_bin("codex")?;
-        let codex_source = std::fs::canonicalize(&codex)?;
-        let target = if cfg!(target_os = "macos") {
-            format!("{}-apple-darwin", std::env::consts::ARCH)
-        } else {
-            format!("{}-unknown-linux-musl", std::env::consts::ARCH)
-        };
-        let standalone = home.path().join("packages/standalone");
-        let release_name = format!("0.0.0-{target}");
-        let managed = standalone
-            .join("releases")
-            .join(&release_name)
-            .join("bin/codex");
-        std::fs::create_dir_all(managed.parent().context("managed bin parent")?)?;
-        // Preserve the installed path without invalidating the shared CLI's Rosetta cache.
-        #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-        {
-            copy_executable(&codex_source, &managed)?;
-            // Translate the fixture before timed daemon capability and readiness checks.
-            ensure!(
-                Command::new(&managed)
-                    .env("CODEX_HOME", home.path())
-                    .arg("--version")
-                    .output()?
-                    .status
-                    .success(),
-                "failed to prepare managed test executable"
-            );
-        }
-        #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
-        if std::fs::hard_link(&codex_source, &managed).is_err() {
-            copy_executable(&codex_source, &managed)?;
-        }
-        std::fs::write(standalone.join("auto-update-version"), &release_name)?;
-        std::os::unix::fs::symlink(
-            PathBuf::from("releases").join(release_name),
-            standalone.join("current"),
-        )?;
-        // Model a daemon that was previously launched and is currently stopped.
-        let state = home.path().join("app-server-daemon");
-        std::fs::create_dir(&state)?;
-        std::fs::write(state.join("app-server.stderr.log"), b"")?;
-        Ok(Self {
-            home,
-            codex,
-            unmanaged: None,
-        })
-    }
-
-    fn command(&self) -> Command {
-        let mut command = Command::new(&self.codex);
-        command.env("CODEX_HOME", self.home.path());
-        command
-    }
-
-    fn lifecycle(&self, action: &str) -> Result<Value> {
-        let output = self
-            .command()
-            .args(["app-server", "daemon", action])
-            .output()?;
-        ensure!(
-            output.status.success(),
-            "daemon {action} failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        Ok(serde_json::from_slice(&output.stdout)?)
-    }
-
-    fn pid(&self, name: &str) -> Result<u32> {
-        let record = std::fs::read(self.home.path().join("app-server-daemon").join(name))
-            .with_context(|| format!("failed to read {name}"))?;
-        Ok(serde_json::from_slice::<Value>(&record)?["pid"]
-            .as_u64()
-            .context("pid missing")? as u32)
-    }
-
-    fn assert_no_updater(&self) {
-        let state = self.home.path().join("app-server-daemon");
-        assert!(!state.join("app-server-updater.pid").exists());
-        assert!(!state.join("daemon-updater.pid").exists());
-    }
-}
-
-fn assert_update_disabled(output: &std::process::Output) {
-    assert!(!output.status.success());
-    assert!(output.stdout.is_empty());
-    assert_eq!(
-        String::from_utf8_lossy(&output.stderr).trim(),
-        "Error: codex self-update is disabled in this managed distribution; use the managed release and promotion workflow instead"
-    );
-}
-
-impl Drop for TestDaemon {
-    fn drop(&mut self) {
-        if let Some(mut child) = self.unmanaged.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-        let _ = self.lifecycle("stop");
-        if let Ok(pid) = self.pid("app-server-updater.pid") {
-            let _ = signal(pid, libc::SIGTERM);
-        }
-    }
-}
-
-fn signal(pid: u32, signal: libc::c_int) -> Result<()> {
-    let raw_pid = libc::pid_t::try_from(pid).context("pid out of range")?;
+#[test]
+fn managed_daemon_restarts_from_deleted_working_directory() -> Result<()> {
+    let daemon = TestDaemon::new()?;
+    let project = daemon.home.path().join("project");
+    std::fs::create_dir(&project)?;
+    let started = daemon
+        .command()
+        .current_dir(&project)
+        .args(["app-server", "daemon", "start"])
+        .output()?;
     ensure!(
-        unsafe { libc::kill(raw_pid, signal) } == 0,
-        "failed to signal pid {pid}: {}",
-        std::io::Error::last_os_error()
+        started.status.success(),
+        "{}",
+        String::from_utf8_lossy(&started.stderr)
     );
+    let old_pid = daemon.pid("app-server.pid")?;
+    daemon.assert_no_updater();
+
+    // Delete the restart caller's cwd without changing the test process's cwd.
+    let restarted = Command::new("/bin/sh")
+        .args([
+            "-c",
+            "rmdir \"$1\" && exec \"$2\" app-server daemon restart",
+            "restart",
+        ])
+        .arg(&project)
+        .arg(&daemon.codex)
+        .current_dir(&project)
+        .env("CODEX_HOME", daemon.home.path())
+        .output()?;
+    ensure!(
+        restarted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&restarted.stderr)
+    );
+    let restarted: Value = serde_json::from_slice(&restarted.stdout)?;
+    assert_eq!(restarted["status"], "restarted");
+    assert_ne!(daemon.pid("app-server.pid")?, old_pid);
+    daemon.assert_no_updater();
+    assert_eq!(daemon.lifecycle("version")?["status"], "running");
     Ok(())
 }
 
-fn wait_for_exit(pid: u32) -> Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        let output = Command::new("/bin/ps")
-            .args(["-p", &pid.to_string(), "-o", "stat="])
-            .output()
-            .context("failed to invoke ps")?;
-        let state = String::from_utf8_lossy(&output.stdout);
-        if !output.status.success() || state.trim().starts_with('Z') {
-            return Ok(());
-        }
-        ensure!(Instant::now() < deadline, "pid {pid} did not exit: {state}");
-        std::thread::sleep(Duration::from_millis(50));
+#[test]
+fn bootstrap_does_not_start_updater_in_deep_codex_home() -> Result<()> {
+    let mut daemon = TestDaemon::new()?;
+    let deep_home = tempfile::Builder::new()
+        .prefix(&"deep-codex-home-".repeat(8))
+        .tempdir_in("/tmp")?;
+    for name in ["packages", "app-server-daemon", "config.toml"] {
+        std::fs::rename(daemon.home.path().join(name), deep_home.path().join(name))?;
     }
+    daemon.home = deep_home;
+    let state = daemon.home.path().join("app-server-daemon");
+    std::fs::write(
+        state.join("settings.json"),
+        br#"{"shutdownGraceSeconds":0}"#,
+    )?;
+    let result = daemon.lifecycle("bootstrap")?;
+    assert_eq!(result["autoUpdateEnabled"], false);
+    assert_eq!(result["status"], "bootstrapped");
+    daemon.assert_no_updater();
+    assert_eq!(daemon.lifecycle("version")?["status"], "running");
+    Ok(())
+}
+
+#[test]
+fn bootstrap_preserves_unused_updater_socket_artifact() -> Result<()> {
+    let daemon = TestDaemon::new()?;
+    let state = daemon.home.path().join("app-server-daemon");
+    std::fs::write(
+        state.join("settings.json"),
+        br#"{"shutdownGraceSeconds":0}"#,
+    )?;
+    let socket = state.join("app-server-updater.sock");
+    std::fs::write(&socket, b"not a socket")?;
+    let result = daemon
+        .command()
+        .args(["app-server", "daemon", "bootstrap"])
+        .output()?;
+    ensure!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    daemon.assert_no_updater();
+    assert_eq!(std::fs::read(socket)?, b"not a socket");
+    assert_eq!(daemon.lifecycle("version")?["status"], "running");
+    Ok(())
+}
+
+#[test]
+fn start_applies_feature_overrides_only_when_launching() -> Result<()> {
+    let daemon = TestDaemon::new()?;
+    let settings_path = daemon.home.path().join("app-server-daemon/settings.json");
+    std::fs::write(
+        &settings_path,
+        br#"{"updater":{"autoUpdateEnabled":false}}"#,
+    )?;
+    let mut previous_pid = None;
+    for (prefer_mxc, expected_status) in [(true, "started"), (false, "alreadyRunning")] {
+        let output = daemon
+            .command()
+            .args(["app-server", "daemon", "start", "-c"])
+            .arg(format!("features.prefer_mxc={prefer_mxc}"))
+            .output()?;
+        ensure!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let output: Value = serde_json::from_slice(&output.stdout)?;
+        assert_eq!(output["status"], expected_status);
+        let settings: Value = serde_json::from_slice(&std::fs::read(&settings_path)?)?;
+        assert_eq!(
+            settings["featureOverrides"],
+            serde_json::json!({"prefer_mxc": true})
+        );
+        let pid = daemon.pid("app-server.pid")?;
+        if let Some(previous_pid) = previous_pid {
+            assert_eq!(pid, previous_pid);
+        }
+        previous_pid = Some(pid);
+    }
+    Ok(())
+}
+
+#[test]
+fn explicit_restart_applies_feature_overrides_and_preserves_saved_settings() -> Result<()> {
+    let daemon = TestDaemon::new()?;
+    let settings_path = daemon.home.path().join("app-server-daemon/settings.json");
+    std::fs::write(
+        &settings_path,
+        serde_json::to_vec(&serde_json::json!({
+            "shutdownGraceSeconds": 0,
+            "updater": { "autoUpdateEnabled": false },
+            "featureOverrides": {
+                "api_key_model_discovery": false,
+                "auth_elicitation": true,
+                "connectors": true,
+                "apps": true
+            }
+        }))?,
+    )?;
+    let mut previous_pid = None;
+    // Start from a stopped daemon, change running settings, and restart again
+    // with omitted flags. Every explicit restart replaces the process.
+    for (args, discovery) in [
+        (
+            vec![
+                "--enable",
+                "api_key_model_discovery",
+                "--disable",
+                "connectors",
+                "-c",
+                "features.network_proxy.enabled=false",
+            ],
+            true,
+        ),
+        (vec!["--disable", "api_key_model_discovery"], false),
+        (vec!["-c", "features.api_key_model_discovery=true"], true),
+        (vec![], true),
+    ] {
+        let output = daemon
+            .command()
+            .args(["app-server", "daemon", "restart"])
+            .args(args)
+            .output()?;
+        ensure!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let output: Value = serde_json::from_slice(&output.stdout)?;
+        assert_eq!(output["status"], "restarted");
+        let pid = output["pid"].as_u64().context("restarted daemon PID")?;
+        assert_ne!(Some(pid), previous_pid);
+        previous_pid = Some(pid);
+        let settings: Value = serde_json::from_slice(&std::fs::read(&settings_path)?)?;
+        assert_eq!(
+            settings["featureOverrides"],
+            serde_json::json!({
+                "api_key_model_discovery": discovery,
+                "auth_elicitation": true,
+                "apps": false,
+                "network_proxy": false
+            })
+        );
+        assert_eq!(settings["updater"]["autoUpdateEnabled"], false);
+    }
+    // Non-toggle config keys must fail before stopping the daemon or saving settings.
+    let saved_settings = std::fs::read(&settings_path)?;
+    let mut errors = String::new();
+    for action in ["start", "restart"] {
+        let output = daemon
+            .command()
+            .args(["app-server", "daemon", action, "--enable", "tool_registry"])
+            .output()?;
+        assert!(!output.status.success());
+        errors.push_str(&String::from_utf8(output.stderr)?);
+        assert_eq!(std::fs::read(&settings_path)?, saved_settings);
+        assert_eq!(Some(u64::from(daemon.pid("app-server.pid")?)), previous_pid);
+    }
+    insta::assert_snapshot!(
+        errors,
+        @"
+        Error: daemon start requires a boolean feature toggle: tool_registry
+        Error: daemon restart requires a boolean feature toggle: tool_registry
+        "
+    );
+    assert_eq!(daemon.lifecycle("version")?["status"], "running");
+    Ok(())
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -251,8 +329,11 @@ fn package_ownership_check_does_not_start_an_updater() -> Result<()> {
             "--check-package-ownership",
         ])
         .output()?;
-    assert_update_disabled(&output);
+    assert!(output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
     daemon.assert_no_updater();
+    assert!(daemon.pid("app-server.pid").is_err());
     Ok(())
 }
 
@@ -457,169 +538,4 @@ fn manual_update_rejects_an_unowned_installation() -> Result<()> {
     assert!(daemon.pid("app-server.pid").is_err());
     assert!(daemon.pid("app-server-updater.pid").is_err());
     Ok(())
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum InitialDaemon {
-    Missing,
-    Legacy,
-}
-
-fn packaged_daemon_launch(action: &str, initial: InitialDaemon) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let mut daemon = TestDaemon::new()?;
-    let standalone = daemon.home.path().join("packages/standalone");
-    let package = if action == "start" && initial == InitialDaemon::Missing {
-        standalone.join("releases/caller")
-    } else {
-        daemon.home.path().join("cli-package")
-    };
-    for directory in ["bin", "codex-path", "codex-resources"] {
-        std::fs::create_dir_all(package.join(directory))?;
-    }
-    copy_executable(&daemon.codex, &package.join("bin/codex"))?;
-    daemon.codex = package.join("bin/codex");
-    for helper in [
-        "bin/codex-code-mode-host",
-        "codex-path/rg",
-        "codex-resources/bwrap",
-    ] {
-        std::fs::write(package.join(helper), b"runtime fixture")?;
-        std::fs::set_permissions(package.join(helper), std::fs::Permissions::from_mode(0o755))?;
-    }
-    let target = format!(
-        "{}-{}",
-        std::env::consts::ARCH,
-        if cfg!(target_os = "macos") {
-            "apple-darwin"
-        } else if cfg!(target_env = "gnu") {
-            "unknown-linux-gnu"
-        } else {
-            "unknown-linux-musl"
-        }
-    );
-    std::fs::write(
-        package.join("codex-package.json"),
-        serde_json::to_vec(&serde_json::json!({
-            "version": env!("CARGO_PKG_VERSION"), "target": target, "entrypoint": "bin/codex"
-        }))?,
-    )?;
-    if action == "start" && initial == InitialDaemon::Missing {
-        std::fs::remove_file(standalone.join("current"))?;
-        std::os::unix::fs::symlink(&package, standalone.join("current"))?;
-    }
-    let cli_selection = standalone.join("current").canonicalize()?;
-    let state = daemon.home.path().join("app-server-daemon");
-    if initial == InitialDaemon::Missing {
-        std::fs::remove_file(state.join("app-server.stderr.log"))?;
-    }
-    std::fs::write(
-        state.join("settings.json"),
-        br#"{"shutdownGraceSeconds":0}"#,
-    )?;
-    let settings_before = std::fs::read(state.join("settings.json"))?;
-    let marker_before = std::fs::read(standalone.join("auto-update-version"))?;
-    let cli_before = daemon.codex.canonicalize()?;
-    let mut command = daemon.command();
-    command.args(["app-server", "daemon", action]);
-    // A freshly copied executable can briefly remain busy on Linux CI workers.
-    let mut retries = 0;
-    let result = loop {
-        let result = command.output();
-        if !result
-            .as_ref()
-            .is_err_and(|error| error.kind() == std::io::ErrorKind::ExecutableFileBusy)
-            || retries == 2
-        {
-            break result?;
-        }
-        retries += 1;
-        std::thread::sleep(Duration::from_millis(/*millis*/ 10));
-    };
-    let dedicated = daemon
-        .home
-        .path()
-        .canonicalize()?
-        .join("packages/app-server-daemon");
-    assert_eq!(daemon.codex.canonicalize()?, cli_before);
-    assert_eq!(standalone.join("current").canonicalize()?, cli_selection);
-    daemon.assert_no_updater();
-    if initial == InitialDaemon::Missing {
-        // A CLI package is not authority to install a daemon implicitly.
-        assert!(!result.status.success());
-        let stderr = String::from_utf8_lossy(&result.stderr);
-        assert!(stderr.contains("daemon executable not found at"));
-        assert!(!stderr.contains("Installing daemon from CLI version"));
-        assert!(!dedicated.exists());
-        assert!(!state.join("daemon.pid").exists());
-        assert!(!state.join("app-server.pid").exists());
-        assert_eq!(std::fs::read(state.join("settings.json"))?, settings_before);
-        assert_eq!(
-            std::fs::read(standalone.join("auto-update-version"))?,
-            marker_before
-        );
-        return Ok(());
-    }
-
-    ensure!(
-        result.status.success(),
-        "{}",
-        String::from_utf8_lossy(&result.stderr)
-    );
-    let output: Value = serde_json::from_slice(&result.stdout)?;
-    assert_eq!(output["status"], "started");
-    assert_eq!(
-        output["managedCodexPath"],
-        standalone
-            .canonicalize()?
-            .join("current/bin/codex")
-            .to_str()
-            .context("managed path is not UTF-8")?
-    );
-    let original_pid = daemon.pid("app-server.pid")?;
-    // Neither a confirmation flag nor a complete local package grants update
-    // authority. Preserve the running daemon, CLI selection and settings.
-    for args in [
-        vec!["app-server", "daemon", "update", "--from-cli"],
-        vec!["app-server", "daemon", "update", "--from-cli", "--yes"],
-    ] {
-        assert_update_disabled(&daemon.command().args(args).output()?);
-        assert_eq!(daemon.pid("app-server.pid")?, original_pid);
-        assert!(!dedicated.exists());
-        daemon.assert_no_updater();
-        assert_eq!(std::fs::read(state.join("settings.json"))?, settings_before);
-        assert_eq!(standalone.join("current").canonicalize()?, cli_selection);
-        assert_eq!(
-            std::fs::read(standalone.join("auto-update-version"))?,
-            marker_before
-        );
-        assert_eq!(
-            std::fs::read(package.join("bin/codex-code-mode-host"))?,
-            b"runtime fixture"
-        );
-    }
-    assert_eq!(daemon.lifecycle("start")?["status"], "alreadyRunning");
-    assert_eq!(daemon.lifecycle("stop")?["status"], "stopped");
-    wait_for_exit(original_pid)?;
-    Ok(())
-}
-
-#[test]
-fn packaged_daemon_start_does_not_install_missing_package() -> Result<()> {
-    packaged_daemon_launch("start", InitialDaemon::Missing)
-}
-
-#[test]
-fn packaged_daemon_restart_does_not_install_missing_package() -> Result<()> {
-    packaged_daemon_launch("restart", InitialDaemon::Missing)
-}
-
-#[test]
-fn packaged_daemon_bootstrap_does_not_install_missing_package() -> Result<()> {
-    packaged_daemon_launch("bootstrap", InitialDaemon::Missing)
-}
-
-#[test]
-fn packaged_daemon_explicit_update_preserves_running_legacy() -> Result<()> {
-    packaged_daemon_launch("start", InitialDaemon::Legacy)
 }

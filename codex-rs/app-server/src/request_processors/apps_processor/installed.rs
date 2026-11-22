@@ -58,12 +58,14 @@ impl AppsRequestProcessor {
                     None,
                 ),
             };
-            let auth = self.auth_manager.auth().await;
+            let mcp_manager = thread.as_ref().map(|thread| thread.mcp_manager())
+                .unwrap_or_else(|| self.thread_manager.mcp_manager());
+            let auth_manager = mcp_manager.auth_manager();
+            let auth = auth_manager.auth().await;
             let runtime_enabled = config
                 .features
                 .apps_enabled_for_auth(auth.as_ref().is_some_and(CodexAuth::uses_codex_backend));
 
-            let mcp_manager = self.thread_manager.mcp_manager();
             let cache_key = connector_runtime_context_key(auth.as_ref());
             let previous_snapshot = mcp_manager
                 .codex_apps_tools_cache()
@@ -96,7 +98,7 @@ impl AppsRequestProcessor {
                     let cancellation_token = CancellationToken::new();
                     let codex_apps_auth_manager =
                         host_owned_codex_apps_enabled(&mcp_config, auth.as_ref())
-                            .then(|| Arc::clone(&self.auth_manager));
+                            .then(|| Arc::clone(&auth_manager));
                     // Capture in the request task; retained MCP drivers do not
                     // inherit REQUEST_WORK. Exhaustion must not become ungated.
                     let request_work = crate::account_turn_admission::derive_request_work()
@@ -111,9 +113,12 @@ impl AppsRequestProcessor {
                         .transpose()?;
                     let access = codex_mcp::McpAttemptAccess::from_work(request_work.as_ref()
                         .map(|work| work as &dyn codex_mcp::McpAttemptWork));
+                    self.thread_manager.runtime_auth_for_mcp_manager(&config, &mcp_manager)?;
                     let runtime = McpRuntime::new(McpRuntimeInput {
                         attempt_requirement,
                         startup_work,
+                        network_policy_metadata: None,
+                        runtime_auth: mcp_manager.runtime_auth_for_config(&config),
                         startup_policy: McpStartupPolicy::Eager,
                         config: Arc::clone(&mcp_config),
                         plugins_available: false,
@@ -131,8 +136,6 @@ impl AppsRequestProcessor {
                         auth_manager: codex_apps_auth_manager,
                         elicitation_reviewer: None,
                         elicitation_lifecycle: None,
-                        canonical_thread_id: None,
-                        control_endpoint: None,
                     })
                     .await;
 

@@ -2,6 +2,8 @@
 use super::CodexThread;
 use super::ThreadLoopOutcome;
 use super::ThreadShutdownOutcome;
+use crate::session::SessionLoopOutcome;
+use crate::session::retirement::CleanupExecution;
 use futures::FutureExt;
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::Ordering;
@@ -22,7 +24,11 @@ impl CodexThread {
     }
 
     /// Independent positive receipts required before any replacement can be considered.
+    /// Unproven sandbox cleanup keeps the old authority retained.
     pub fn retirement_is_quiescent(&self) -> bool {
+        if self.sandbox_cleanup_outcome().is_some() {
+            return false;
+        }
         let Ok(retirement) = self.retirement.lock() else {
             return false;
         };
@@ -48,6 +54,35 @@ impl CodexThread {
                 .is_none_or(codex_thread_store::LiveThread::is_sealed)
     }
 
+    /// Read-only evidence that this exact runtime released its resources after
+    /// an incomplete original retirement report. Unlike
+    /// `retirement_is_quiescent`, it does not require `ordinary == Complete`:
+    /// the original report stays as recorded and is never rewritten here.
+    ///
+    /// Requires: the exact session loop already joined `Normal`; the cleanup
+    /// owner attached at loop birth already recorded
+    /// `Finished { persistence_failed: false }`; submission and task admission
+    /// are closed; and the live writer, if any, is sealed through its write
+    /// gate. Every check is a peek: this never polls, drives, rebinds or
+    /// refreshes cleanup, and a pending or contended observation is `false`.
+    pub fn late_release_is_quiescent(&self) -> bool {
+        let termination = &self.io.session_loop_termination;
+        self.sandbox_cleanup_outcome().is_none()
+            && termination.observed() == Some(SessionLoopOutcome::Normal)
+            && termination.cleanup_completed()
+                == Some(CleanupExecution::Finished {
+                    persistence_failed: false,
+                })
+            && self.io.tx_sub.is_closed()
+            && self.session.task_admission_closed.load(Ordering::Acquire)
+            && self
+                .session
+                .services
+                .live_thread
+                .as_ref()
+                .is_none_or(codex_thread_store::LiveThread::is_sealed)
+    }
+
     /// A separate bounded attempt over existing MCP owners, not a new original deadline.
     pub async fn reconcile_retirement_until(&self, deadline: Instant) -> ThreadRecoveryOutcome {
         if !self.retirement_is_quiescent() {
@@ -59,10 +94,15 @@ impl CodexThread {
         if Instant::now() >= deadline {
             return ThreadRecoveryOutcome::Quiescent;
         }
-        let Ok(report) =
-            AssertUnwindSafe(self.session.services.mcp_runtime.shutdown_until(deadline))
-                .catch_unwind()
-                .await
+        let Ok(report) = AssertUnwindSafe(
+            self.session
+                .services
+                .mcp_runtime
+                .retirement_owner()
+                .drain_workers_until(deadline),
+        )
+        .catch_unwind()
+        .await
         else {
             return ThreadRecoveryOutcome::Quiescent;
         };

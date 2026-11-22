@@ -126,6 +126,20 @@ impl LifecycleTestHandler {
 
 impl CoreToolRuntime for LifecycleTestHandler {}
 
+impl codex_extension_api::ApprovalReviewContributor for LifecycleTestHandler {
+    fn decide<'a>(
+        &'a self,
+        _input: &'a codex_extension_api::ApprovalDecisionInput<'_>,
+    ) -> codex_extension_api::ExtensionFuture<'a, Option<codex_extension_api::ApprovalDecision>>
+    {
+        Box::pin(async {
+            Some(codex_extension_api::ApprovalDecision::Reviewed(
+                codex_protocol::protocol::ReviewDecision::denied("review denied"),
+            ))
+        })
+    }
+}
+
 fn test_spec(tool_name: &codex_tools::ToolName) -> codex_tools::ToolSpec {
     codex_tools::ToolSpec::Function(codex_tools::ResponsesApiTool {
         name: tool_name.name.clone(),
@@ -378,7 +392,7 @@ fn registry_allows_identical_names_in_different_namespaces() {
 
 #[tokio::test]
 async fn readiness_selects_exact_tool_with_registry_owned_exposure() {
-    let (session, turn) = crate::session::tests::make_session_and_context().await;
+    let (session, _turn) = crate::session::tests::make_session_and_context().await;
     let session = Arc::new(session);
     let plain_name = codex_tools::ToolName::plain("echo");
     let namespaced_name = codex_tools::ToolName::namespaced("mcp__server__", "echo");
@@ -386,7 +400,7 @@ async fn readiness_selects_exact_tool_with_registry_owned_exposure() {
         TestHandler {
             tool_name: plain_name.clone(),
         }
-        .wait_until_ready(&session, &turn)
+        .wait_until_ready(&session, &_turn)
         .is_none()
     );
     let plain_readiness_waits = Arc::new(AtomicUsize::new(0));
@@ -409,7 +423,7 @@ async fn readiness_selects_exact_tool_with_registry_owned_exposure() {
     registry
         .tool(&plain_name)
         .expect("plain runtime should be registered")
-        .wait_until_ready(&session, &turn)
+        .wait_until_ready(&session, &_turn)
         .expect("plain runtime should provide a readiness wait")
         .await;
     assert_eq!(
@@ -423,7 +437,7 @@ async fn readiness_selects_exact_tool_with_registry_owned_exposure() {
     registry
         .tool(&namespaced_name)
         .expect("namespaced runtime should be registered")
-        .wait_until_ready(&session, &turn)
+        .wait_until_ready(&session, &_turn)
         .expect("namespaced runtime should forward its readiness wait")
         .await;
     assert_eq!(
@@ -474,6 +488,7 @@ async fn function_tools_expose_default_hook_payloads_and_rewrites() -> anyhow::R
     assert_eq!(
         handler.post_tool_use_payload(&invocation, &output),
         Some(PostToolUsePayload {
+            tool_cwd: None,
             tool_name: HookToolName::new("functions.echo"),
             tool_use_id: "call-1".to_string(),
             tool_input: serde_json::json!({ "message": "hello" }),
@@ -745,7 +760,6 @@ async fn dispatch_uses_canonical_tool_names_for_lifecycle_contributors() -> anyh
     builder.tool_lifecycle_contributor(Arc::new(ToolLifecycleRecorder {
         records: Arc::clone(&records),
     }));
-    session.services.extensions = Arc::new(builder.build());
 
     let ok_tool = codex_tools::ToolName::plain("ok_tool");
     let failing_tool = codex_tools::ToolName::namespaced("extensions", "failing_tool");
@@ -757,7 +771,19 @@ async fn dispatch_uses_canonical_tool_names_for_lifecycle_contributors() -> anyh
         tool_name: failing_tool.clone(),
         result: LifecycleTestResult::Err,
     }) as Arc<dyn CoreToolRuntime>;
-    let registry = ToolRegistry::from_tools([ok_handler, failing_handler]);
+    let reviewed_tool = codex_tools::ToolName::namespaced("extensions", "reviewed_tool");
+    let reviewed_handler = Arc::new(LifecycleTestHandler {
+        tool_name: reviewed_tool.clone(),
+        result: LifecycleTestResult::Err,
+    });
+    builder.approval_review_contributor(reviewed_handler.clone());
+    session.services.extensions = Arc::new(builder.build());
+    let mut registry = ToolRegistry::from_tools([ok_handler, failing_handler]);
+    registry.register_trusted_with_native_review(
+        reviewed_handler,
+        super::ToolExposure::Direct,
+        super::NativeReview::Required,
+    );
     let session = Arc::new(session);
     let turn = Arc::new(turn);
 
@@ -788,6 +814,16 @@ async fn dispatch_uses_canonical_tool_names_for_lifecycle_contributors() -> anyh
         Err(err) => err,
     };
     assert_eq!(err.to_string(), "handler failed");
+    let denied = registry
+        .dispatch_any_with_state(
+            test_invocation(session, turn, "reviewed-call", reviewed_tool.clone()),
+            /*call_state*/ None,
+        )
+        .await;
+    assert_eq!(
+        denied.err().expect("review must deny").to_string(),
+        "review denied"
+    );
 
     let expected = vec![
         RecordedToolLifecycle::Start {
@@ -810,6 +846,13 @@ async fn dispatch_uses_canonical_tool_names_for_lifecycle_contributors() -> anyh
             tool_name: failing_tool,
             outcome: codex_extension_api::ToolCallOutcome::Failed {
                 handler_executed: true,
+            },
+        },
+        RecordedToolLifecycle::Finish {
+            call_id: "reviewed-call".to_string(),
+            tool_name: reviewed_tool,
+            outcome: codex_extension_api::ToolCallOutcome::Failed {
+                handler_executed: false,
             },
         },
     ];
@@ -841,6 +884,8 @@ fn test_invocation(
         call_id: call_id.to_string(),
         tool_name,
         source: crate::tools::context::ToolCallSource::Direct,
+        native_call: None,
+        environments: Default::default(),
         payload: ToolPayload::Function {
             arguments: "{}".to_string(),
         },

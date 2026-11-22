@@ -12,6 +12,7 @@ use crate::remote::RemoteInstalledPluginBundleSyncError;
 use crate::remote::RemotePluginCacheMutationGuard;
 use crate::remote::RemotePluginCatalogError;
 use crate::remote::RemotePluginDetail;
+use crate::remote::reset_authority::RemotePluginBundleSyncGeneration;
 use crate::remote_bundle;
 use crate::remote_bundle::RemotePluginBundleInstallError;
 use codex_app_server_protocol::PluginAuthPolicy;
@@ -89,7 +90,6 @@ impl PluginsManager {
         request: RemotePluginInstallRequest,
         on_effective_plugins_changed: Option<EffectivePluginsChangedCallback>,
     ) -> Result<RemotePluginInstallOutcome, RemotePluginOperationError> {
-        let (reset_generation, bundle_generation) = self.remote_installed_plugins_admission();
         use RemotePluginOperationErrorKind as Error;
         let unresolved = |kind| RemotePluginOperationError {
             plugin_id: None,
@@ -107,7 +107,15 @@ impl PluginsManager {
         }
         remote::validate_remote_plugin_id(&remote_plugin_id)
             .map_err(|err| unresolved(Error::InvalidRequest(err.message)))?;
-        let service = config.remote_plugin_service_config();
+        let publication_generation = RemotePluginBundleSyncGeneration::capture(&self.codex_home)
+            .map_err(|_| {
+                unresolved(Error::Internal(
+                    "remote plugin publication authority unavailable".to_string(),
+                ))
+            })?;
+        let service = self
+            .remote_plugin_service_config(config)
+            .for_current_account();
         let detail = remote::fetch_remote_plugin_detail_with_download_urls(
             &service,
             auth,
@@ -161,28 +169,14 @@ impl PluginsManager {
             &detail.summary.name,
         );
         // Materialize first: a failed download must never leave a backend installation behind.
-        let installed = remote_bundle::download_and_install_remote_plugin_bundle_for_generation(
+        let installed = remote_bundle::download_and_install_remote_plugin_bundle_with_generation(
             &service,
             self.codex_home.clone(),
             bundle,
-            bundle_generation.clone(),
+            &publication_generation,
         )
         .await
-        .map_err(|err| resolved(Error::Bundle(err)))?
-        .ok_or_else(|| {
-            resolved(Error::Sync {
-                context: "remote plugin install superseded by account reset",
-                source: RemoteInstalledPluginBundleSyncError::Superseded,
-            })
-        })?;
-        // Reset observes already admitted backend mutation work, but a download
-        // that outlives its epoch cannot begin a new backend installation.
-        let _lease = bundle_generation.begin_commit().ok_or_else(|| {
-            resolved(Error::Sync {
-                context: "remote plugin install superseded by account reset",
-                source: RemoteInstalledPluginBundleSyncError::Superseded,
-            })
-        })?;
+        .map_err(|err| resolved(Error::Bundle(err)))?;
         let install_result = if let Some(install_attempt_id) = install_attempt_id.as_deref() {
             remote::install_remote_plugin_with_install_attempt_id(
                 &service,
@@ -211,7 +205,6 @@ impl PluginsManager {
             config,
             auth.cloned(),
             on_effective_plugins_changed,
-            reset_generation,
         );
         Ok(RemotePluginInstallOutcome {
             installed: PluginInstallOutcome {
@@ -237,7 +230,6 @@ impl PluginsManager {
         remote_plugin_id: &str,
         on_effective_plugins_changed: Option<EffectivePluginsChangedCallback>,
     ) -> Result<RemotePluginUninstallOutcome, RemotePluginOperationError> {
-        let (reset_generation, bundle_generation) = self.remote_installed_plugins_admission();
         use RemotePluginOperationErrorKind as Error;
         let unresolved = |kind| RemotePluginOperationError {
             plugin_id: None,
@@ -250,7 +242,13 @@ impl PluginsManager {
         }
         remote::validate_remote_plugin_id(remote_plugin_id)
             .map_err(|err| unresolved(Error::InvalidRequest(err.message)))?;
-        let service = config.remote_plugin_service_config();
+        let publication_generation = RemotePluginBundleSyncGeneration::capture(&self.codex_home)
+            .map_err(|_| {
+                unresolved(Error::Internal(
+                    "remote plugin publication authority unavailable".to_string(),
+                ))
+            })?;
+        let service = self.remote_plugin_service_config(config);
         let target =
             remote::resolve_remote_plugin_uninstall_target(&service, auth, remote_plugin_id)
                 .await
@@ -288,12 +286,12 @@ impl PluginsManager {
             &plugin_id.marketplace_name,
             &plugin_id.plugin_name,
         );
-        let cache_removal_error = match remote::uninstall_remote_plugin_for_generation(
+        let cache_removal_error = match remote::uninstall_remote_plugin_with_generation(
             &service,
             auth,
             self.codex_home.clone(),
             target,
-            bundle_generation,
+            &publication_generation,
         )
         .await
         {
@@ -306,24 +304,11 @@ impl PluginsManager {
                 }));
             }
         };
-        let effective_plugins_changed = {
-            let state = self
-                .remote_installed_plugins_cache_refresh_state
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if !reset_generation.is_current(&state.generation) {
-                return Err(resolved(Error::Sync {
-                    context: "remote plugin uninstall superseded by account reset",
-                    source: RemoteInstalledPluginBundleSyncError::Superseded,
-                }));
-            }
-            self.clear_remote_installed_plugins_cache_contents()
-        };
+        let effective_plugins_changed = self.clear_remote_installed_plugins_cache();
         self.maybe_start_remote_installed_plugins_cache_refresh_after_mutation(
             config,
             auth.cloned(),
             on_effective_plugins_changed,
-            reset_generation,
         );
         Ok(RemotePluginUninstallOutcome {
             telemetry,

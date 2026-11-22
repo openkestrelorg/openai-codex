@@ -14,481 +14,80 @@ use tempfile::tempdir;
 use codex_keyring_store::tests::MockKeyringStore;
 use keyring::Error as KeyringError;
 
+#[cfg(unix)]
 #[test]
-fn managed_source_guard_excludes_cooperating_writers_until_cache_commit() -> anyhow::Result<()> {
-    for mode in [
-        AuthCredentialsStoreMode::File,
-        AuthCredentialsStoreMode::Keyring,
-        AuthCredentialsStoreMode::Auto,
-    ] {
-        for backend in [
-            AuthKeyringBackendKind::Direct,
-            AuthKeyringBackendKind::Secrets,
-        ] {
-            let home = tempdir()?;
-            let keyring = Arc::new(MockKeyringStore::default());
-            let storage = create_auth_storage_with_store(
-                home.path().to_path_buf(),
-                mode,
-                keyring.clone(),
-                backend,
-            );
-            storage.save(&auth_with_prefix("prepared-B"))?;
-            let prepared = storage.load_managed()?;
-            let guard = storage.lock_managed_source()?;
-            assert!(guard.verify_managed_preimage(&prepared.preimage)?);
-            let writer =
-                create_auth_storage_with_store(home.path().to_path_buf(), mode, keyring, backend);
-            // This is the manager's verify -> cache-install interval. A separate
-            // descriptor and worker must not mutate the source during it.
-            std::thread::scope(|scope| {
-                scope
-                    .spawn(|| {
-                        assert!(writer.save(&auth_with_prefix("replacement-C")).is_err());
-                        assert!(writer.delete().is_err());
-                        assert!(matches!(
-                            writer.load_managed(),
-                            Err(ManagedAuthStorageError::ReadFailed(
-                                ManagedAuthStorageFailure::CoordinationContended
-                            ))
-                        ));
-                    })
-                    .join()
-                    .unwrap();
-            });
-            assert!(guard.verify_managed_preimage(&prepared.preimage)?);
-            drop(guard);
-            writer.save(&auth_with_prefix("replacement-C"))?;
-            assert!(!storage.verify_managed_preimage(&prepared.preimage)?);
-        }
-    }
-    Ok(())
-}
-
-#[derive(Debug)]
-struct PausedManagedRead {
-    file: FileAuthStorage,
-    entered: Arc<std::sync::Barrier>,
-    resume: Arc<std::sync::Barrier>,
-}
-
-impl AuthStorageBackend for PausedManagedRead {
-    fn load(&self) -> std::io::Result<Option<AuthDotJson>> {
-        self.file.load()
-    }
-    fn read_managed_bytes(&self) -> Result<ManagedAuthStorageBytes, ManagedAuthStorageError> {
-        self.entered.wait();
-        self.resume.wait();
-        self.file.read_managed_bytes()
-    }
-    fn save(&self, auth: &AuthDotJson) -> std::io::Result<()> {
-        self.file.save(auth)
-    }
-    fn delete(&self) -> std::io::Result<bool> {
-        self.file.delete()
-    }
-}
-
-#[test]
-fn managed_prepare_holds_source_lock_across_read_and_parse() -> anyhow::Result<()> {
+fn file_storage_creates_dangling_symlink_target_and_rejects_cycles() -> anyhow::Result<()> {
+    use std::os::unix::fs::symlink;
     let home = tempdir()?;
-    let writer = create_auth_storage(
-        home.path().to_path_buf(),
-        AuthCredentialsStoreMode::File,
-        AuthKeyringBackendKind::Direct,
-    );
-    let original = auth_with_prefix("prepared-B");
-    writer.save(&original)?;
-    let entered = Arc::new(std::sync::Barrier::new(2));
-    let resume = Arc::new(std::sync::Barrier::new(2));
-    let reader = LockedAuthStorage {
-        codex_home: home.path().to_path_buf(),
-        backend: Arc::new(PausedManagedRead {
-            file: FileAuthStorage::new(home.path().to_path_buf()),
-            entered: entered.clone(),
-            resume: resume.clone(),
-        }),
-    };
-    std::thread::scope(|scope| {
-        let task = scope.spawn(|| reader.load_managed());
-        entered.wait();
-        let write_result = writer.save(&auth_with_prefix("replacement-C"));
-        resume.wait();
-        assert!(write_result.is_err());
-        assert_eq!(task.join().unwrap().unwrap().auth, Some(original));
-    });
-    Ok(())
-}
-
-#[test]
-fn managed_coordination_preserves_first_write_and_detects_noncooperating_precheck_change()
--> anyhow::Result<()> {
-    let home = tempdir()?;
-    let new_home = home.path().join("not-yet-created");
-    let storage = create_auth_storage(
-        new_home.clone(),
-        AuthCredentialsStoreMode::File,
-        AuthKeyringBackendKind::Direct,
-    );
-    assert!(storage.load_managed().is_err());
+    let auth = serde_json::from_value(json!({"OPENAI_API_KEY":"fake-key"}))?;
+    let storage = FileAuthStorage::new(home.path().to_path_buf());
+    symlink("intermediate", home.path().join("auth.json"))?;
+    symlink("new-target.json", home.path().join("intermediate"))?;
+    storage.save(&auth)?;
+    assert_eq!(storage.load()?, Some(auth.clone()));
     assert!(
-        !new_home.exists(),
-        "managed prepare must not create an absent home"
+        std::fs::symlink_metadata(home.path().join("auth.json"))?
+            .file_type()
+            .is_symlink()
     );
-    storage.save(&auth_with_prefix("B"))?;
-    let prepared = storage.load_managed()?;
-    std::fs::write(
-        get_auth_file(&new_home),
-        serde_json::to_vec(&auth_with_prefix("C"))?,
-    )?;
-    let guard = storage.lock_managed_source()?;
-    assert!(!guard.verify_managed_preimage(&prepared.preimage)?);
+    std::fs::remove_file(home.path().join("new-target.json"))?;
+    symlink("auth.json", home.path().join("new-target.json"))?;
+    assert_eq!(
+        storage.save(&auth).unwrap_err().kind(),
+        std::io::ErrorKind::InvalidInput
+    );
     Ok(())
 }
 
 #[cfg(unix)]
 #[test]
-fn managed_coordination_rejects_symlink_and_hardlink_lock_files() -> anyhow::Result<()> {
+fn file_storage_does_not_replace_read_only_or_hard_linked_credentials() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
     let home = tempdir()?;
-    let target = home.path().join("unrelated");
-    std::fs::write(&target, "sentinel")?;
-    let lock = home.path().join(MANAGED_AUTH_COORDINATION_FILE);
-    std::os::unix::fs::symlink(&target, &lock)?;
-    assert!(acquire_auth_source_lock(home.path()).is_err());
-    std::fs::remove_file(&lock)?;
-    std::fs::hard_link(&target, &lock)?;
-    assert!(acquire_auth_source_lock(home.path()).is_err());
-    assert_eq!(std::fs::read_to_string(&target)?, "sentinel");
+    let path = home.path().join("auth.json");
+    let storage = FileAuthStorage::new(home.path().to_path_buf());
+    let first = serde_json::from_value(json!({"OPENAI_API_KEY":"first"}))?;
+    let second = serde_json::from_value(json!({"OPENAI_API_KEY":"second"}))?;
+    storage.save(&first)?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400))?;
+    assert_eq!(
+        storage.save(&second).unwrap_err().kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
+    assert_eq!(storage.load()?, Some(first.clone()));
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    let peer = home.path().join("peer.json");
+    std::fs::hard_link(&path, &peer)?;
+    assert_eq!(
+        storage.save(&second).unwrap_err().kind(),
+        std::io::ErrorKind::Unsupported
+    );
+    assert_eq!(std::fs::read(path)?, std::fs::read(peer)?);
+    assert_eq!(storage.load()?, Some(first));
     Ok(())
 }
 
 #[test]
-fn managed_preimage_detects_replacement_without_parsing_replacement_auth() -> anyhow::Result<()> {
-    for mode in [
+fn refresh_commit_does_not_overwrite_another_writer() -> anyhow::Result<()> {
+    let home = tempdir()?;
+    let storage = create_auth_storage(
+        home.path().to_path_buf(),
         AuthCredentialsStoreMode::File,
-        AuthCredentialsStoreMode::Keyring,
-        AuthCredentialsStoreMode::Auto,
-    ] {
-        for backend in [
-            AuthKeyringBackendKind::Direct,
-            AuthKeyringBackendKind::Secrets,
-        ] {
-            let home = tempdir()?;
-            let keyring = MockKeyringStore::default();
-            let storage = create_auth_storage_with_store(
-                home.path().to_path_buf(),
-                mode,
-                Arc::new(keyring.clone()),
-                backend,
-            );
-            let absent = storage.load_managed()?;
-            assert!(storage.verify_managed_preimage(&absent.preimage)?);
-            let original = auth_with_prefix("prepared-B");
-            storage.save(&original)?;
-            assert!(!storage.verify_managed_preimage(&absent.preimage)?);
-            let prepared = storage.load_managed()?;
-            assert!(storage.verify_managed_preimage(&prepared.preimage)?);
-            storage.save(&auth_with_prefix("replacement-C"))?;
-            assert!(!storage.verify_managed_preimage(&prepared.preimage)?);
-            assert_eq!(prepared.auth, Some(original));
-            // Revalidation must report a changed preimage even if the new
-            // candidate is not JSON; only prepare is allowed to parse auth.
-            match (mode, backend) {
-                (AuthCredentialsStoreMode::File, _) => {
-                    std::fs::write(get_auth_file(home.path()), "{")?
-                }
-                (_, AuthKeyringBackendKind::Direct) => {
-                    keyring.save(KEYRING_SERVICE, &compute_store_key(home.path())?, "{")?
-                }
-                (_, AuthKeyringBackendKind::Secrets) => {
-                    SecretsManager::new_with_keyring_store_and_namespace(
-                        home.path().to_path_buf(),
-                        SecretsBackendKind::Local,
-                        Arc::new(keyring.clone()),
-                        LocalSecretsNamespace::CodexAuth,
-                    )
-                    .set(&SecretScope::Global, &CODEX_AUTH_SECRET_NAME, "{")?
-                }
-            }
-            assert!(!storage.verify_managed_preimage(&prepared.preimage)?);
-            assert!(storage.load_managed().is_err());
-            assert_eq!(
-                format!("{:?}", prepared.preimage),
-                "ManagedAuthStoragePreimage([redacted])"
-            );
-        }
-    }
-    Ok(())
-}
-
-#[test]
-fn managed_auto_preimage_binds_primary_absence_and_fallback_source_identity() -> anyhow::Result<()>
-{
-    let home = tempdir()?;
-    let keyring = MockKeyringStore::default();
-    let storage = AutoAuthStorage::new(
+        AuthKeyringBackendKind::default(),
+    );
+    let first = serde_json::from_value(json!({"OPENAI_API_KEY":"first"}))?;
+    let second = serde_json::from_value(json!({"OPENAI_API_KEY":"second"}))?;
+    let stale = serde_json::from_value(json!({"OPENAI_API_KEY":"stale"}))?;
+    storage.save(&first)?;
+    // An independent storage instance publishes a later generation before commit.
+    let other = create_auth_storage(
         home.path().to_path_buf(),
-        Arc::new(keyring.clone()),
-        AuthKeyringBackendKind::Direct,
+        AuthCredentialsStoreMode::File,
+        AuthKeyringBackendKind::default(),
     );
-    let original = auth_with_prefix("B");
-    storage.file_storage.save(&original)?;
-    let prepared = storage.load_managed()?;
-    assert!(storage.verify_managed_preimage(&prepared.preimage)?);
-    // Even identical payload in a newly present primary is a source change.
-    storage.keyring_storage.save(&original)?;
-    assert!(!storage.verify_managed_preimage(&prepared.preimage)?);
-    keyring.set_error(
-        &compute_store_key(home.path())?,
-        KeyringError::Invalid("error".into(), "read".into()),
-    );
-    assert!(matches!(
-        storage.verify_managed_preimage(&prepared.preimage),
-        Err(ManagedAuthStorageError::AutoFallbackRequired(
-            ManagedAuthStorageFailure::Keyring
-        ))
-    ));
-
-    let other_home = tempdir()?;
-    let other = FileAuthStorage::new(other_home.path().to_path_buf());
-    other.save(&original)?;
-    let first = FileAuthStorage::new(home.path().to_path_buf());
-    first.save(&original)?;
-    assert!(!other.verify_managed_preimage(&first.load_managed()?.preimage)?);
-    Ok(())
-}
-
-#[test]
-fn managed_secrets_preimage_detects_reencrypted_identical_auth() -> anyhow::Result<()> {
-    let home = tempdir()?;
-    let storage = SecretsKeyringAuthStorage::new(
-        home.path().to_path_buf(),
-        Arc::new(MockKeyringStore::default()),
-    );
-    let auth = auth_with_prefix("B");
-    storage.save(&auth)?;
-    let prepared = storage.load_managed()?;
-    storage.save(&auth)?;
-    assert!(!storage.verify_managed_preimage(&prepared.preimage)?);
-    Ok(())
-}
-
-#[test]
-fn managed_file_load_distinguishes_absence_io_and_parse_failures() -> anyhow::Result<()> {
-    let home = tempdir()?;
-    let storage = FileAuthStorage::new(home.path().to_path_buf());
-    let absent = storage.load_managed()?;
-    assert!(absent.auth.is_none());
-    assert_eq!(absent.source, ManagedAuthStorageSource::File);
-
-    let auth_file = get_auth_file(home.path());
-    std::fs::create_dir(&auth_file)?;
-    assert!(matches!(
-        storage.load_managed(),
-        Err(ManagedAuthStorageError::ReadFailed(
-            ManagedAuthStorageFailure::FileIo(_)
-        ))
-    ));
-    std::fs::remove_dir(&auth_file)?;
-
-    for invalid in [b"{".as_slice(), b"not-json", &[0xff]] {
-        std::fs::write(&auth_file, invalid)?;
-        assert_eq!(
-            storage.load_managed().unwrap_err(),
-            ManagedAuthStorageError::ReadFailed(ManagedAuthStorageFailure::Parse(
-                ManagedAuthStorageSource::File
-            ))
-        );
-    }
-    Ok(())
-}
-
-#[test]
-fn managed_load_preserves_exact_snapshot_and_redacts_debug() -> anyhow::Result<()> {
-    let home = tempdir()?;
-    let storage = FileAuthStorage::new(home.path().to_path_buf());
-    let original = auth_with_prefix("managed-secret-sentinel");
-    storage.save(&original)?;
-    let read = storage.load_managed()?;
-    storage.save(&auth_with_prefix("later-source"))?;
-    assert_eq!(read.auth, Some(original));
-    // Unsupported modes must remain present for the manager's explicit mode
-    // refusal; storage must not turn them into authoritative logout absence.
-    assert_eq!(
-        read.auth.as_ref().and_then(|auth| auth.auth_mode),
-        Some(AuthMode::ApiKey)
-    );
-    let debug = format!("{read:?}");
-    assert!(debug.contains("auth_present: true"));
-    assert!(!debug.contains("managed-secret-sentinel"));
-    assert!(!debug.contains("api-key"));
-    Ok(())
-}
-
-#[test]
-fn managed_direct_keyring_distinguishes_absence_failure_and_parse() -> anyhow::Result<()> {
-    let home = tempdir()?;
-    let keyring = MockKeyringStore::default();
-    let storage =
-        DirectKeyringAuthStorage::new(home.path().to_path_buf(), Arc::new(keyring.clone()));
-    assert!(storage.load_managed()?.auth.is_none());
-    let key = compute_store_key(home.path())?;
-    keyring.save(KEYRING_SERVICE, &key, "malformed-secret-sentinel")?;
-    assert_eq!(
-        storage.load_managed().unwrap_err(),
-        ManagedAuthStorageError::ReadFailed(ManagedAuthStorageFailure::Parse(
-            ManagedAuthStorageSource::Keyring
-        ))
-    );
-    keyring.set_error(
-        &key,
-        KeyringError::Invalid("secret-error-sentinel".into(), "load".into()),
-    );
-    let error = storage.load_managed().unwrap_err();
-    assert_eq!(
-        error,
-        ManagedAuthStorageError::ReadFailed(ManagedAuthStorageFailure::Keyring)
-    );
-    assert!(!format!("{error:?}: {error}").contains("secret-error-sentinel"));
-    Ok(())
-}
-
-#[test]
-fn managed_secrets_distinguishes_absence_backend_failure_and_auth_parse() -> anyhow::Result<()> {
-    let home = tempdir()?;
-    let keyring = MockKeyringStore::default();
-    let storage =
-        SecretsKeyringAuthStorage::new(home.path().to_path_buf(), Arc::new(keyring.clone()));
-    assert!(storage.load_managed()?.auth.is_none());
-    storage
-        .secrets_manager
-        .set(&SecretScope::Global, &CODEX_AUTH_SECRET_NAME, "{")?;
-    assert_eq!(
-        storage.load_managed().unwrap_err(),
-        ManagedAuthStorageError::ReadFailed(ManagedAuthStorageFailure::Parse(
-            ManagedAuthStorageSource::Secrets
-        ))
-    );
-    let key = compute_keyring_account(home.path(), LocalSecretsNamespace::CodexAuth);
-    keyring.set_error(
-        &key,
-        KeyringError::Invalid("secret-error-sentinel".into(), "load".into()),
-    );
-    assert_eq!(
-        storage.load_managed().unwrap_err(),
-        ManagedAuthStorageError::ReadFailed(ManagedAuthStorageFailure::Secrets)
-    );
-    Ok(())
-}
-
-#[test]
-fn managed_auto_never_turns_failed_primary_into_fallback_auth_or_absence() -> anyhow::Result<()> {
-    for backend in [
-        AuthKeyringBackendKind::Direct,
-        AuthKeyringBackendKind::Secrets,
-    ] {
-        let home = tempdir()?;
-        let keyring = MockKeyringStore::default();
-        let storage = AutoAuthStorage::new(
-            home.path().to_path_buf(),
-            Arc::new(keyring.clone()),
-            backend,
-        );
-        let absent = storage.load_managed()?;
-        assert!(absent.auth.is_none());
-        assert_eq!(
-            absent.source,
-            ManagedAuthStorageSource::FileAfterKeyringAbsence
-        );
-        let file_auth = auth_with_prefix("fallback");
-        storage.file_storage.save(&file_auth)?;
-        let read = storage.load_managed()?;
-        assert_eq!(read.auth, Some(file_auth));
-        assert_eq!(
-            read.source,
-            ManagedAuthStorageSource::FileAfterKeyringAbsence
-        );
-
-        let (key, cause) = match backend {
-            AuthKeyringBackendKind::Direct => (
-                compute_store_key(home.path())?,
-                ManagedAuthStorageFailure::Keyring,
-            ),
-            AuthKeyringBackendKind::Secrets => {
-                seed_secrets_backend_with_auth(
-                    &keyring,
-                    home.path(),
-                    &auth_with_prefix("primary"),
-                )?;
-                (
-                    compute_keyring_account(home.path(), LocalSecretsNamespace::CodexAuth),
-                    ManagedAuthStorageFailure::Secrets,
-                )
-            }
-        };
-        for fallback_present in [true, false] {
-            if !fallback_present {
-                storage.file_storage.delete()?;
-            }
-            keyring.set_error(&key, KeyringError::Invalid("error".into(), "load".into()));
-            assert_eq!(
-                storage.load_managed().unwrap_err(),
-                ManagedAuthStorageError::AutoFallbackRequired(cause)
-            );
-        }
-    }
-    Ok(())
-}
-
-#[test]
-fn managed_auto_parse_failure_is_not_erased_by_valid_fallback() -> anyhow::Result<()> {
-    let home = tempdir()?;
-    let keyring = MockKeyringStore::default();
-    let storage = AutoAuthStorage::new(
-        home.path().to_path_buf(),
-        Arc::new(keyring.clone()),
-        AuthKeyringBackendKind::Direct,
-    );
-    storage
-        .file_storage
-        .save(&auth_with_prefix("valid-fallback"))?;
-    keyring.save(KEYRING_SERVICE, &compute_store_key(home.path())?, "{")?;
-    assert_eq!(
-        storage.load_managed().unwrap_err(),
-        ManagedAuthStorageError::AutoFallbackRequired(ManagedAuthStorageFailure::Parse(
-            ManagedAuthStorageSource::Keyring
-        ))
-    );
-    Ok(())
-}
-
-#[test]
-fn managed_load_refuses_ephemeral_even_when_empty() -> anyhow::Result<()> {
-    let home = tempdir()?;
-    let storage = EphemeralAuthStorage::new(home.path().to_path_buf());
-    assert_eq!(
-        storage.load_managed().unwrap_err(),
-        ManagedAuthStorageError::ReadFailed(ManagedAuthStorageFailure::UnsupportedStorage)
-    );
-    Ok(())
-}
-
-#[test]
-fn managed_keyring_never_falls_back_to_an_unresolved_home_identity() -> anyhow::Result<()> {
-    let home = tempdir()?;
-    let missing = home.path().join("missing");
-    let keyring = MockKeyringStore::default();
-    let fallback_key = compute_store_key(&missing)?;
-    keyring.save(
-        KEYRING_SERVICE,
-        &fallback_key,
-        &serde_json::to_string(&auth_with_prefix("wrong-identity"))?,
-    )?;
-    let storage = DirectKeyringAuthStorage::new(missing, Arc::new(keyring));
-    assert_eq!(
-        storage.load_managed().unwrap_err(),
-        ManagedAuthStorageError::ReadFailed(ManagedAuthStorageFailure::Keyring)
-    );
+    other.save(&second)?;
+    assert!(storage.compare_and_save(&first, &stale).is_err());
+    assert_eq!(storage.load()?, Some(second));
     Ok(())
 }
 
@@ -540,6 +139,54 @@ async fn file_storage_save_persists_auth_dot_json() -> anyhow::Result<()> {
         .try_read_auth_json(&file)
         .context("failed to read auth file after save")?;
     assert_eq!(auth_dot_json, same_auth_dot_json);
+
+    // An overlapping reader must keep seeing the complete old document.
+    let mut overlapping_reader = File::open(&file)?;
+    let mut replacement = auth_dot_json.clone();
+    replacement.openai_api_key = Some("replacement-with-a-different-length".to_string());
+    storage
+        .save(&replacement)
+        .context("atomically replace auth while the original reader remains open")?;
+    let mut original_contents = String::new();
+    overlapping_reader.read_to_string(&mut original_contents)?;
+    assert_eq!(
+        serde_json::from_str::<AuthDotJson>(&original_contents)?,
+        auth_dot_json
+    );
+    assert_eq!(storage.load()?, Some(replacement));
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&file)?.permissions().mode() & 0o777,
+            0o600
+        );
+
+        let linked_home = tempdir()?;
+        let link = get_auth_file(linked_home.path());
+        std::os::unix::fs::symlink(&file, &link)?;
+        FileAuthStorage::new(linked_home.path().to_path_buf()).save(&auth_dot_json)?;
+        assert!(std::fs::symlink_metadata(link)?.file_type().is_symlink());
+        assert_eq!(storage.load()?, Some(auth_dot_json));
+    }
+    Ok(())
+}
+
+#[test]
+fn file_storage_failed_replacement_cleans_up_temporary_file() -> anyhow::Result<()> {
+    let home = tempdir()?;
+    let auth_path = get_auth_file(home.path());
+    // A directory cannot be replaced by an auth file on any supported platform.
+    std::fs::create_dir(&auth_path)?;
+    let storage = FileAuthStorage::new(home.path().to_path_buf());
+    let auth = serde_json::from_value(json!({"OPENAI_API_KEY": "test-key"}))?;
+    assert!(storage.save(&auth).is_err());
+    let entries = std::fs::read_dir(home.path())?
+        .map(|entry| entry.map(|entry| entry.file_name()))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    assert_eq!(entries, vec![std::ffi::OsString::from("auth.json")]);
+    assert!(auth_path.is_dir());
     Ok(())
 }
 
@@ -911,6 +558,8 @@ fn auth_with_prefix(prefix: &str) -> AuthDotJson {
             id_token: id_token_with_prefix(prefix),
             access_token: format!("{prefix}-access"),
             refresh_token: format!("{prefix}-refresh"),
+            oauth_provenance: None,
+            login_owner_id: None,
             account_id: Some(format!("{prefix}-account-id")),
         }),
         last_refresh: None,
@@ -936,6 +585,7 @@ fn secrets_keyring_auth_storage_load_returns_deserialized_auth() -> anyhow::Resu
     let storage = SecretsKeyringAuthStorage::new(
         codex_home.path().to_path_buf(),
         Arc::new(mock_keyring.clone()),
+        AuthCredentialsStoreMode::Keyring,
     );
     let expected = AuthDotJson {
         auth_mode: Some(AuthMode::ApiKey),
@@ -965,40 +615,13 @@ fn keyring_auth_storage_compute_store_key_for_home_directory() -> anyhow::Result
 }
 
 #[test]
-fn direct_keyring_auth_storage_saves_legacy_keyring_entry() -> anyhow::Result<()> {
-    let codex_home = tempdir()?;
-    let mock_keyring = MockKeyringStore::default();
-    let storage = DirectKeyringAuthStorage::new(
-        codex_home.path().to_path_buf(),
-        Arc::new(mock_keyring.clone()),
-    );
-    let auth_file = get_auth_file(codex_home.path());
-    std::fs::write(&auth_file, "stale")?;
-    let auth = auth_with_prefix("direct");
-
-    storage.save(&auth)?;
-
-    let legacy_key = compute_store_key(codex_home.path())?;
-    let saved_value = mock_keyring
-        .saved_value(&legacy_key)
-        .context("direct keyring auth entry should exist")?;
-    assert_eq!(saved_value, serde_json::to_string(&auth)?);
-    assert!(!encrypted_auth_file(codex_home.path()).exists());
-    assert!(
-        !auth_file.exists(),
-        "fallback auth.json should be removed after keyring save"
-    );
-    assert_eq!(storage.load()?, Some(auth));
-    Ok(())
-}
-
-#[test]
 fn direct_keyring_auth_storage_delete_removes_keyring_and_file() -> anyhow::Result<()> {
     let codex_home = tempdir()?;
     let mock_keyring = MockKeyringStore::default();
     let storage = DirectKeyringAuthStorage::new(
         codex_home.path().to_path_buf(),
         Arc::new(mock_keyring.clone()),
+        AuthCredentialsStoreMode::Keyring,
     );
     let auth = auth_with_prefix("direct-delete");
     storage.save(&auth)?;
@@ -1065,44 +688,13 @@ fn factory_uses_secrets_backend_only_when_requested() -> anyhow::Result<()> {
 }
 
 #[test]
-fn secrets_keyring_auth_storage_save_persists_and_removes_fallback_file() -> anyhow::Result<()> {
-    let codex_home = tempdir()?;
-    let mock_keyring = MockKeyringStore::default();
-    let storage = SecretsKeyringAuthStorage::new(
-        codex_home.path().to_path_buf(),
-        Arc::new(mock_keyring.clone()),
-    );
-    let auth_file = get_auth_file(codex_home.path());
-    std::fs::write(&auth_file, "stale")?;
-    let auth = AuthDotJson {
-        auth_mode: Some(AuthMode::Chatgpt),
-        openai_api_key: None,
-        tokens: Some(TokenData {
-            id_token: Default::default(),
-            access_token: "access".to_string(),
-            refresh_token: "refresh".to_string(),
-            account_id: Some("account".to_string()),
-        }),
-        last_refresh: Some(Utc::now()),
-        agent_identity: None,
-        personal_access_token: None,
-        bedrock_api_key: None,
-        bedrock_access_keys: None,
-    };
-
-    storage.save(&auth)?;
-
-    assert_keyring_saved_auth_and_removed_fallback(&mock_keyring, codex_home.path(), &auth)?;
-    Ok(())
-}
-
-#[test]
 fn secrets_keyring_auth_storage_delete_removes_keyring_and_file() -> anyhow::Result<()> {
     let codex_home = tempdir()?;
     let mock_keyring = MockKeyringStore::default();
     let storage = SecretsKeyringAuthStorage::new(
         codex_home.path().to_path_buf(),
         Arc::new(mock_keyring.clone()),
+        AuthCredentialsStoreMode::Keyring,
     );
     let auth = auth_with_prefix("to-delete");
     let auth_file = seed_secrets_backend_and_fallback_auth_file_for_delete(
@@ -1129,11 +721,13 @@ fn secrets_keyring_auth_storage_delete_removes_legacy_direct_keyring_entry() -> 
     let direct_storage = DirectKeyringAuthStorage::new(
         codex_home.path().to_path_buf(),
         Arc::new(mock_keyring.clone()),
+        AuthCredentialsStoreMode::Keyring,
     );
     direct_storage.save(&auth_with_prefix("legacy-direct"))?;
     let storage = SecretsKeyringAuthStorage::new(
         codex_home.path().to_path_buf(),
         Arc::new(mock_keyring.clone()),
+        AuthCredentialsStoreMode::Keyring,
     );
     let auth = auth_with_prefix("to-delete");
     let auth_file = seed_secrets_backend_and_fallback_auth_file_for_delete(
@@ -1158,141 +752,8 @@ fn secrets_keyring_auth_storage_delete_removes_legacy_direct_keyring_entry() -> 
     Ok(())
 }
 
-#[test]
-fn auto_auth_storage_load_prefers_keyring_value() -> anyhow::Result<()> {
-    let codex_home = tempdir()?;
-    let mock_keyring = MockKeyringStore::default();
-    let storage = AutoAuthStorage::new(
-        codex_home.path().to_path_buf(),
-        Arc::new(mock_keyring.clone()),
-        AuthKeyringBackendKind::Secrets,
-    );
-    let keyring_auth = auth_with_prefix("keyring");
-    seed_secrets_backend_with_auth(&mock_keyring, codex_home.path(), &keyring_auth)?;
+#[path = "storage_policy_tests.rs"]
+mod policy;
 
-    let file_auth = auth_with_prefix("file");
-    storage.file_storage.save(&file_auth)?;
-
-    let loaded = storage.load()?;
-    assert_eq!(loaded, Some(keyring_auth));
-    Ok(())
-}
-
-#[test]
-fn auto_auth_storage_load_uses_file_when_keyring_empty() -> anyhow::Result<()> {
-    let codex_home = tempdir()?;
-    let mock_keyring = MockKeyringStore::default();
-    let storage = AutoAuthStorage::new(
-        codex_home.path().to_path_buf(),
-        Arc::new(mock_keyring),
-        AuthKeyringBackendKind::Secrets,
-    );
-
-    let expected = auth_with_prefix("file-only");
-    storage.file_storage.save(&expected)?;
-
-    let loaded = storage.load()?;
-    assert_eq!(loaded, Some(expected));
-    Ok(())
-}
-
-#[test]
-fn auto_auth_storage_load_falls_back_when_keyring_errors() -> anyhow::Result<()> {
-    let codex_home = tempdir()?;
-    let mock_keyring = MockKeyringStore::default();
-    let storage = AutoAuthStorage::new(
-        codex_home.path().to_path_buf(),
-        Arc::new(mock_keyring.clone()),
-        AuthKeyringBackendKind::Secrets,
-    );
-    let key = compute_keyring_account(codex_home.path(), LocalSecretsNamespace::CodexAuth);
-
-    let encrypted = auth_with_prefix("encrypted");
-    seed_secrets_backend_with_auth(&mock_keyring, codex_home.path(), &encrypted)?;
-    mock_keyring.set_error(&key, KeyringError::Invalid("error".into(), "load".into()));
-
-    let expected = auth_with_prefix("fallback");
-    storage.file_storage.save(&expected)?;
-
-    let loaded = storage.load()?;
-    assert_eq!(loaded, Some(expected));
-    Ok(())
-}
-
-#[test]
-fn auto_auth_storage_save_prefers_keyring() -> anyhow::Result<()> {
-    let codex_home = tempdir()?;
-    let mock_keyring = MockKeyringStore::default();
-    let storage = AutoAuthStorage::new(
-        codex_home.path().to_path_buf(),
-        Arc::new(mock_keyring.clone()),
-        AuthKeyringBackendKind::Secrets,
-    );
-    let stale = auth_with_prefix("stale");
-    storage.file_storage.save(&stale)?;
-
-    let expected = auth_with_prefix("to-save");
-    storage.save(&expected)?;
-
-    assert_keyring_saved_auth_and_removed_fallback(&mock_keyring, codex_home.path(), &expected)?;
-    Ok(())
-}
-
-#[test]
-fn auto_auth_storage_save_falls_back_when_keyring_errors() -> anyhow::Result<()> {
-    let codex_home = tempdir()?;
-    let mock_keyring = MockKeyringStore::default();
-    let storage = AutoAuthStorage::new(
-        codex_home.path().to_path_buf(),
-        Arc::new(mock_keyring.clone()),
-        AuthKeyringBackendKind::Secrets,
-    );
-    let key = compute_keyring_account(codex_home.path(), LocalSecretsNamespace::CodexAuth);
-    mock_keyring.set_error(&key, KeyringError::Invalid("error".into(), "save".into()));
-
-    let auth = auth_with_prefix("fallback");
-    storage.save(&auth)?;
-
-    let auth_file = get_auth_file(codex_home.path());
-    assert!(
-        auth_file.exists(),
-        "fallback auth.json should be created when keyring save fails"
-    );
-    let saved = storage
-        .file_storage
-        .load()?
-        .context("fallback auth should exist")?;
-    assert_eq!(saved, auth);
-    assert!(
-        mock_keyring.saved_value(&key).is_none(),
-        "keyring should not contain value when save fails"
-    );
-    Ok(())
-}
-
-#[test]
-fn auto_auth_storage_delete_removes_keyring_and_file() -> anyhow::Result<()> {
-    let codex_home = tempdir()?;
-    let mock_keyring = MockKeyringStore::default();
-    let storage = AutoAuthStorage::new(
-        codex_home.path().to_path_buf(),
-        Arc::new(mock_keyring.clone()),
-        AuthKeyringBackendKind::Secrets,
-    );
-    let auth = auth_with_prefix("to-delete");
-    let auth_file = seed_secrets_backend_and_fallback_auth_file_for_delete(
-        &mock_keyring,
-        codex_home.path(),
-        &auth,
-    )?;
-
-    let removed = storage.delete()?;
-
-    assert!(removed, "delete should report removal");
-    assert_eq!(storage.load()?, None, "encrypted auth should be removed");
-    assert!(
-        !auth_file.exists(),
-        "fallback auth.json should be removed after delete"
-    );
-    Ok(())
-}
+#[path = "storage_error_tests.rs"]
+mod errors;

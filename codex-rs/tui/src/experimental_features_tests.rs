@@ -65,6 +65,8 @@ async fn experimental_features_rpc_paginates_thread_config_and_bounds_bad_server
             page
         });
         let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+            interactive_client: false,
+            required_human_approval: true,
             endpoint: RemoteAppServerEndpoint::WebSocket {
                 websocket_url: url,
                 auth_token: None,
@@ -72,7 +74,6 @@ async fn experimental_features_rpc_paginates_thread_config_and_bounds_bad_server
             client_name: "experimental-test".to_string(),
             client_version: "0.0.0".to_string(),
             experimental_api: true,
-            interactive_client: false,
             mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,

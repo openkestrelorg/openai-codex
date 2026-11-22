@@ -1,111 +1,128 @@
-//! Compiler-enforced exhaustive classification of every `ClientRequest`
-//! variant into "requires an account-work permit before effect" or
-//! "independent of the current account." Owned by this crate deliberately,
-//! not `app-server-protocol`, so a new protocol variant fails compilation
-//! here without widening the shared protocol macro's blast radius
-//! (`CODEX-I05-S03-R009`, plan Preflight A closed-work census).
-//!
-//! The match below has no wildcard arm on purpose: a future `ClientRequest`
-//! variant that omits classification must fail to compile, not silently
-//! default to either class.
+//! Exhaustive request admission for the actual 0.169 wire surface.
+//! Pure cache observations/control/cancellation remain independent. A request
+//! that can resolve credentials or perform account/provider work is counted
+//! before bookkeeping or queueing, including warm model-picker requests.
+//! Missing historical protocol controls are not retired; adding them to the
+//! wire must add explicit arms here (no wildcard fallback).
 
 use codex_app_server_protocol::ClientRequest;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AccountDependency {
-    /// Reads/writes no account-bound state; never gated by the barrier.
     Independent,
-    /// Reaches auth, provider, MCP, plugin, skill, or model state and must
-    /// hold an account-work permit before any effect (`CODEX-I05-S03-R009`,
-    /// `R012`).
     Permit,
 }
 
-/// Classifies a request per the Preflight A closed-work census
-/// (`implementation/preflight-a/codex-initial-plan-completion.md`). The
-/// three `ManagedTransition*` control variants are deliberately
-/// `Independent`: they are the barrier's own control surface, and gating
-/// them on the barrier they themselves close would self-deadlock every
-/// transition attempt (delegated design control 1).
 pub(crate) fn classify(request: &ClientRequest) -> AccountDependency {
     match request {
-        ClientRequest::ThreadStart { .. }
-        | ClientRequest::ThreadResume { .. }
-        | ClientRequest::ThreadFork { .. }
-        | ClientRequest::ThreadClear { .. }
-        | ClientRequest::ThreadUnsubscribe { .. }
-        | ClientRequest::ThreadArchive { .. }
-        | ClientRequest::ThreadDelete { .. }
-        | ClientRequest::ThreadUnarchive { .. }
-        | ClientRequest::ThreadRevert { .. }
-        | ClientRequest::ThreadCompactStart { .. }
-        | ClientRequest::ThreadBackgroundTerminalsClean { .. }
-        | ClientRequest::ThreadBackgroundTerminalsTerminate { .. }
-        | ClientRequest::ThreadShellCommand { .. }
-        | ClientRequest::ThreadApproveGuardianDeniedAction { .. }
-        | ClientRequest::TurnStart { .. }
-        | ClientRequest::ThreadQueueAdd { .. }
-        | ClientRequest::ThreadQueueStart { .. }
-        | ClientRequest::ThreadInjectItems { .. }
-        | ClientRequest::TurnSteer { .. }
-        | ClientRequest::TurnInterrupt { .. }
-        | ClientRequest::ThreadRealtimeStart { .. }
-        | ClientRequest::ThreadRealtimeAppendAudio { .. }
-        | ClientRequest::ThreadRealtimeAppendText { .. }
-        | ClientRequest::ThreadRealtimeAppendSpeech { .. }
-        | ClientRequest::ThreadRealtimeStop { .. }
-        | ClientRequest::ReviewStart { .. }
-        | ClientRequest::GetConversationSummary { .. }
-        | ClientRequest::SendAddCreditsNudgeEmail { .. }
-        | ClientRequest::RemoteControlEnable { .. }
-        | ClientRequest::RemoteControlDisable { .. }
-        | ClientRequest::RemoteControlPairingStart { .. }
-        | ClientRequest::RemoteControlPairingStatus { .. }
-        | ClientRequest::RemoteControlClientsList { .. }
-        | ClientRequest::RemoteControlClientsRevoke { .. }
-        | ClientRequest::McpServerOauthLogin { .. }
-        | ClientRequest::McpServerRefresh { .. }
-        | ClientRequest::McpServerConfigIdentity { .. }
-        | ClientRequest::McpServerStatusList { .. }
-        | ClientRequest::McpResourceRead { .. }
-        | ClientRequest::McpServerToolCall { .. }
-        | ClientRequest::McpServerEventStreamStart { .. }
+        ClientRequest::GetAccount { params, .. } => {
+            if params.cache_only {
+                AccountDependency::Independent
+            } else {
+                AccountDependency::Permit
+            }
+        }
+        ClientRequest::AccountSessionsList { params, .. } => {
+            if params.refresh_workspace_metadata {
+                AccountDependency::Permit
+            } else {
+                AccountDependency::Independent
+            }
+        }
+        ClientRequest::AccountSessionsSwitch { .. }
+        | ClientRequest::AppsInstalled { .. }
+        | ClientRequest::AppsList { .. }
+        | ClientRequest::AppsRead { .. }
+        | ClientRequest::BedrockCheckGovCloudRequirements { .. }
         | ClientRequest::BedrockSetup { .. }
+        | ClientRequest::ConsumeAccountRateLimitResetCredit { .. }
+        | ClientRequest::GatewayOAuthLogin { .. }
+        | ClientRequest::GatewayOAuthRead { .. }
+        | ClientRequest::GcpSetup { .. }
+        | ClientRequest::GetAccountRateLimits { .. }
+        | ClientRequest::GetAccountSecuritySetup { .. }
+        | ClientRequest::GetAccountTokenUsage { .. }
+        | ClientRequest::GetAuthStatus { .. }
+        | ClientRequest::GetConversationSummary { .. }
+        | ClientRequest::GetWorkspaceMessages { .. }
+        | ClientRequest::HooksList { .. }
+        | ClientRequest::LoginAccount { .. }
+        | ClientRequest::LogoutAccount { .. }
         | ClientRequest::MarketplaceAdd { .. }
         | ClientRequest::MarketplaceRemove { .. }
         | ClientRequest::MarketplaceUpgrade { .. }
-        | ClientRequest::PluginList { .. }
-        | ClientRequest::PluginSearch { .. }
+        | ClientRequest::McpResourceRead { .. }
+        | ClientRequest::McpServerEventStreamStart { .. }
+        | ClientRequest::McpServerOauthLogin { .. }
+        | ClientRequest::McpServerRefresh { .. }
+        | ClientRequest::McpHostedEndpointDeclare { .. }
+        | ClientRequest::McpServerConfigIdentity { .. }
+        | ClientRequest::McpServerStatusList { .. }
+        | ClientRequest::McpServerToolCall { .. }
+        | ClientRequest::ModelList { .. }
+        | ClientRequest::PluginInstall { .. }
         | ClientRequest::PluginInstalled { .. }
-        | ClientRequest::PluginReconcile { .. }
+        | ClientRequest::PluginList { .. }
         | ClientRequest::PluginRead { .. }
-        | ClientRequest::PluginSkillRead { .. }
-        | ClientRequest::PluginShareSave { .. }
-        | ClientRequest::PluginShareUpdateTargets { .. }
-        | ClientRequest::PluginShareList { .. }
+        | ClientRequest::PluginReconcile { .. }
+        | ClientRequest::PluginSearch { .. }
         | ClientRequest::PluginShareCheckout { .. }
         | ClientRequest::PluginShareDelete { .. }
-        | ClientRequest::PluginInstall { .. }
+        | ClientRequest::PluginShareList { .. }
+        | ClientRequest::PluginShareSave { .. }
+        | ClientRequest::PluginShareUpdateTargets { .. }
+        | ClientRequest::PluginSkillRead { .. }
         | ClientRequest::PluginUninstall { .. }
-        | ClientRequest::AppsRead { .. }
-        | ClientRequest::AppsList { .. }
-        | ClientRequest::AppsInstalled { .. }
-        | ClientRequest::LoginAccount { .. }
-        | ClientRequest::LogoutAccount { .. }
-        | ClientRequest::GatewayOAuthRead { .. }
-        | ClientRequest::GatewayOAuthLogin { .. }
-        | ClientRequest::GatewayOAuthCancel { .. }
-        | ClientRequest::SkillsList { .. }
-        | ClientRequest::SkillsExtraRootsSet { .. }
+        | ClientRequest::RemoteControlClientsList { .. }
+        | ClientRequest::RemoteControlClientsRevoke { .. }
+        | ClientRequest::RemoteControlDisable { .. }
+        | ClientRequest::RemoteControlEnable { .. }
+        | ClientRequest::RemoteControlPairingStart { .. }
+        | ClientRequest::RemoteControlPairingStatus { .. }
+        | ClientRequest::ReviewStart { .. }
+        | ClientRequest::SendAddCreditsNudgeEmail { .. }
         | ClientRequest::SkillsConfigWrite { .. }
-        | ClientRequest::HooksList { .. }
-        | ClientRequest::UserVerificationStatus { .. }
-        | ClientRequest::UserVerificationEnroll { .. }
+        | ClientRequest::SkillsExtraRootsSet { .. }
+        | ClientRequest::SkillsList { .. }
+        | ClientRequest::ThreadApproveGuardianDeniedAction { .. }
+        | ClientRequest::ThreadArchive { .. }
+        | ClientRequest::ThreadBackgroundTerminalsClean { .. }
+        | ClientRequest::ThreadBackgroundTerminalsTerminate { .. }
+        | ClientRequest::ThreadCompactStart { .. }
+        | ClientRequest::ThreadDelete { .. }
+        | ClientRequest::ThreadFork { .. }
+        | ClientRequest::ThreadClear { .. }
+        | ClientRequest::ThreadGuardianReview { .. }
+        | ClientRequest::ThreadInjectItems { .. }
+        | ClientRequest::ThreadPrepareApprovedPlan { .. }
+        | ClientRequest::ThreadQueueAdd { .. }
+        | ClientRequest::ThreadQueueStart { .. }
+        | ClientRequest::ThreadRealtimeAppendAudio { .. }
+        | ClientRequest::ThreadRealtimeAppendSpeech { .. }
+        | ClientRequest::ThreadRealtimeAppendText { .. }
+        | ClientRequest::ThreadRealtimeStart { .. }
+        | ClientRequest::ThreadRealtimeStop { .. }
+        | ClientRequest::ThreadResume { .. }
+        | ClientRequest::ThreadRevert { .. }
+        | ClientRequest::ThreadSample { .. }
+        | ClientRequest::ThreadShellCommand { .. }
+        | ClientRequest::ThreadStart { .. }
+        | ClientRequest::ThreadUnarchive { .. }
+        | ClientRequest::ThreadUnsubscribe { .. }
+        | ClientRequest::TurnInterrupt { .. }
+        | ClientRequest::TurnStart { .. }
+        | ClientRequest::TurnStartIfIdle { .. }
+        | ClientRequest::TurnSteer { .. }
         | ClientRequest::UserVerificationDelete { .. }
+        | ClientRequest::UserVerificationEnroll { .. }
+        | ClientRequest::UserVerificationStatus { .. }
         | ClientRequest::UserVerificationVerify { .. } => AccountDependency::Permit,
-
-        ClientRequest::CancelLoginAccount { .. }
+        ClientRequest::McpHostedEndpointRetire { .. }
+        | ClientRequest::ManagedTransitionStart { .. }
+        | ClientRequest::ManagedTransitionRead { .. }
+        | ClientRequest::ManagedTransitionCancel { .. }
         | ClientRequest::BedrockDiscover { .. }
+        | ClientRequest::CancelLoginAccount { .. }
         | ClientRequest::CollaborationModeList { .. }
         | ClientRequest::CommandExecResize { .. }
         | ClientRequest::CommandExecTerminate { .. }
@@ -114,7 +131,6 @@ pub(crate) fn classify(request: &ClientRequest) -> AccountDependency {
         | ClientRequest::ConfigRead { .. }
         | ClientRequest::ConfigRequirementsRead { .. }
         | ClientRequest::ConfigValueWrite { .. }
-        | ClientRequest::ConsumeAccountRateLimitResetCredit { .. }
         | ClientRequest::EnvironmentAdd { .. }
         | ClientRequest::EnvironmentInfo { .. }
         | ClientRequest::EnvironmentStatus { .. }
@@ -124,6 +140,7 @@ pub(crate) fn classify(request: &ClientRequest) -> AccountDependency {
         | ClientRequest::ExternalAgentConfigImport { .. }
         | ClientRequest::ExternalAgentConfigImportHistoriesRead { .. }
         | ClientRequest::ExternalAgentConfigImportHistoryRecord { .. }
+        | ClientRequest::FeedbackSave { .. }
         | ClientRequest::FeedbackUpload { .. }
         | ClientRequest::FsCopy { .. }
         | ClientRequest::FsCreateDirectory { .. }
@@ -138,23 +155,16 @@ pub(crate) fn classify(request: &ClientRequest) -> AccountDependency {
         | ClientRequest::FuzzyFileSearchSessionStart { .. }
         | ClientRequest::FuzzyFileSearchSessionStop { .. }
         | ClientRequest::FuzzyFileSearchSessionUpdate { .. }
-        | ClientRequest::GetAccount { .. }
-        | ClientRequest::GetAccountRateLimits { .. }
-        | ClientRequest::GetAccountTokenUsage { .. }
-        | ClientRequest::GetAuthStatus { .. }
-        | ClientRequest::GetWorkspaceMessages { .. }
+        | ClientRequest::GatewayOAuthCancel { .. }
         | ClientRequest::GitDiffToRemote { .. }
         | ClientRequest::Initialize { .. }
-        | ClientRequest::ManagedTransitionCancel { .. }
-        | ClientRequest::ManagedTransitionRead { .. }
-        | ClientRequest::ManagedTransitionStart { .. }
+        | ClientRequest::McpServerEventStreamStop { .. }
         | ClientRequest::MemoryReset { .. }
         | ClientRequest::MemoryStatus { .. }
-        // Cancel-only: no new client or auth capture, including during drain.
-        | ClientRequest::McpServerEventStreamStop { .. }
         | ClientRequest::MockExperimentalMethod { .. }
-        | ClientRequest::ModelList { .. }
         | ClientRequest::ModelProviderCapabilitiesRead { .. }
+        | ClientRequest::ModelProviderConfigWrite { .. }
+        | ClientRequest::ModelProviderList { .. }
         | ClientRequest::OneOffCommandExec { .. }
         | ClientRequest::PermissionProfileList { .. }
         | ClientRequest::ProcessKill { .. }
@@ -171,11 +181,9 @@ pub(crate) fn classify(request: &ClientRequest) -> AccountDependency {
         | ClientRequest::RemoteControlStatusRead { .. }
         | ClientRequest::RolloutCompress { .. }
         | ClientRequest::ServerDiagnostics { .. }
-        | ClientRequest::ThreadInteractiveSubscriptionList { .. }
-        | ClientRequest::ThreadClearRead { .. }
-        | ClientRequest::ThreadClearRecoveryRead { .. }
         | ClientRequest::ThreadAttachmentAdd { .. }
         | ClientRequest::ThreadAttachmentList { .. }
+        | ClientRequest::ThreadAttachmentOwnerList { .. }
         | ClientRequest::ThreadAttachmentRemove { .. }
         | ClientRequest::ThreadBackgroundTerminalsList { .. }
         | ClientRequest::ThreadDecrementElicitation { .. }
@@ -184,19 +192,26 @@ pub(crate) fn classify(request: &ClientRequest) -> AccountDependency {
         | ClientRequest::ThreadGoalSet { .. }
         | ClientRequest::ThreadIncrementElicitation { .. }
         | ClientRequest::ThreadItemsList { .. }
+        | ClientRequest::ThreadItemsRead { .. }
         | ClientRequest::ThreadList { .. }
+        | ClientRequest::ThreadClearRecoveryRead { .. }
+        | ClientRequest::ThreadClearRead { .. }
+        | ClientRequest::ThreadInteractiveSubscriptionList { .. }
+        | ClientRequest::ThreadRetentionAcquire { .. }
+        | ClientRequest::ThreadRetentionRelease { .. }
         | ClientRequest::ThreadLoadedList { .. }
         | ClientRequest::ThreadMemoryModeSet { .. }
+        | ClientRequest::ThreadMemoryRead { .. }
         | ClientRequest::ThreadMetadataUpdate { .. }
-        | ClientRequest::ThreadRead { .. }
-        // Unlike queue/add and queue/start, these never wake or submit a turn.
+        | ClientRequest::ThreadPredictionRequest { .. }
         | ClientRequest::ThreadQueueDelete { .. }
         | ClientRequest::ThreadQueueList { .. }
         | ClientRequest::ThreadQueueReorder { .. }
         | ClientRequest::ThreadQueueUpdate { .. }
-        | ClientRequest::ThreadRetentionAcquire { .. }
-        | ClientRequest::ThreadRetentionRelease { .. }
+        | ClientRequest::ThreadRead { .. }
+        | ClientRequest::ThreadReadStateUpdate { .. }
         | ClientRequest::ThreadRealtimeListVoices { .. }
+        | ClientRequest::ThreadSampleCancel { .. }
         | ClientRequest::ThreadSearch { .. }
         | ClientRequest::ThreadSearchOccurrences { .. }
         | ClientRequest::ThreadSectionCreate { .. }
@@ -206,8 +221,8 @@ pub(crate) fn classify(request: &ClientRequest) -> AccountDependency {
         | ClientRequest::ThreadSectionUpdate { .. }
         | ClientRequest::ThreadSetName { .. }
         | ClientRequest::ThreadSettingsUpdate { .. }
-        | ClientRequest::ThreadTurnsList { .. }
         | ClientRequest::ThreadTimelineList { .. }
+        | ClientRequest::ThreadTurnsList { .. }
         | ClientRequest::TurnSettingsUpdate { .. }
         | ClientRequest::UserVerificationCancel { .. }
         | ClientRequest::WindowsSandboxReadiness { .. }
@@ -218,50 +233,142 @@ pub(crate) fn classify(request: &ClientRequest) -> AccountDependency {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codex_app_server_protocol::ExperimentalApi;
 
-    #[test]
-    fn managed_transition_control_requests_are_independent_to_avoid_self_deadlock() {
-        let start = ClientRequest::ManagedTransitionStart {
-            request_id: codex_app_server_protocol::RequestId::Integer(1),
-            params: codex_app_server_protocol::StartManagedTransitionParams {
-                contract_version:
-                    codex_app_server_protocol::MANAGED_AUTH_TRANSITION_CONTRACT_VERSION,
-                transition_id: "t".to_owned(),
-                process_instance_id: "p".to_owned(),
-                intent: codex_app_server_protocol::ManagedTransitionIntent::AdoptManagedAuth,
-                expected_auth_revision: 0,
-                expected_transition_revision: 0,
-                expected_auth_fingerprint: None,
-                intended_result_auth_fingerprint: Some("intended-account".to_owned()),
-            },
-        };
-        assert_eq!(classify(&start), AccountDependency::Independent);
+    fn request(method: &str, params: serde_json::Value) -> ClientRequest {
+        let wire: codex_app_server_protocol::JSONRPCRequest =
+            serde_json::from_value(serde_json::json!({"id":1, "method":method, "params":params}))
+                .unwrap();
+        ClientRequest::try_from(wire).unwrap()
     }
 
     #[test]
-    fn representative_permit_class_members_are_permit() {
-        let turn_start = ClientRequest::TurnStart {
-            request_id: codex_app_server_protocol::RequestId::Integer(1),
-            params: Default::default(),
-        };
-        assert_eq!(classify(&turn_start), AccountDependency::Permit);
+    fn explicit_account_cache_observations_remain_independent() {
+        for refresh in [false, true] {
+            let request = request(
+                "account/read",
+                serde_json::json!({"cacheOnly":true,"refreshToken":refresh}),
+            );
+            // An inconsistent cache-only/refresh combination is rejected by
+            // the handler without needing permission to refresh anything.
+            assert_eq!(classify(&request), AccountDependency::Independent);
+        }
+        assert_eq!(
+            classify(&request("account/read", serde_json::json!({}))),
+            AccountDependency::Permit
+        );
     }
 
     #[test]
-    fn credential_mutations_are_permit_gated() {
-        let login = ClientRequest::LoginAccount {
-            request_id: codex_app_server_protocol::RequestId::Integer(2),
-            params: codex_app_server_protocol::LoginAccountParams::Chatgpt {
-                codex_streamlined_login: false,
-                use_hosted_login_success_page: false,
-                app_brand: None,
-            },
-        };
-        let logout = ClientRequest::LogoutAccount {
-            request_id: codex_app_server_protocol::RequestId::Integer(3),
-            params: None,
-        };
-        assert_eq!(classify(&login), AccountDependency::Permit);
-        assert_eq!(classify(&logout), AccountDependency::Permit);
+    fn session_list_refresh_is_distinct_from_cached_status() {
+        for refresh in [false, true] {
+            let actual = request(
+                "accountSession/list",
+                serde_json::json!({"refreshWorkspaceMetadata":refresh}),
+            );
+            assert_eq!(
+                classify(&actual),
+                if refresh {
+                    AccountDependency::Permit
+                } else {
+                    AccountDependency::Independent
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn credential_and_online_catalog_reads_are_counted_before_effects() {
+        for (method, params) in [
+            ("getAuthStatus", serde_json::json!({})),
+            ("config/mcpServer/identity", serde_json::Value::Null),
+            ("account/rateLimits/read", serde_json::json!({})),
+            ("model/list", serde_json::json!({})),
+            ("model/list", serde_json::json!({"modelProvider":"other"})),
+        ] {
+            assert_eq!(
+                classify(&request(method, params)),
+                AccountDependency::Permit,
+                "{method}"
+            );
+        }
+    }
+
+    #[test]
+    fn plugin_backend_mutations_require_account_work() {
+        // Managed reset drains counted requests before retiring plugin caches.
+        // Both backend mutations must stay behind that barrier.
+        for (method, params) in [
+            (
+                "plugin/install",
+                serde_json::json!({"pluginName":"fixture"}),
+            ),
+            (
+                "plugin/uninstall",
+                serde_json::json!({"pluginId":"fixture"}),
+            ),
+        ] {
+            assert_eq!(
+                classify(&request(method, params)),
+                AccountDependency::Permit,
+                "{method}"
+            );
+        }
+    }
+
+    #[test]
+    fn hosted_declaration_is_account_work_but_retirement_stays_independent() {
+        let params = serde_json::json!({
+            "url":"http://127.0.0.1:41005/mcp", "authorization":"Bearer configured",
+            "retirementCapability":"private-capability", "timeoutMs":1000
+        });
+        assert_eq!(
+            classify(&request(
+                "kcf/mcpServer/hostedEndpoint/declare",
+                params.clone()
+            )),
+            AccountDependency::Permit
+        );
+        assert_eq!(
+            classify(&request("kcf/mcpServer/hostedEndpoint/retire", params)),
+            AccountDependency::Independent
+        );
+    }
+
+    #[test]
+    fn gateway_cancellation_does_not_acquire_fresh_account_work() {
+        assert_eq!(
+            classify(&request(
+                "account/gatewayOAuth/cancel",
+                serde_json::json!({})
+            )),
+            AccountDependency::Independent
+        );
+    }
+    #[test]
+    fn transition_controls_remain_independent_and_unserialized() {
+        for (method, mut params) in [
+            (
+                "start",
+                serde_json::json!({
+                    "intent":"adoptManagedLogout", "expectedAuthRevision":0,
+                    "expectedTransitionRevision":0, "expectedAuthFingerprint":null,
+                    "intendedResultAuthFingerprint":null
+                }),
+            ),
+            ("read", serde_json::json!({})),
+            ("cancel", serde_json::json!({})),
+        ] {
+            params["contractVersion"] = serde_json::json!(1);
+            params["transitionId"] = serde_json::json!("test");
+            params["processInstanceId"] = serde_json::json!("test");
+            let request = request(&format!("account/managedAuthTransition/{method}"), params);
+            assert_eq!(classify(&request), AccountDependency::Independent);
+            assert!(request.serialization_scope().is_none());
+            assert_eq!(
+                request.experimental_reason(),
+                Some("account/managedAuthTransition")
+            );
+        }
     }
 }

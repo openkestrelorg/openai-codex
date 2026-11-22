@@ -226,14 +226,6 @@ impl ExecutorProcessTransport {
         let index = PROCESS_COUNTER.fetch_add(1, Ordering::Relaxed);
         ProcessId::from(format!("mcp-stdio-{index}"))
     }
-
-    /// Records a terminal observation made by the owning stdio process handle.
-    /// The handle subscribes before sending termination, so it is the one
-    /// place that can prove `Closed` without a second terminate request.
-    pub(super) fn mark_closed_after_terminal_observation(&mut self) {
-        self.closed = true;
-        self.terminated = true;
-    }
 }
 
 impl Transport<RoleClient> for ExecutorProcessTransport {
@@ -276,19 +268,8 @@ impl Transport<RoleClient> for ExecutorProcessTransport {
     }
 
     async fn close(&mut self) -> std::result::Result<(), Self::Error> {
-        // Subscribe before requesting termination so fast closure is consumed
-        // from retained replay rather than confused with request acceptance.
-        let mut events = self.process.subscribe_events();
-        tokio::time::timeout(
-            super::stdio_server_launcher::PROCESS_RETIREMENT_TIMEOUT,
-            async {
-                self.process.terminate().await.map_err(io::Error::other)?;
-                super::stdio_server_launcher::await_executor_process_close(&mut events).await
-            },
-        )
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "executor MCP close timed out"))??;
-        self.mark_closed_after_terminal_observation();
+        self.process.terminate().await.map_err(io::Error::other)?;
+        self.terminated = true;
         Ok(())
     }
 }
@@ -319,7 +300,7 @@ impl ExecutorProcessTransport {
                     // output flushed during process shutdown can still be
                     // decoded into JSON-RPC messages.
                 }
-                Ok(ExecProcessEvent::Closed { seq }) => {
+                Ok(ExecProcessEvent::Closed { seq, .. }) => {
                     self.note_seq(seq);
                     self.closed = true;
                 }
@@ -424,20 +405,20 @@ impl ExecutorProcessTransport {
     }
 
     fn push_process_output(&mut self, chunk: ProcessOutputChunk) {
-        let bytes = chunk.chunk.into_inner();
+        let bytes = chunk.chunk.as_ref();
         match chunk.stream {
             // MCP stdio uses stdout as the protocol stream. PTY output is
             // accepted defensively because the executor process API has a
             // unified stream enum, but remote MCP starts with `tty=false`.
             ExecOutputStream::Stdout | ExecOutputStream::Pty => {
-                if let Err(error) = self.stdout.extend_from_slice(&bytes) {
+                if let Err(error) = self.stdout.extend_from_slice(bytes) {
                     self.close_for_oversized_line("stdout", error);
                 }
             }
             // Stderr is intentionally out-of-band. It should help debug server
             // startup failures without entering rmcp framing.
             ExecOutputStream::Stderr => {
-                if let Err(error) = self.push_stderr(&bytes) {
+                if let Err(error) = self.push_stderr(bytes) {
                     self.stdout.clear();
                     self.close_for_oversized_line("stderr", error);
                 }

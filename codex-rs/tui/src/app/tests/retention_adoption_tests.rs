@@ -29,6 +29,10 @@ enum StartupOutcome {
 
 #[tokio::test]
 async fn startup_event_owns_provisional_retention_until_installation() -> Result<()> {
+    boxed_future!(startup_event_owns_provisional_retention_until_installation_scenario()).await
+}
+
+async fn startup_event_owns_provisional_retention_until_installation_scenario() -> Result<()> {
     for outcome in [
         StartupOutcome::Accepted,
         StartupOutcome::FailedDelivery,
@@ -36,16 +40,21 @@ async fn startup_event_owns_provisional_retention_until_installation() -> Result
         StartupOutcome::Stale,
     ] {
         let (mut app, _, _) = make_test_app_with_channels().await;
-        let mut server = crate::start_embedded_app_server_for_picker(&app.config).await?;
-        let pending = crate::app_server_session::start_thread_with_request_handle(
+        app.config
+            .features
+            .set_enabled(codex_features::Feature::Plugins, false)?;
+        let mut server =
+            boxed_future!(crate::start_embedded_app_server_for_picker(&app.config)).await?;
+        let pending = boxed_future!(crate::app_server_session::prepare_startup_thread(
             server.request_handle(),
-            server.retention_client(),
             &app.local_settings,
             app.config.clone(),
             server.thread_params_mode(),
             /*remote_cwd_override*/ None,
             server.thread_tool_transport(),
-        )
+            crate::app_server_session::StartupLaunchChoices::default(),
+            Some(server.retention_client()),
+        ))
         .await?;
         let thread_id = pending.started.session.thread_id;
         assert!(matches!(
@@ -54,6 +63,7 @@ async fn startup_event_owns_provisional_retention_until_installation() -> Result
         ));
         app.pending_startup_thread_start = !matches!(outcome, StartupOutcome::Stale);
         let event = AppEvent::StartupThreadStarted {
+            backend_id: server.backend_id(),
             result: Ok(pending),
         };
         match outcome {
@@ -100,143 +110,364 @@ async fn startup_event_owns_provisional_retention_until_installation() -> Result
 }
 
 #[tokio::test]
-async fn resume_cleanup_preserves_primary_displayed_and_side_targets() -> Result<()> {
-    for target_index in 0..3 {
-        let (mut app, _, _) = make_test_app_with_channels().await;
-        let mut server = crate::start_embedded_app_server_for_picker(&app.config).await?;
-        let primary = server.start_thread(&app.config).await?;
-        let displayed = server.start_thread(&app.config).await?;
-        let side = server.start_thread(&app.config).await?;
-        let ids = [
-            primary.session.thread_id,
-            displayed.session.thread_id,
-            side.session.thread_id,
-        ];
-        app.primary_thread_id = Some(ids[0]);
-        app.chat_widget.handle_thread_session(displayed.session);
-        crate::chatwidget::activate_voice_for_thread(&mut app.chat_widget, ids[1]);
-        app.side_threads
-            .insert(ids[2], crate::app::side::SideThreadState::new(ids[0]));
-        app.shutdown_current_thread_except(&mut server, Some(ids[target_index]))
-            .await;
-        assert_eq!(
-            app.chat_widget.is_current_realtime_attempt(
-                ids[1], /*attempt_id*/ 0, /*input_generation*/ 0
-            ),
-            target_index == 1
-        );
-        for (index, id) in ids.into_iter().enumerate() {
-            assert_eq!(
-                matches!(
-                    probe(&mut server, id).await?,
-                    ThreadRetentionAcquireResponse::AlreadyHeld { .. }
-                ),
-                index == target_index
-            );
+async fn resume_observation_and_provisional_adoption_have_distinct_custody() -> Result<()> {
+    boxed_future!(resume_observation_and_provisional_adoption_scenario()).await
+}
+
+async fn resume_observation_and_provisional_adoption_scenario() -> Result<()> {
+    let (mut app, _, _) = make_test_app_with_channels().await;
+    app.config
+        .features
+        .set_enabled(codex_features::Feature::Plugins, false)?;
+    let mut server =
+        boxed_future!(crate::start_embedded_app_server_for_picker(&app.config)).await?;
+    let id = ThreadId::from_string(
+        &app_test_support::create_fake_rollout(
+            app.config.codex_home.as_path(),
+            "2026-01-01T00-00-00",
+            "2026-01-01T00:00:00Z",
+            "saved resume source",
+            Some(app.config.model_provider_id.as_str()),
+            None,
+        )
+        .expect("resume source rollout"),
+    )?;
+    boxed_future!(server.resume_thread(
+        &app.local_settings,
+        app.config.clone(),
+        id,
+        crate::app_server_session::ResumeModelSettings::PreserveExistingThread
+    ))
+    .await?;
+    let ThreadRetentionAcquireResponse::Acquired { grant_id } = probe(&mut server, id).await?
+    else {
+        panic!("observing a thread must not have acquired a retention grant")
+    };
+    let _: codex_app_server_protocol::ThreadRetentionReleaseResponse = server
+        .request_handle()
+        .request_typed(ClientRequest::ThreadRetentionRelease {
+            request_id: server.next_request_id(),
+            params: codex_app_server_protocol::ThreadRetentionReleaseParams {
+                thread_id: id.to_string(),
+                grant_id,
+            },
+        })
+        .await?;
+
+    let (resumed, pending) = boxed_future!(server.prepare_retained_resume(
+        &app.local_settings,
+        app.config.clone(),
+        id,
+        crate::app_server_session::ResumeModelSettings::PreserveExistingThread,
+        crate::resume_permissions::ResumePermissions::default(),
+    ))
+    .await?;
+    assert_eq!(resumed.session.thread_id, id);
+    assert!(matches!(
+        probe(&mut server, id).await?,
+        ThreadRetentionAcquireResponse::AlreadyHeld { .. }
+    ));
+    pending.expect("adoption has provisional custody").commit();
+    let (_, existing) = boxed_future!(server.prepare_retained_resume(
+        &app.local_settings,
+        app.config.clone(),
+        id,
+        crate::app_server_session::ResumeModelSettings::PreserveExistingThread,
+        crate::resume_permissions::ResumePermissions::default(),
+    ))
+    .await?;
+    drop(existing);
+    tokio::task::yield_now().await;
+    assert!(
+        matches!(
+            probe(&mut server, id).await?,
+            ThreadRetentionAcquireResponse::AlreadyHeld { .. }
+        ),
+        "abandoning an already-held adoption must not release the committed grant"
+    );
+
+    let other = ThreadId::from_string(
+        &app_test_support::create_fake_rollout(
+            app.config.codex_home.as_path(),
+            "2026-01-01T00-00-01",
+            "2026-01-01T00:00:01Z",
+            "saved resume source",
+            Some(app.config.model_provider_id.as_str()),
+            None,
+        )
+        .expect("resume source rollout"),
+    )?;
+    let (_, pending) = boxed_future!(server.prepare_retained_resume(
+        &app.local_settings,
+        app.config.clone(),
+        other,
+        crate::app_server_session::ResumeModelSettings::PreserveExistingThread,
+        crate::resume_permissions::ResumePermissions::default(),
+    ))
+    .await?;
+    drop(pending);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match probe(&mut server, other).await? {
+                ThreadRetentionAcquireResponse::Acquired { .. } => {
+                    break Ok::<_, color_eyre::Report>(());
+                }
+                ThreadRetentionAcquireResponse::AlreadyHeld { .. } => {
+                    tokio::task::yield_now().await
+                }
+                other => panic!("unexpected retention probe: {other:?}"),
+            }
         }
-        assert_eq!(app.side_threads.contains_key(&ids[2]), target_index == 2);
+    })
+    .await??;
+    for thread_id in [id, other] {
+        server.thread_unsubscribe(thread_id).await?;
+    }
+    server.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn fork_preparation_keeps_new_grants_provisional_until_installation() -> Result<()> {
+    boxed_future!(fork_preparation_retention_scenario()).await
+}
+
+async fn fork_preparation_retention_scenario() -> Result<()> {
+    for (install, ephemeral) in [(false, false), (true, false), (false, true), (true, true)] {
+        let (mut app, _, _) = make_test_app_with_channels().await;
+        app.config
+            .features
+            .set_enabled(codex_features::Feature::Plugins, false)?;
+        let source = ThreadId::from_string(
+            &app_test_support::create_fake_rollout(
+                app.config.codex_home.as_path(),
+                "2026-01-01T00-00-00",
+                "2026-01-01T00:00:00Z",
+                "saved fork source",
+                Some(app.config.model_provider_id.as_str()),
+                None,
+            )
+            .expect("source rollout"),
+        )?;
+        let mut server =
+            boxed_future!(crate::start_embedded_app_server_for_picker(&app.config)).await?;
+        let started = boxed_future!(server.resume_thread(
+            &app.local_settings,
+            app.config.clone(),
+            source,
+            crate::app_server_session::ResumeModelSettings::PreserveExistingThread,
+        ))
+        .await?;
+        app.enqueue_primary_thread_session(started.session, started.turns)
+            .await?;
+        let mut fork_config = app.config.clone();
+        fork_config.ephemeral = ephemeral;
+        let (forked, retention) = boxed_future!(server.prepare_retained_fork_thread_at(
+            &app.local_settings,
+            fork_config,
+            source,
+            None,
+            None,
+            crate::app_server_session::ForkGoalContinuation::DeferUntilNextTurn,
+            None,
+        ))
+        .await?;
+        let id = forked.session.thread_id;
+        assert_ne!(id, source);
+        assert_eq!(server.thread_read(id, false).await?.ephemeral, ephemeral);
+        assert!(retention.is_some());
+        assert!(matches!(
+            probe(&mut server, id).await?,
+            ThreadRetentionAcquireResponse::AlreadyHeld { .. }
+        ));
+        if install {
+            let mut tui = crate::tui::test_support::make_test_tui()?;
+            boxed_future!(app.replace_chat_widget_with_app_server_thread(
+                &mut tui,
+                forked,
+                super::super::session_lifecycle::ThreadAttachPresentation::SessionLineage,
+                None,
+            ))
+            .await?;
+            assert_eq!(app.current_displayed_thread_id(), Some(id));
+            retention.expect("provisional fork grant").commit();
+            assert!(matches!(
+                probe(&mut server, id).await?,
+                ThreadRetentionAcquireResponse::AlreadyHeld { .. }
+            ));
+        } else {
+            drop(retention);
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    match probe(&mut server, id).await? {
+                        ThreadRetentionAcquireResponse::Acquired { .. } => {
+                            break Ok::<_, color_eyre::Report>(());
+                        }
+                        ThreadRetentionAcquireResponse::AlreadyHeld { .. } => {
+                            tokio::task::yield_now().await
+                        }
+                        other => panic!("unexpected retention probe: {other:?}"),
+                    }
+                }
+            })
+            .await??;
+            assert_eq!(app.current_displayed_thread_id(), Some(source));
+        }
+        server.thread_unsubscribe(id).await?;
+        server.thread_unsubscribe(source).await?;
         server.shutdown().await?;
     }
     Ok(())
 }
 
-#[test]
-fn clear_preserves_a_tracked_successor_and_reports_retention_refusal_after_commit() -> Result<()> {
-    // Match the existing clear UI fixtures' stack, not the product stack.
-    std::thread::Builder::new()
-        .name("clear-retention-boundary".to_string())
-        .stack_size(8 * 1024 * 1024)
-        .spawn(|| {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()?
-                .block_on(async {
-                    use codex_app_server_client::AppServerEvent;
-                    use codex_app_server_protocol::JSONRPCMessage;
-                    use codex_app_server_protocol::ServerNotification;
-                    use futures::SinkExt;
-                    use futures::StreamExt;
-                    use serde_json::json;
-                    use tokio_tungstenite::tungstenite::Message;
+#[tokio::test]
+async fn sidebar_event_owns_retention_until_install_or_abandonment() -> Result<()> {
+    boxed_future!(sidebar_event_retention_scenario()).await
+}
 
-                    for refuse in [false, true] {
-                        let (mut app, _, _) = make_test_app_with_channels().await;
-                        let predecessor = ThreadId::new();
-                        let successor = ThreadId::new();
-                        app.primary_thread_id = Some(predecessor);
-                        app.active_thread_id = Some(predecessor);
-                        app.chat_widget.handle_thread_session(test_thread_session(
-                            predecessor,
-                            app.config.cwd.to_path_buf(),
-                        ));
-                        app.ensure_thread_channel(predecessor);
-                        // Simulate notification registration before clear's
-                        // response is handled. Its cleanup sweep must skip B.
-                        app.ensure_thread_channel(successor);
-                        let cwd = app.config.cwd.clone();
-                        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-                        let endpoint = crate::resolve_remote_addr(&format!(
-                            "ws://{}", listener.local_addr()?
-                        ))?;
-                        let peer = tokio::spawn(async move {
-                            let (stream, _) = listener.accept().await?;
-                            let mut socket = tokio_tungstenite::accept_async(stream).await?;
-                            let mut methods = Vec::new();
-                            while let Some(frame) = socket.next().await {
-                                let Message::Text(text) = frame? else { continue };
-                                let JSONRPCMessage::Request(request) = serde_json::from_str(&text)? else { continue };
-                                methods.push(request.method.clone());
-                                let result = match request.method.as_str() {
-                                    "initialize" => json!({"userAgent": "retention-test/0.0.0"}),
-                                    "thread/clear" => {
-                                        assert_eq!(request.params.as_ref().unwrap()["threadId"], predecessor.to_string());
-                                        json!({"transitionId": "committed-clear", "predecessorThreadId": predecessor,
-                                            "successorThread": {"id": successor, "sessionId": successor, "preview": "", "ephemeral": false,
-                                                "modelProvider": "test-provider", "createdAt": 1, "updatedAt": 2,
-                                                "status": {"type": "idle"}, "cwd": cwd, "cliVersion": "0.0.0", "source": "cli", "turns": []}})
-                                    }
-                                    "thread/retention/acquire" => {
-                                        assert_eq!(request.params.as_ref().unwrap()["threadId"], successor.to_string());
-                                        if refuse { json!({"status": "refused", "reason": "authorityUnavailable"}) }
-                                        else { json!({"status": "acquired", "grantId": "successor-grant"}) }
-                                    }
-                                    "thread/unsubscribe" => {
-                                        assert_eq!(request.params.as_ref().unwrap()["threadId"], predecessor.to_string());
-                                        json!({"status": "unsubscribed"})
-                                    }
-                                    method => panic!("unexpected clear request: {method}"),
-                                };
-                                socket.send(Message::Text(json!({"id": request.id, "result": result}).to_string().into())).await?;
-                            }
-                            Ok::<_, color_eyre::Report>(methods)
-                        });
-                        let mut session = AppServerSession::new(
-                            crate::connect_remote_app_server(endpoint).await?,
-                            crate::app_server_session::ThreadParamsMode::Remote,
-                        );
-                        let mut tui = crate::tui::test_support::make_test_tui()?;
-                        app.clear_displayed_session(
-                            &mut tui,
-                            &mut session,
-                            /*initial_user_message*/ None,
-                            /*new_thread_name*/ None,
-                        ).await;
-                        assert_eq!(app.primary_thread_id, Some(successor));
-                        assert_eq!(app.current_displayed_thread_id(), Some(successor));
-                        if refuse {
-                            let event = tokio::time::timeout(Duration::from_secs(5), session.next_event()).await?;
-                            let Some(AppServerEvent::ServerNotification(notification)) = event else { panic!("missing clear warning") };
-                            let ServerNotification::Warning(warning) = *notification else { panic!("not a warning") };
-                            assert_eq!(warning.message, format!("Clear completed, but successor {successor} could not be retained: thread retention refused for {successor}: AuthorityUnavailable. The successor may already be closed or may close while idle."));
+async fn sidebar_event_retention_scenario() -> Result<()> {
+    use crate::app_server_session::SideChatStorage;
+    for outcome in ["installed", "boundary-failed", "stale", "discarded"] {
+        let (mut app, _, _) = make_test_app_with_channels().await;
+        app.config
+            .features
+            .set_enabled(codex_features::Feature::Plugins, false)?;
+        enable_side_retention(&mut app)?;
+        let parent = ThreadId::from_string(
+            &app_test_support::create_fake_rollout(
+                app.config.codex_home.as_path(),
+                "2026-01-01T00-00-00",
+                "2026-01-01T00:00:00Z",
+                "sidebar source",
+                Some(app.config.model_provider_id.as_str()),
+                None,
+            )
+            .expect("source rollout"),
+        )?;
+        let mut server =
+            boxed_future!(crate::start_embedded_app_server_for_picker(&app.config)).await?;
+        let started = boxed_future!(server.resume_thread(
+            &app.local_settings,
+            app.config.clone(),
+            parent,
+            crate::app_server_session::ResumeModelSettings::PreserveExistingThread,
+        ))
+        .await?;
+        app.chat_widget
+            .handle_thread_session(started.session.clone());
+        app.enqueue_primary_thread_session(started.session, started.turns)
+            .await?;
+        app.active_thread_id = Some(parent);
+        let mut fork = boxed_future!(server.sidebar_fork(
+            app.local_settings.clone(),
+            app.side_fork_config(),
+            parent,
+            None,
+            SideChatStorage::Temporary,
+        ))
+        .await?;
+        assert_eq!(fork.boundary, Ok(()));
+        assert!(fork.retention.is_some());
+        let child = fork.thread.session.thread_id;
+        let ThreadRetentionAcquireResponse::AlreadyHeld { grant_id } =
+            probe(&mut server, child).await?
+        else {
+            panic!("queued sidebar event must own a grant");
+        };
+        if outcome == "boundary-failed" {
+            // Exercise the real event/install refusal path while keeping the
+            // minting connection alive; this is not a transport-close test.
+            fork.boundary = Err("injected boundary failure".to_string());
+        }
+        let request = uuid::Uuid::new_v4();
+        let event = AppEvent::SideCreated {
+            backend_id: server.backend_id(),
+            parent,
+            request,
+            result: Ok(Box::new(fork)),
+        };
+        tokio::task::yield_now().await;
+        if outcome == "discarded" {
+            drop(event);
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    match probe(&mut server, child).await? {
+                        ThreadRetentionAcquireResponse::Acquired { .. } => {
+                            break Ok::<_, color_eyre::Report>(());
                         }
-                        session.shutdown().await?;
-                        let methods = tokio::time::timeout(Duration::from_secs(5), peer).await???;
-                        assert_eq!(methods.iter().filter(|method| method.as_str() == "thread/clear").count(), 1);
-                        assert!(methods.iter().any(|method| method == "thread/unsubscribe"));
+                        ThreadRetentionAcquireResponse::AlreadyHeld { .. } => {
+                            tokio::task::yield_now().await
+                        }
+                        other => panic!("unexpected sidebar probe: {other:?}"),
                     }
-                    Ok(())
+                }
+            })
+            .await??;
+            server.thread_unsubscribe(child).await?;
+        } else {
+            if matches!(outcome, "installed" | "boundary-failed") {
+                let pane = app.sidebars.entry(Some(parent)).or_default();
+                pane.creation = Some(super::super::sidebar::SideCreation {
+                    owner: server.backend_id(),
+                    state: super::super::sidebar::CreationState::Waiting {
+                        request,
+                        started: Instant::now(),
+                    },
+                    message: None,
+                });
+                pane.show(
+                    super::super::sidebar::SidebarContent::Chooser,
+                    super::super::sidebar::PaneFocus::Main,
+                );
+            }
+            let mut tui = crate::tui::test_support::make_test_tui()?;
+            boxed_future!(app.handle_event(&mut tui, &mut server, event)).await?;
+            assert_eq!(
+                app.side_threads.contains_key(&child),
+                outcome == "installed"
+            );
+            if outcome == "boundary-failed" {
+                assert!(matches!(
+                    app.sidebars[&Some(parent)]
+                        .creation
+                        .as_ref()
+                        .map(|creation| &creation.state),
+                    Some(super::super::sidebar::CreationState::Failed { .. })
+                ));
+            }
+            if outcome == "installed" {
+                // Revalidation waits for any earlier abandonment release. An
+                // accidental drop would mint a DIFFERENT opaque grant here.
+                let observation = server
+                    .retain_clear_successor(&child.to_string(), None)
+                    .await
+                    .expect("serialized retention revalidation");
+                assert_eq!(
+                    probe(&mut server, child).await?,
+                    ThreadRetentionAcquireResponse::AlreadyHeld {
+                        grant_id: grant_id.clone()
+                    }
+                );
+                drop(observation);
+                assert!(app.discard_side_thread(&mut server, child).await);
+            }
+            let released: codex_app_server_protocol::ThreadRetentionReleaseResponse = server
+                .request_handle()
+                .request_typed(ClientRequest::ThreadRetentionRelease {
+                    request_id: server.next_request_id(),
+                    params: codex_app_server_protocol::ThreadRetentionReleaseParams {
+                        thread_id: child.to_string(),
+                        grant_id,
+                    },
                 })
-        })?
-        .join()
-        .expect("clear retention test thread")
+                .await?;
+            assert_eq!(
+                released,
+                codex_app_server_protocol::ThreadRetentionReleaseResponse::NotHeld {}
+            );
+        }
+        server.thread_unsubscribe(parent).await?;
+        server.shutdown().await?;
+    }
+    Ok(())
 }

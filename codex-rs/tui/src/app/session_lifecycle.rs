@@ -8,19 +8,73 @@ use super::agent_picker::AGENT_PICKER_VIEW_ID;
 use super::app_server_event_targets::ServerNotificationThreadTarget;
 use super::app_server_event_targets::server_notification_thread_target;
 use super::app_server_event_targets::server_request_thread_id;
+use super::thread_attachment::ChannelMode;
+use super::thread_attachment::PreparedAttachment;
+use super::thread_attachment::Selection;
+use super::thread_attachment::SelectionMode;
 use super::*;
+use crate::app_server_session::SessionAccount;
+use crate::app_server_session::SideChatStorage;
+use crate::app_server_session::is_server_shutting_down_error;
 use crate::app_server_session::source_agent_path;
 use crate::app_server_session::thread_blocks_direct_input;
 use crate::chatwidget::ThreadInputStateRestoreMode;
+use crate::streaming::commit_tick::CommitTickScope;
+use codex_app_server_protocol::ThreadPrepareApprovedPlanParams;
+use codex_model_provider_info::OPENAI_PROVIDER_ID;
 use std::collections::HashSet;
 
 #[derive(Clone, Copy)]
 pub(super) enum ThreadAttachPresentation {
     /// A primary thread created by thread/start, without inherited history.
     Fresh,
+    /// A fresh thread whose terminal clear succeeded before its backend was adopted.
+    FreshAfterClear,
     /// A fresh thread whose startup composer is already visible.
     FreshWithDraft,
     SessionLineage,
+}
+
+/// Caller intent is separate from lifecycle metadata: unavailable predecessors
+/// use negotiated clear recovery rather than an ordinary clear-source start.
+#[derive(Clone, Copy)]
+enum FreshSessionIntent {
+    Start(Option<ThreadStartSource>),
+    ClearRecovery(Option<ThreadId>),
+}
+
+enum ClearFirstInput {
+    Message(Option<crate::chatwidget::UserMessage>),
+    ApprovedPlan(String),
+}
+
+async fn prepare_approved_plan_prompt(
+    app_server: &mut AppServerSession,
+    thread_id: ThreadId,
+    local_codex_home: &codex_utils_absolute_path::AbsolutePathBuf,
+    plan: String,
+) -> Result<String> {
+    let codex_home = app_server.codex_home_path(local_codex_home);
+    let attachment_path =
+        crate::attachment_files::write_approved_plan(app_server, codex_home.as_ref(), plan.clone())
+            .await
+            .map(|path| path.to_string())
+            .inspect_err(|err| tracing::debug!(%err, "approved plan attachment unavailable"))
+            .ok();
+    app_server
+        .thread_prepare_approved_plan(ThreadPrepareApprovedPlanParams {
+            thread_id: thread_id.to_string(),
+            markdown: plan,
+            attachment_path,
+        })
+        .await
+}
+
+pub(super) struct PreparedFreshSession {
+    pub(super) started: AppServerStartedThread,
+    pub(super) config: Config,
+    pub(super) local_settings: crate::local_settings::LocalSettings,
+    pub(super) retention: Option<crate::app_server_session::PendingRetention>,
 }
 
 /// Reports whether a loaded-thread backfill completed and which descendants already had their
@@ -134,6 +188,7 @@ impl App {
             }
         }
 
+        self.sync_active_agent_label();
         let has_non_primary_agent_thread = self
             .agent_navigation
             .has_non_primary_thread(self.primary_thread_id);
@@ -151,15 +206,8 @@ impl App {
             return;
         }
 
-        let selected = self
-            .chat_widget
-            .selected_index_for_present_view(AGENT_PICKER_VIEW_ID);
-        let params = self.agent_picker_selection_view_params(selected);
-        if !self
-            .chat_widget
-            .replace_selection_view_if_present(AGENT_PICKER_VIEW_ID, params)
-        {
-            let params = self.agent_picker_selection_view_params(selected);
+        if !self.refresh_agent_picker() {
+            let params = self.agent_picker_selection_view_params(/*selected*/ None);
             self.chat_widget.show_selection_view(params);
         }
         if let Some(primary_thread_id) = self.primary_thread_id {
@@ -168,42 +216,39 @@ impl App {
     }
 
     pub(super) fn agent_picker_selection_view_params(
-        &self,
-        selected: Option<usize>,
+        &mut self,
+        selected: Option<ThreadId>,
     ) -> SelectionViewParams {
-        let mut initial_selected_idx = selected;
-        let items: Vec<SelectionItem> = self
-            .agent_navigation
-            .ordered_threads()
+        let mut threads = self.agent_navigation.visible_threads();
+        let pending = &self.agent_navigation.pending_approvals;
+        threads.sort_by_key(|(id, _)| !pending.contains(id));
+        let mut row_ids = Vec::with_capacity(threads.len());
+        let mut initial_selected_idx = None;
+        let items: Vec<SelectionItem> = threads
             .into_iter()
             .enumerate()
             .map(|(idx, (thread_id, entry))| {
-                if initial_selected_idx.is_none() && self.active_thread_id == Some(thread_id) {
+                row_ids.push(thread_id);
+                let is_pending = pending.contains(&thread_id);
+                let is_current = self.active_thread_id == Some(thread_id);
+                if selected == Some(thread_id)
+                    || initial_selected_idx.is_none() && (is_pending || is_current)
+                {
                     initial_selected_idx = Some(idx);
                 }
-                let id = thread_id;
-                let is_primary = self.primary_thread_id == Some(thread_id);
-                let name = entry
-                    .agent_path
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|agent_path| !is_primary && !agent_path.is_empty())
-                    .map(ToOwned::to_owned)
-                    .unwrap_or_else(|| {
-                        format_agent_picker_item_name(
-                            entry.agent_nickname.as_deref(),
-                            entry.agent_role.as_deref(),
-                            is_primary,
-                        )
-                    });
+                let name = self.thread_label(thread_id);
                 let uuid = thread_id.to_string();
                 SelectionItem {
-                    name: name.clone(),
+                    name: if is_pending {
+                        format!("{name} (needs approval)")
+                    } else {
+                        name.clone()
+                    },
                     name_prefix_spans: agent_picker_status_dot_spans(entry.is_closed),
                     description: Some(uuid.clone()),
-                    is_current: self.active_thread_id == Some(thread_id),
+                    is_current,
                     actions: vec![Box::new(move |tx| {
-                        tx.send(AppEvent::SelectAgentThread(id));
+                        tx.send(AppEvent::SelectAgentThread(thread_id));
                     })],
                     dismiss_on_select: true,
                     search_value: Some(format!("{name} {uuid}")),
@@ -211,6 +256,7 @@ impl App {
                 }
             })
             .collect();
+        self.agent_navigation.picker_row_ids = row_ids;
 
         SelectionViewParams {
             view_id: Some(AGENT_PICKER_VIEW_ID),
@@ -244,10 +290,7 @@ impl App {
         })
     }
 
-    /// Updates cached picker metadata and then mirrors any visible-label change into the footer.
-    ///
-    /// These two writes stay paired so the picker rows and contextual footer continue to describe
-    /// the same displayed thread after nickname or role updates.
+    /// Cache metadata in both the picker and transcript. Callers refresh the UI after a batch.
     pub(super) fn upsert_agent_picker_thread(
         &mut self,
         thread_id: ThreadId,
@@ -262,7 +305,14 @@ impl App {
         );
         self.agent_navigation
             .upsert(thread_id, agent_nickname, agent_role, is_closed);
-        self.sync_active_agent_label();
+    }
+
+    pub(super) fn sync_agent_picker_thread(&mut self, thread_id: ThreadId) {
+        if self.agent_navigation.pending_approvals.contains(&thread_id) {
+            self.refresh_agent_picker();
+        } else {
+            self.sync_active_agent_label();
+        }
     }
 
     /// Persists the app-server's authoritative ownership flag and updates the active composer.
@@ -320,6 +370,7 @@ impl App {
                     self.agent_navigation.mark_parent_owned(thread_id);
                 }
                 self.agent_navigation.set_agent_path(thread_id, agent_path);
+                self.sync_agent_picker_thread(thread_id);
                 if is_running {
                     self.agent_navigation.mark_running(thread_id);
                 } else {
@@ -352,6 +403,7 @@ impl App {
                 }
                 self.agent_navigation
                     .set_running(thread_id, /*is_running*/ false);
+                self.sync_agent_picker_thread(thread_id);
                 true
             }
         }
@@ -367,79 +419,85 @@ impl App {
         &mut self,
         app_server: &mut AppServerSession,
         thread_id: ThreadId,
-    ) -> Result<bool> {
+    ) -> Result<(bool, Option<crate::app_server_session::PendingRetention>)> {
+        if !self.should_attach_live_thread_for_selection(thread_id) {
+            return Ok((true, None));
+        }
+
+        use crate::app_server_session::ResumeModelSettings;
+        let side = self.side_threads.get(&thread_id);
+        let resume_settings = if side.is_some_and(|side| side.storage == SideChatStorage::Attached)
+            && self
+                .agent_navigation
+                .get(&thread_id)
+                .is_some_and(|entry| entry.is_closed)
+        {
+            ResumeModelSettings::PreserveSideConversation
+        } else {
+            ResumeModelSettings::PreserveExistingThread
+        };
+        // A previously installed, writable saved side chat keeps its interactive ownership
+        // when its writer has to be reloaded (for example after an archive failed).
+        let reopen_saved = side.is_some_and(|side| side.storage == SideChatStorage::Attached)
+            && !self.agent_navigation.is_parent_owned(thread_id)
+            && self
+                .thread_event_channels
+                .get(&thread_id)
+                .is_some_and(|channel| {
+                    channel
+                        .backend_id
+                        .is_none_or(|owner| owner == app_server.backend_id())
+                        && channel.attachment() == ThreadEventAttachment::ReplayOnly
+                });
+        let (prepared, retention) = super::thread_attachment::prepare_for_adoption(
+            app_server,
+            &self.local_settings,
+            &self.config,
+            thread_id,
+            resume_settings,
+            reopen_saved,
+        )
+        .await?;
+        let live = self
+            .install_thread_attachment(app_server, thread_id, prepared, ChannelMode::ReplaceLive)
+            .await;
+        Ok((live, retention))
+    }
+
+    pub(super) async fn install_thread_attachment(
+        &mut self,
+        app_server: &mut AppServerSession,
+        thread_id: ThreadId,
+        prepared: PreparedAttachment,
+        channel_mode: ChannelMode<'_>,
+    ) -> bool {
+        let incoming = match channel_mode {
+            ChannelMode::ReplaceLive => None,
+            ChannelMode::Reuse(updates) => Some(updates),
+        };
+        let closed = incoming
+            .is_some_and(|updates| updates.close == super::thread_attachment::CloseState::Closed);
         let was_external_writer = self
             .thread_event_channels
             .get(&thread_id)
             .is_some_and(|channel| channel.attachment() == ThreadEventAttachment::ExternalWriter);
-        if self
-            .thread_event_channels
-            .get(&thread_id)
-            .is_some_and(|channel| channel.attachment() == ThreadEventAttachment::Live)
-        {
-            return Ok(true);
-        }
-
-        let (session, turns, live_attached) = match app_server
-            .observe_thread(
-                &self.local_settings,
-                self.config.clone(),
-                thread_id,
-                crate::app_server_session::ResumeModelSettings::PreserveExistingThread,
-            )
-            .await
-        {
-            Ok(started) => {
+        let (mut session, turns, live_attached) = match prepared {
+            PreparedAttachment::Live(started) => {
                 if let Some(entry) = self.agent_navigation.get(&thread_id).cloned() {
                     self.upsert_agent_picker_thread(
                         thread_id,
                         entry.agent_nickname,
                         entry.agent_role,
-                        /*is_closed*/ false,
+                        closed,
                     );
+                    self.sync_agent_picker_thread(thread_id);
                 }
                 if started.blocks_direct_input {
                     self.agent_navigation.mark_parent_owned(thread_id);
                 }
                 (started.session, started.turns, true)
             }
-            Err(resume_err) => {
-                tracing::warn!(
-                    thread_id = %thread_id,
-                    error = %resume_err,
-                    "failed to resume live thread for selection; falling back to thread/read"
-                );
-                let mut thread = app_server
-                    .thread_read(thread_id, /*include_turns*/ false)
-                    .await?;
-                if thread.ephemeral {
-                    return Err(color_eyre::eyre::eyre!(
-                        "Agent thread {thread_id} is not yet available for replay or live attach."
-                    ));
-                }
-                match app_server
-                    .hydrate_initial_thread_history(
-                        &mut thread,
-                        /*turn_cursor*/ None,
-                        /*item_cursor*/ None,
-                        Some(&self.config),
-                        Some(&self.local_settings),
-                        crate::app_server_session::HistoryHydrationScope::Initial,
-                    )
-                    .await
-                {
-                    Ok(()) => {}
-                    Err(err) if Self::can_fallback_from_include_turns_error(&err) => {}
-                    Err(err) => return Err(err),
-                }
-                let turns = thread.turns.clone();
-                if turns.is_empty() {
-                    // A `thread/read` fallback without turns would create a blank local replay
-                    // channel with no live listener attached, which blocks later real re-attach.
-                    return Err(color_eyre::eyre::eyre!(
-                        "Agent thread {thread_id} is not yet available for replay or live attach."
-                    ));
-                }
+            PreparedAttachment::ReplayOnly(thread) => {
                 let mut session = self.session_state_for_thread_read(thread_id, &thread).await;
                 // Reads have no settings. Keep this cached thread's permissions rather than
                 // inferring them from the conversation that is currently displayed.
@@ -454,22 +512,47 @@ impl App {
                 // `thread/read` can seed replay state, but it does not attach the app-server
                 // listener that `thread/resume` establishes, so treat this path as replay-only.
                 session.model.clear();
-                (session, turns, false)
+                if was_external_writer {
+                    app_server.freeze_viewed_receipt(thread_id);
+                }
+                (session, thread.turns, false)
             }
         };
-        self.agents_overview.activity.remove(&thread_id);
-        let recap_progress =
-            if live_attached && let Some(channel) = self.thread_event_channels.remove(&thread_id) {
-                let store = channel.store.lock().await;
-                if let Some(input) = store.input_state.clone() {
-                    self.agents_overview.input_states.insert(thread_id, input);
+        let live_attached = live_attached && !closed;
+        if self.side_threads.contains_key(&thread_id) {
+            session.forked_from_id = None;
+            session.fork_parent_title = None;
+            session.daybreak_enabled = false;
+        }
+        // A reattach can discover output missed while the server was disconnected.
+        let replay_may_have_output = if self.side_companions.contains_key(&thread_id) {
+            match self.thread_event_channels.get(&thread_id) {
+                Some(channel) => {
+                    let store = channel.store.lock().await;
+                    store.replay_may_have_output || store.session.is_none() || store.turns != turns
                 }
-                store.recap_progress()
-            } else {
-                Default::default()
-            };
+                None => true,
+            }
+        } else {
+            false
+        };
+        self.agents_overview.activity.remove(&thread_id);
+        let recap_progress = if incoming.is_none()
+            && live_attached
+            && let Some(channel) = self.thread_event_channels.remove(&thread_id)
+        {
+            let store = channel.store.lock().await;
+            if let Some(input) = store.input_state.clone() {
+                self.agents_overview.input_states.insert(thread_id, input);
+            }
+            store.recap_progress()
+        } else {
+            Default::default()
+        };
         let channel = self.ensure_thread_channel(thread_id);
-        if !live_attached {
+        if live_attached {
+            channel.mark_live();
+        } else {
             if was_external_writer {
                 channel.mark_external_writer();
             } else {
@@ -477,24 +560,49 @@ impl App {
             }
         }
         let mut store = channel.store.lock().await;
+        if let Some(settings) = incoming.and_then(|updates| updates.settings.as_ref()) {
+            super::thread_settings::apply_thread_settings_to_session(&mut session, settings);
+        }
+        let live_turn = incoming.filter(|updates| updates.turn_changed).map(|_| {
+            (
+                store.active_turn_id.clone(),
+                store.latest_turn_id.clone(),
+                store.evicted_active_turn.take(),
+                store.active_reasoning_item.clone(),
+            )
+        });
         store.set_session(session, turns);
+        if let Some((active, latest, evicted, reasoning)) = live_turn {
+            store.active_turn_id = active;
+            store.latest_turn_id = latest;
+            store.evicted_active_turn = evicted;
+            store.active_reasoning_item = reasoning;
+        }
+        if closed {
+            store.clear_active_turn_id();
+            store.active_reasoning_item = None;
+            store.pending_interrupt_turn_id = None;
+        }
+        store.replay_may_have_output |= replay_may_have_output;
         store.merge_recap_progress(recap_progress);
         store.rebase_buffer_after_session_refresh();
-        Ok(live_attached)
+        live_attached
     }
 
-    /// Replaces the chat widget, carrying the editor yank and re-seeding collab metadata from the
-    /// navigation cache.
+    /// Replaces the chat widget, carrying composer preferences and the editor yank, and
+    /// re-seeding collab metadata from the navigation cache.
     ///
     /// Thread switches reconstruct the `ChatWidget`, which loses the `collab_agent_metadata` map.
     /// This helper copies every known nickname/role from `AgentNavigationState` into the
     /// replacement widget so that replayed collab items render agent names immediately.
     pub(super) fn replace_chat_widget(&mut self, mut chat_widget: ChatWidget) {
+        chat_widget.inherit_view_transition_key_guard(&mut self.chat_widget);
+        chat_widget.fork_in_progress = self.chat_widget.fork_in_progress;
         self.pending_right_click_paste = None;
+        self.config_notification_test_pending = None;
         if !self.chat_widget.realtime_conversation_is_running() {
             self.retain_realtime_replay_state_before_replace();
         }
-        chat_widget.cyber_policy_notice = self.chat_widget.cyber_policy_notice.clone();
         self.commit_animation = None;
         // Transfer the last-written terminal title to the replacement widget
         // so it knows what OSC title is currently displayed. Without this, the
@@ -504,6 +612,7 @@ impl App {
         if chat_widget.last_terminal_title.is_none() {
             chat_widget.last_terminal_title = previous_terminal_title;
         }
+        chat_widget.config_panel_tui = self.chat_widget.config_panel_tui.clone();
         chat_widget.remote_connection = self.chat_widget.remote_connection.clone();
         chat_widget.snapshot_local_images = self.app_server_target.uses_remote_workspace();
         chat_widget.set_local_worktree_operations(self.chat_widget.local_worktree_operations);
@@ -514,11 +623,15 @@ impl App {
             chat_widget.windows_sandbox_elevated_setup_complete =
                 self.chat_widget.windows_sandbox_elevated_setup_complete;
         }
-        chat_widget.set_agents_navigation_enabled(matches!(
-            self.app_server_target,
-            AppServerTarget::LocalDaemon { .. }
-        ));
-        chat_widget.inherit_backend_banner_state(&mut self.chat_widget);
+        if chat_widget.status_account_display() == self.chat_widget.status_account_display()
+            && chat_widget.has_chatgpt_account() == self.chat_widget.has_chatgpt_account()
+        {
+            chat_widget.inherit_backend_banner_state(&mut self.chat_widget);
+            chat_widget.inherit_security_setup(&mut self.chat_widget);
+        }
+        chat_widget
+            .mention_usage_mut()
+            .inherit(self.chat_widget.mention_usage_mut());
         for (thread_id, entry) in self.agent_navigation.ordered_threads() {
             chat_widget.set_collab_agent_metadata(
                 thread_id,
@@ -533,7 +646,7 @@ impl App {
             previous.park_voice();
             self.background_voice = Some(Box::new(previous));
         }
-        self.sync_active_agent_label();
+        self.refresh_agent_picker();
     }
 
     pub(super) async fn select_agent_thread(
@@ -542,6 +655,18 @@ impl App {
         app_server: &mut AppServerSession,
         thread_id: ThreadId,
     ) -> Result<()> {
+        if self
+            .side_threads
+            .get(&thread_id)
+            .is_some_and(|side| side.close_request.is_some())
+        {
+            self.chat_widget.add_info_message(
+                "Side chat is still closing. Try again in a moment.".to_string(),
+                /*hint*/ None,
+            );
+            return Ok(());
+        }
+
         let pending_profile_on_unavailable_thread = self.thread_unavailable(thread_id)
             && self.pending_server_profiles.contains_key(&thread_id);
         let cached_session = if self.thread_unavailable(thread_id) {
@@ -557,14 +682,7 @@ impl App {
         if self.active_thread_id == Some(thread_id) && !self.thread_unavailable(thread_id) {
             return Ok(());
         }
-        if self.reject_pending_permission_root_switch() {
-            return Ok(());
-        }
-        if self.windows_sandbox_blocks_thread_switch() {
-            self.chat_widget.add_info_message(
-                "Finish Windows sandbox setup before switching threads.".to_string(),
-                /*hint*/ None,
-            );
+        if !self.can_select_thread() {
             return Ok(());
         }
         if self.active_thread_id == Some(thread_id) {
@@ -572,10 +690,16 @@ impl App {
             self.store_active_thread_receiver().await;
         }
 
-        // A tracked side thread stays loaded until it is explicitly discarded and already has a
-        // replay channel, so another liveness read cannot add anything before selection.
-        if !(self.side_threads.contains_key(&thread_id)
-            && self.thread_event_channels.contains_key(&thread_id)
+        let known_side = self.side_threads.contains_key(&thread_id)
+            && self.thread_event_channels.contains_key(&thread_id);
+        // The live parent already receives lifecycle notifications while its child has focus.
+        let live_parent = self.side_retention_enabled(tui)
+            && !self.reconnect.offline
+            && self.primary_thread_id == Some(thread_id)
+            && self.active_side_parent_thread_id() == Some(thread_id)
+            && !self.should_attach_live_thread_for_selection(thread_id);
+        if !(known_side
+            || live_parent
             || self
                 .refresh_agent_picker_thread_liveness(app_server, thread_id)
                 .await)
@@ -585,23 +709,19 @@ impl App {
             ));
             return Ok(());
         }
-        let mut is_replay_only = self
-            .agent_navigation
-            .get(&thread_id)
-            .is_some_and(|entry| entry.is_closed);
-        let mut attached_replay_only = false;
-        if self.should_attach_live_thread_for_selection(thread_id) {
+        let mut retention = None;
+        let mode = if self.should_attach_live_thread_for_selection(thread_id) {
             match self
                 .attach_live_thread_for_selection(app_server, thread_id)
                 .await
             {
-                Ok(live_attached) => {
-                    attached_replay_only = !live_attached;
-                    is_replay_only = attached_replay_only;
+                Ok((true, pending)) => {
+                    retention = pending;
+                    SelectionMode::Live
                 }
+                Ok((false, _)) => SelectionMode::ReplayOnly,
                 Err(_) if self.thread_event_channels.contains_key(&thread_id) => {
-                    is_replay_only = true;
-                    attached_replay_only = true;
+                    SelectionMode::ReplayOnly
                 }
                 Err(err) => {
                     self.add_agents_overview_error(format!(
@@ -610,12 +730,63 @@ impl App {
                     return Ok(());
                 }
             }
-        } else if !self.thread_event_channels.contains_key(&thread_id) && is_replay_only {
-            self.add_agents_overview_error(format!(
-                "Agent thread {thread_id} is no longer available."
-            ));
-            return Ok(());
+        } else if self
+            .agent_navigation
+            .get(&thread_id)
+            .is_some_and(|entry| entry.is_closed)
+        {
+            SelectionMode::Closed
+        } else {
+            SelectionMode::Live
+        };
+        self.commit_thread_selection(
+            tui,
+            app_server,
+            thread_id,
+            Selection {
+                mode,
+                cached_session,
+                pending_profile_on_unavailable_thread,
+            },
+        )
+        .await?;
+        if let Some(retention) = retention
+            && self.current_displayed_thread_id() == Some(thread_id)
+            && !self.agent_navigation.is_parent_owned(thread_id)
+        {
+            retention.commit();
         }
+        Ok(())
+    }
+
+    pub(super) fn can_select_thread(&mut self) -> bool {
+        if self.reject_pending_permission_root_switch() {
+            return false;
+        }
+        if self.windows_sandbox_blocks_thread_switch() {
+            self.chat_widget.add_info_message(
+                "Finish Windows sandbox setup before switching threads.".to_string(),
+                /*hint*/ None,
+            );
+            return false;
+        }
+        true
+    }
+
+    pub(super) async fn commit_thread_selection(
+        &mut self,
+        tui: &mut tui::Tui,
+        app_server: &mut AppServerSession,
+        thread_id: ThreadId,
+        selection: Selection,
+    ) -> Result<()> {
+        let Selection {
+            mode,
+            cached_session,
+            pending_profile_on_unavailable_thread,
+        } = selection;
+        let mut is_replay_only = mode != SelectionMode::Live;
+        let mut attached_replay_only = mode == SelectionMode::ReplayOnly;
         let previous_thread_id = self.active_thread_id;
         // Notifications already routed to the active channel must reach the old
         // widget before its transcript state is transferred. Events routed after
@@ -702,7 +873,53 @@ impl App {
         self.recap.seed_from_progress(recap_progress, now);
         self.schedule_recap_check(thread_id, now);
 
+        // Draining the old receiver can queue history insertions and stream consolidation.
+        // Park the transcript after those events and before the destination's reset and replay.
+        if self.side_retention_enabled(tui)
+            && self.pending_thread_switch_resets == 0
+            && let Some(old) = previous_thread_id
+            && old != thread_id
+            && let Some(pair) = self.side_pair_key(old)
+        {
+            let conversation_width = self
+                .conversation_area(tui.terminal.last_known_screen_size.into())
+                .width;
+            self.sync_owned_transcript(conversation_width);
+            let width = self.transcript_view.remaining_area().width.max(1);
+            let (stream, display) = self.chat_widget.take_side_display(width);
+            self.app_event_tx.send(AppEvent::ParkSideCompanion {
+                pair,
+                thread_id: old,
+                stream,
+                display,
+            });
+        }
         self.render_thread_snapshot(tui, app_server, thread_id, snapshot, !is_replay_only)?;
+        if !is_replay_only
+            && let Some(message) = self
+                .side_threads
+                .get_mut(&thread_id)
+                .and_then(|side| side.opening_message.take())
+        {
+            self.chat_widget
+                .submit_user_message_as_plain_user_turn(message);
+        }
+        if self.side_retention_enabled(tui) {
+            if self.side_threads.contains_key(&thread_id) {
+                self.sidebar_mut().show(
+                    sidebar::SidebarContent::Chat(thread_id),
+                    sidebar::PaneFocus::Sidebar,
+                );
+            } else if let Some(sidebar::SidebarContent::Chat(child)) = self
+                .sidebar()
+                .and_then(sidebar::SidebarPane::visible_content)
+            {
+                self.sidebar_mut().show(
+                    sidebar::SidebarContent::Chat(child),
+                    sidebar::PaneFocus::Main,
+                );
+            }
+        }
         if is_replay_only
             && self
                 .thread_event_channels
@@ -732,6 +949,16 @@ impl App {
         snapshot: ThreadEventSnapshot,
         resume_restored_queue: bool,
     ) -> Result<()> {
+        let retain_side_view = self.side_retention_enabled(tui);
+        let side_parent = |id| {
+            self.side_threads
+                .get(&self.side_pair_key(id)?)
+                .map(|side| side.parent_thread_id)
+        };
+        let preserve_screen = retain_side_view
+            && side_parent(thread_id).is_some_and(|parent| {
+                self.chat_widget.thread_id().and_then(side_parent) == Some(parent)
+            });
         let init = self.chatwidget_init_for_forked_or_resumed_thread(
             tui,
             self.config.clone(),
@@ -752,25 +979,60 @@ impl App {
         if self.agent_navigation.is_parent_owned(thread_id) {
             self.chat_widget.set_parent_owned_thread();
         }
-        self.reset_for_thread_switch(tui)?;
+        if retain_side_view {
+            // Even a superseding selection must leave queued history its original cells and view.
+            tui.clear_pending_history_lines();
+            if !preserve_screen {
+                tui.clear_for_thread_switch()?;
+            }
+        } else {
+            self.reset_for_thread_switch(tui)?;
+        }
         self.pending_thread_switch_resets += 1;
-        self.app_event_tx
-            .send(AppEvent::ResetTranscriptForThreadSwitch);
+        self.app_event_tx.send(if preserve_screen {
+            AppEvent::ResetTranscriptForThreadSwitchPreservingScreen
+        } else {
+            AppEvent::ResetTranscriptForThreadSwitch
+        });
         self.replay_thread_snapshot(snapshot, resume_restored_queue);
+        self.app_event_tx
+            .send(AppEvent::RestoreBackgroundTerminals(thread_id));
+        if let Some(thread_id) = self.chat_widget.thread_id()
+            && let Some(active) = self
+                .chat_widget
+                .config_ref()
+                .permissions
+                .active_permission_profile()
+            && self
+                .agents_overview
+                .selected_permission_profiles
+                .get(&thread_id)
+                == Some(&active.id)
+        {
+            self.adopt_server_permissions();
+        }
         if external_writer {
             self.chat_widget.show_external_writer_thread();
+        }
+        if retain_side_view {
+            // Hold drawing and input through the history events emitted by replay.
+            self.chat_widget
+                .run_commit_tick_with_scope(CommitTickScope::Replay);
+            self.pending_thread_switch_resets += 1;
+            self.app_event_tx
+                .send(AppEvent::SideReplayFinished(thread_id));
         }
         Ok(())
     }
 
     pub(super) fn should_attach_live_thread_for_selection(&self, thread_id: ThreadId) -> bool {
-        self.thread_event_channels
+        self.agent_navigation
             .get(&thread_id)
-            .is_none_or(|channel| channel.attachment() != ThreadEventAttachment::Live)
-            && self
-                .agent_navigation
+            .is_some_and(|entry| entry.is_closed)
+            || self
+                .thread_event_channels
                 .get(&thread_id)
-                .is_none_or(|entry| !entry.is_closed || self.thread_unavailable(thread_id))
+                .is_none_or(|channel| channel.attachment() != ThreadEventAttachment::Live)
     }
 
     pub(super) fn reset_for_thread_switch(&mut self, tui: &mut tui::Tui) -> Result<()> {
@@ -781,18 +1043,35 @@ impl App {
 
     pub(super) async fn reset_thread_event_state(&mut self) {
         let voice_owner = self.voice_owner_thread_id();
+        let mut previous_pending = std::mem::take(&mut self.pending_app_server_requests);
+        // Move retained tasks' approvals to background routing before clearing request bookkeeping.
+        for (thread_id, requests) in &mut self.agents_overview.dispatched_requests {
+            if let Some(channel) = self.thread_event_channels.get(thread_id) {
+                for request in channel.store.lock().await.pending_replay_requests() {
+                    if !requests
+                        .iter()
+                        .any(|pending| pending.request.id() == request.id())
+                        && let Some(request) = previous_pending.buffered_request(request)
+                    {
+                        requests.push(request);
+                    }
+                }
+            }
+        }
         if voice_owner.is_some() {
             for (thread_id, channel) in &self.thread_event_channels {
-                if Some(*thread_id) != voice_owner {
+                if Some(*thread_id) != voice_owner && !self.side_threads.contains_key(thread_id) {
                     for request in channel.store.lock().await.pending_replay_requests() {
-                        self.pending_app_server_requests
-                            .resolve_notification(&thread_id.to_string(), request.id());
+                        previous_pending.resolve_notification(&thread_id.to_string(), request.id());
                     }
                 }
             }
         }
         self.thread_event_listener_tasks.retain(|id, task| {
-            if Some(*id) == voice_owner {
+            if Some(*id) == voice_owner
+                || self.side_threads.contains_key(id)
+                || self.agents_overview.dispatched_requests.contains_key(id)
+            {
                 true
             } else {
                 task.abort();
@@ -800,14 +1079,22 @@ impl App {
             }
         });
         self.thread_event_channels
-            .retain(|id, _| Some(*id) == voice_owner);
+            .retain(|id, _| Some(*id) == voice_owner || self.side_threads.contains_key(id));
+        // A retained side can still display its parent even after the parent channel is detached.
+        self.side_companions.retain(|id, _| {
+            self.side_threads.contains_key(id)
+                || self
+                    .side_threads
+                    .values()
+                    .any(|side| side.parent_thread_id == *id)
+        });
+        self.sidebars.remove(&None);
         self.pending_realtime_speech_replay.clear();
         self.pending_realtime_transcript_replay.clear();
         self.realtime_replay_order.clear();
         self.pending_server_profiles.clear();
         self.agents_overview.activity.clear();
         self.agent_navigation.clear();
-        self.side_threads.clear();
         self.active_thread_id = None;
         self.active_thread_rx = None;
         self.primary_thread_id = None;
@@ -815,7 +1102,20 @@ impl App {
         self.primary_session_configured = None;
         self.pending_primary_events.clear();
         if voice_owner.is_none() {
-            self.pending_app_server_requests.clear();
+            let side_thread_ids: Vec<_> = self.side_threads.keys().copied().collect();
+            for thread_id in side_thread_ids {
+                if let Some(channel) = self.thread_event_channels.get(&thread_id) {
+                    for request in channel.store.lock().await.pending_replay_requests() {
+                        if let Some(request) = previous_pending.buffered_request(request) {
+                            let _ = self
+                                .pending_app_server_requests
+                                .note_buffered_request(&request);
+                        }
+                    }
+                }
+            }
+        } else {
+            self.pending_app_server_requests = previous_pending;
         }
         self.pending_startup_thread_start = false;
         self.pending_server_version_notice = None;
@@ -823,14 +1123,37 @@ impl App {
         self.sync_active_agent_label();
     }
 
-    pub(super) async fn handle_startup_thread_started(
+    pub(super) async fn handle_pending_startup_thread_started(
         &mut self,
         app_server: &mut AppServerSession,
         result: Result<crate::app_server_session::PendingStartupThread>,
     ) -> Result<()> {
+        let (result, retention) = match result {
+            Ok(pending) => (Ok(pending.started), pending.retention),
+            Err(error) => (Err(error), None),
+        };
+        self.install_startup_thread(app_server, result, retention)
+            .await
+    }
+
+    #[cfg(test)]
+    pub(super) async fn handle_startup_thread_started(
+        &mut self,
+        app_server: &mut AppServerSession,
+        result: Result<AppServerStartedThread>,
+    ) -> Result<()> {
+        self.install_startup_thread(app_server, result, None).await
+    }
+
+    async fn install_startup_thread(
+        &mut self,
+        app_server: &mut AppServerSession,
+        result: Result<AppServerStartedThread>,
+        retention: Option<crate::app_server_session::PendingRetention>,
+    ) -> Result<()> {
         if !self.pending_startup_thread_start {
             if let Ok(started) = result {
-                let thread_id = started.started.session.thread_id;
+                let thread_id = started.session.thread_id;
                 if let Err(err) = app_server.thread_unsubscribe(thread_id).await {
                     tracing::warn!(
                         thread_id = %thread_id,
@@ -842,11 +1165,23 @@ impl App {
             return Ok(());
         }
 
+        // A refusal proves no thread was created.
+        if let Err(error) = &result
+            && matches!(
+                error.downcast_ref::<TypedRequestError>(),
+                Some(TypedRequestError::Server { method, source })
+                    if method == "thread/start" && is_server_shutting_down_error(source)
+            )
+            && self.begin_reconnect_for_rejected_startup()
+        {
+            return Ok(());
+        }
+
         self.pending_startup_thread_start = false;
         self.chat_widget
             .set_queue_submissions_until_session_configured(/*queue*/ false);
         match result {
-            Ok(crate::app_server_session::PendingStartupThread { started, retention }) => {
+            Ok(started) => {
                 self.chat_widget.mark_fresh_task_for_sparkle(&started);
                 let thread_id = started.session.thread_id;
                 if started.task_tools_available {
@@ -865,31 +1200,22 @@ impl App {
                     ThreadBufferedEvent::HistoryEntryResponse(_)
                     | ThreadBufferedEvent::FeedbackSubmission(_) => true,
                 });
-                self.pending_app_server_requests.clear();
-                let mut unsupported_requests = Vec::new();
+                let previous_pending = std::mem::take(&mut self.pending_app_server_requests);
                 for event in &self.pending_primary_events {
-                    if let ThreadBufferedEvent::Request(request) = event
-                        && let Some(unsupported) = self
-                            .pending_app_server_requests
-                            .note_server_request(request)
-                    {
-                        unsupported_requests.push(unsupported);
-                    }
-                }
-                for unsupported in unsupported_requests {
-                    self.pending_primary_events.retain(|event| {
-                        !matches!(event, ThreadBufferedEvent::Request(request)
-                            if request.id() == &unsupported.request_id)
-                    });
-                    if let Err(error) = self
-                        .reject_app_server_request(
-                            app_server,
-                            unsupported.request_id,
-                            unsupported.message,
-                        )
-                        .await
-                    {
-                        tracing::warn!("{error}");
+                    if let ThreadBufferedEvent::Request(request) = event {
+                        let retained = previous_pending.buffered_request((**request).clone());
+                        #[cfg(test)]
+                        let retained = retained.or_else(|| {
+                            Some(super::app_server_requests::BufferedServerRequest::new(
+                                (**request).clone(),
+                                &app_server.request_handle(),
+                            ))
+                        });
+                        if let Some(request) = retained {
+                            let _ = self
+                                .pending_app_server_requests
+                                .note_buffered_request(&request);
+                        }
                     }
                 }
                 if started.blocks_direct_input {
@@ -897,7 +1223,6 @@ impl App {
                 }
                 // Lifecycle notifications may arrive before the thread/start response.
                 if !self.config.ephemeral
-                    && !matches!(self.app_server_target, AppServerTarget::Embedded)
                     && !self.pending_primary_events.iter().any(|event| {
                         matches!(event, ThreadBufferedEvent::Notification(notification)
                             if matches!(notification.as_ref(),
@@ -914,10 +1239,32 @@ impl App {
                 // A full usage read can finish before thread/start. Apply its cached fallback
                 // after attachment but before the initial prompt or queued draft is submitted.
                 let recovery_was_pending = self.chat_widget.hold_rate_limit_recovery();
+                if self.loader_overrides.user_config_profile.is_none() {
+                    self.chat_widget.accept_startup_approval_policy(
+                        &mut self.config.permissions.approval_policy,
+                        started.session.approval_policy,
+                    )?;
+                }
                 self.enqueue_primary_thread_session(started.session, started.turns)
                     .await?;
-                retention.commit();
+                if let Some(retention) = retention {
+                    retention.commit();
+                }
                 self.apply_backend_banner_fallback(app_server).await;
+                if let Some(model) = self.harness_overrides.model.as_deref()
+                    && model == self.chat_widget.current_model()
+                    && self.chat_widget.has_chatgpt_account()
+                    && self.chat_widget.config_ref().model_provider_id == OPENAI_PROVIDER_ID
+                    && !self
+                        .model_catalog
+                        .models
+                        .iter()
+                        .any(|preset| preset.model == model)
+                {
+                    self.chat_widget.add_to_history(history_cell::new_visible_warning_event(format!(
+                        "Your ChatGPT model list doesn't include `{model}`. Check the spelling or use /model to choose another model."
+                    )));
+                }
                 if let Some(notice) = self.pending_server_version_notice.take() {
                     self.chat_widget.add_server_version_warning(notice);
                 }
@@ -946,32 +1293,31 @@ impl App {
         Ok(())
     }
 
-    #[cfg(test)]
     pub(super) async fn start_fresh_session(
         &mut self,
         tui: &mut tui::Tui,
         app_server: &mut AppServerSession,
+        session_start_source: Option<ThreadStartSource>,
         initial_user_message: Option<crate::chatwidget::UserMessage>,
         new_thread_name: Option<String>,
-        session_start_source: Option<codex_app_server_protocol::ThreadStartSource>,
     ) {
-        self.start_fresh_session_with_summary_hint(
+        self.start_fresh_session_with_intent(
             tui,
             app_server,
+            FreshSessionIntent::Start(session_start_source),
             initial_user_message,
             new_thread_name,
-            session_start_source,
         )
         .await;
     }
 
-    pub(super) async fn start_fresh_session_with_summary_hint(
+    async fn start_fresh_session_with_intent(
         &mut self,
         tui: &mut tui::Tui,
         app_server: &mut AppServerSession,
+        intent: FreshSessionIntent,
         initial_user_message: Option<crate::chatwidget::UserMessage>,
         new_thread_name: Option<String>,
-        session_start_source: Option<codex_app_server_protocol::ThreadStartSource>,
     ) {
         if self.reject_pending_permission_root_switch() {
             if let Some(message) = initial_user_message {
@@ -979,141 +1325,268 @@ impl App {
             }
             return;
         }
+        // Resolve trust before loading defaults and applying explicit permission choices.
+        if self.current_displayed_thread_id().is_none() {
+            let mut config = self.chat_widget.config_ref().clone();
+            let cwd = config.cwd.to_path_buf();
+            if let Err(control) = self
+                .confirm_directory_trust(
+                    tui,
+                    app_server,
+                    &mut config,
+                    &cwd,
+                    crate::onboarding::DirectoryTrustOptions::default(),
+                    /*startup_draft*/ None,
+                )
+                .await
+            {
+                if matches!(control, AppRunControl::Exit(_)) {
+                    self.app_event_tx.send(AppEvent::Exit(ExitMode::Immediate));
+                }
+                return;
+            }
+        }
         // Start a fresh in-memory session while preserving resumability via persisted rollout
         // history. If an initial message is provided, `enqueue_primary_thread_session` suppresses it
         // until the new session is configured and any replayed turns have been rendered.
-        let mut config = match self.load_new_session_config(app_server).await {
-            Ok(config) => config,
-            Err(err) => {
-                if let Some(message) = initial_user_message {
-                    self.chat_widget.restore_user_message_to_composer(message);
-                }
-                self.chat_widget
-                    .add_error_message(format!("Failed to read new session defaults: {err}"));
-                tui.frame_requester().schedule_frame();
-                return;
-            }
-        };
-        apply_managed_new_thread_defaults(
-            &mut config,
-            app_server.managed_new_thread_defaults(),
-            &self.cli_kv_overrides,
-            &self.harness_overrides,
-        );
-        let summary = session_summary(
-            self.chat_widget.token_usage(),
-            self.chat_widget.thread_id(),
-            self.chat_widget.thread_name(),
-            self.chat_widget.rollout_path().as_deref(),
-        );
-        let started =
-            if session_start_source == Some(codex_app_server_protocol::ThreadStartSource::Clear) {
-                app_server
-                    .start_clear_recovery(
-                        &self.local_settings,
-                        &config,
-                        self.current_displayed_thread_id(),
-                    )
-                    .await
-            } else {
-                app_server
-                    .start_thread_with_session_start_source(
-                        &self.local_settings,
-                        &config,
-                        session_start_source,
-                        /*clear_predecessor_thread_id*/ None,
-                        /*remote_cwd_override*/ None,
-                        /*selected_profile*/ None,
-                    )
-                    .await
-            };
-        match started {
-            Ok(mut started) => {
-                if let Some(thread_id) = self.current_displayed_thread_id()
-                    && let Some(blank) = self.agents_overview.blank_sessions.get_mut(&thread_id)
-                {
-                    if let Some(channel) = self.thread_event_channels.get(&thread_id)
-                        && let Some(session) = channel.store.lock().await.session.as_ref()
-                    {
-                        blank.session = session.clone();
-                    }
-                    if let Some(input) = self.chat_widget.capture_thread_input_state() {
-                        self.agents_overview.input_states.insert(thread_id, input);
-                    }
-                }
-                self.detach_current_thread_for_navigation(
+        match self.prepare_fresh_session(app_server, intent).await {
+            Ok(prepared) => {
+                self.adopt_fresh_session(
+                    tui,
                     app_server,
-                    Some(started.session.thread_id),
+                    prepared,
+                    ThreadAttachPresentation::Fresh,
+                    initial_user_message,
+                    new_thread_name,
                 )
                 .await;
-                self.local_settings = self.local_settings.reloaded(&config);
-                self.refresh_server_version_overview_notice(CODEX_CLI_VERSION);
-                self.config = config;
-
-                let name_error = if let Some(name) = new_thread_name {
-                    match app_server
-                        .thread_set_name(started.session.thread_id, name.clone())
-                        .await
-                    {
-                        Ok(()) => {
-                            started.session.thread_name = Some(name);
-                            None
-                        }
-                        Err(err) => Some(format!("Failed to name the new session: {err}")),
-                    }
-                } else {
-                    None
-                };
-                let thread_id = started.session.thread_id;
-                if !self.config.ephemeral
-                    && !matches!(self.app_server_target, AppServerTarget::Embedded)
-                {
-                    self.agents_overview
-                        .blank_sessions
-                        .insert(thread_id, started.clone());
-                }
-                if let Err(err) = self
-                    .replace_chat_widget_with_app_server_thread(
-                        tui,
-                        started,
-                        ThreadAttachPresentation::Fresh,
-                        initial_user_message,
-                    )
-                    .await
-                {
-                    self.agents_overview.blank_sessions.remove(&thread_id);
-                    self.chat_widget.add_error_message(format!(
-                        "Failed to attach to fresh app-server thread: {err}"
-                    ));
-                } else {
-                    if let Some(err) = name_error {
-                        self.chat_widget.add_error_message(err);
-                    }
-                    if let Some(summary) = summary {
-                        let mut lines: Vec<Line<'static>> = Vec::new();
-                        if let Some(usage_line) = summary.usage_line {
-                            lines.push(usage_line.into());
-                        }
-                        if let Some(command) = summary.resume_hint {
-                            lines.push(
-                                vec!["To continue this session, run ".into(), command.cyan()]
-                                    .into(),
-                            );
-                        }
-                        self.chat_widget.add_plain_history_lines(lines);
-                    }
-                }
             }
             Err(err) => {
-                self.chat_widget.add_error_message(format!(
-                    "Failed to start a fresh session through the app server: {err}"
-                ));
+                self.chat_widget.add_error_message(err.to_string());
                 if let Some(message) = initial_user_message {
                     self.chat_widget.restore_user_message_to_composer(message);
                 }
             }
         }
         tui.frame_requester().schedule_frame();
+    }
+
+    async fn prepare_fresh_session(
+        &mut self,
+        app_server: &mut AppServerSession,
+        intent: FreshSessionIntent,
+    ) -> Result<PreparedFreshSession> {
+        let (config, local_settings) =
+            crate::boxed_future!(self.load_new_session_config(app_server))
+                .await
+                .map_err(|err| {
+                    color_eyre::eyre::eyre!("Failed to read new session defaults: {err}")
+                })?;
+        let (started, retention) = match intent {
+            FreshSessionIntent::ClearRecovery(predecessor) => {
+                let (started, retention) = app_server
+                    .start_clear_recovery(&local_settings, &config, predecessor)
+                    .await?;
+                (started, retention)
+            }
+            FreshSessionIntent::Start(session_start_source) => {
+                let clear_predecessor_thread_id =
+                    if session_start_source == Some(ThreadStartSource::Clear) {
+                        self.current_displayed_thread_id().map(|id| id.to_string())
+                    } else {
+                        None
+                    };
+                let (started, retention) =
+                    crate::boxed_future!(app_server.prepare_retained_thread_start(
+                        &self.local_settings,
+                        &config,
+                        session_start_source,
+                        clear_predecessor_thread_id,
+                        /*remote_cwd_override*/ None,
+                        /*selected_profile*/ None,
+                        self.backend_preference_context.local_cwd.as_deref(),
+                    ))
+                    .await
+                    .map_err(|err| {
+                        color_eyre::eyre::eyre!(
+                            "Failed to start a fresh session through the app server: {err}"
+                        )
+                    })?;
+                (started, retention)
+            }
+        };
+        Ok(PreparedFreshSession {
+            started,
+            config,
+            local_settings,
+            retention,
+        })
+    }
+
+    pub(super) async fn implement_plan_in_fresh_session(
+        &mut self,
+        tui: &mut tui::Tui,
+        app_server: &mut AppServerSession,
+        plan: String,
+    ) -> Result<()> {
+        if self.reject_pending_permission_root_switch() {
+            return Ok(());
+        }
+        let displayed = self.current_displayed_thread_id();
+        if displayed.is_some_and(|id| !self.thread_unavailable(id)) {
+            crate::boxed_future!(self.clear_displayed_session_with(
+                tui,
+                app_server,
+                ClearFirstInput::ApprovedPlan(plan),
+                /*new_thread_name*/ None,
+            ))
+            .await;
+            return Ok(());
+        }
+        let prepared = match self
+            .prepare_fresh_session(app_server, FreshSessionIntent::ClearRecovery(displayed))
+            .await
+        {
+            Ok(prepared) => prepared,
+            Err(err) => {
+                self.chat_widget.add_error_message(err.to_string());
+                tui.frame_requester().schedule_frame();
+                return Ok(());
+            }
+        };
+        let thread_id = prepared.started.session.thread_id;
+        match prepare_approved_plan_prompt(app_server, thread_id, &prepared.config.codex_home, plan)
+            .await
+        {
+            Ok(prompt) => {
+                self.clear_terminal_ui(tui, /*redraw_header*/ false)?;
+                self.reset_app_ui_state_after_clear();
+                self.adopt_fresh_session(
+                    tui,
+                    app_server,
+                    prepared,
+                    ThreadAttachPresentation::Fresh,
+                    Some(prompt.into()),
+                    /*new_thread_name*/ None,
+                )
+                .await;
+            }
+            Err(err) => {
+                let _ = app_server.thread_unsubscribe(thread_id).await;
+                self.chat_widget
+                    .add_error_message(format!("Failed to hand off the approved plan: {err:#}"));
+            }
+        }
+        tui.frame_requester().schedule_frame();
+        Ok(())
+    }
+
+    pub(super) async fn adopt_fresh_session(
+        &mut self,
+        tui: &mut tui::Tui,
+        app_server: &mut AppServerSession,
+        prepared: PreparedFreshSession,
+        presentation: ThreadAttachPresentation,
+        initial_user_message: Option<crate::chatwidget::UserMessage>,
+        new_thread_name: Option<String>,
+    ) {
+        let PreparedFreshSession {
+            mut started,
+            config,
+            local_settings,
+            retention,
+        } = prepared;
+        if let Some(thread_id) = self.current_displayed_thread_id()
+            && let Some(blank) = self.agents_overview.blank_sessions.get_mut(&thread_id)
+        {
+            if let Some(channel) = self.thread_event_channels.get(&thread_id)
+                && let Some(session) = channel.store.lock().await.session.as_ref()
+            {
+                blank.session = session.clone();
+            }
+            if let Some(input) = self.chat_widget.capture_thread_input_state() {
+                self.agents_overview.input_states.insert(thread_id, input);
+            }
+        }
+        self.detach_current_thread_for_navigation(app_server, Some(started.session.thread_id))
+            .await;
+        self.local_settings = local_settings;
+        self.refresh_server_version_overview_notice(CODEX_CLI_VERSION);
+        self.config = config;
+        self.remember_launch_permissions();
+
+        let name_error = if let Some(name) = new_thread_name {
+            match app_server
+                .thread_set_name(started.session.thread_id, name.clone())
+                .await
+            {
+                Ok(()) => {
+                    started.session.thread_name = Some(name);
+                    None
+                }
+                Err(err) => Some(format!("Failed to name the new session: {err}")),
+            }
+        } else {
+            None
+        };
+        let thread_id = started.session.thread_id;
+        let (account, account_error) = if self.model_catalog.provider_may_have_changed() {
+            match app_server.read_thread_account(&started.session).await {
+                Ok(account) => (Some(account), None),
+                Err(err) => (Some(SessionAccount::default()), Some(err)),
+            }
+        } else {
+            (None, None)
+        };
+        if !self.config.ephemeral {
+            self.agents_overview
+                .blank_sessions
+                .insert(thread_id, started.clone());
+        }
+        if let Err(err) = self
+            .replace_chat_widget_with_account(
+                tui,
+                started,
+                presentation,
+                initial_user_message,
+                account,
+            )
+            .await
+        {
+            self.agents_overview.blank_sessions.remove(&thread_id);
+            self.chat_widget.add_error_message(format!(
+                "Failed to attach to fresh app-server thread: {err}"
+            ));
+        } else {
+            if let Some(retention) = retention {
+                retention.commit();
+            }
+            if let Some(err) = name_error {
+                self.chat_widget.add_error_message(err);
+            }
+            if let Some(err) = account_error {
+                self.chat_widget.add_error_message(format!(
+                    "Could not load account details for this chat: {err}"
+                ));
+            }
+        }
+    }
+
+    /// Heap-allocates the clear transition before its first poll; see
+    /// [`Self::start_fresh_session_with_summary_hint_boxed`].
+    pub(super) fn clear_displayed_session_boxed<'a>(
+        &'a mut self,
+        tui: &'a mut tui::Tui,
+        app_server: &'a mut AppServerSession,
+        initial_user_message: Option<crate::chatwidget::UserMessage>,
+        new_thread_name: Option<String>,
+    ) -> std::pin::Pin<Box<impl std::future::Future<Output = ()> + 'a>> {
+        Box::pin(self.clear_displayed_session(
+            tui,
+            app_server,
+            initial_user_message,
+            new_thread_name,
+        ))
     }
 
     /// Replaces the displayed thread through the server-owned clear transition.
@@ -1128,25 +1601,51 @@ impl App {
         initial_user_message: Option<crate::chatwidget::UserMessage>,
         new_thread_name: Option<String>,
     ) {
+        self.clear_displayed_session_with(
+            tui,
+            app_server,
+            ClearFirstInput::Message(initial_user_message),
+            new_thread_name,
+        )
+        .await;
+    }
+
+    async fn clear_displayed_session_with(
+        &mut self,
+        tui: &mut tui::Tui,
+        app_server: &mut AppServerSession,
+        first: ClearFirstInput,
+        new_thread_name: Option<String>,
+    ) {
         let displayed = self.current_displayed_thread_id();
         if displayed.is_none() || displayed.is_some_and(|id| self.thread_unavailable(id)) {
-            self.start_fresh_session_with_summary_hint(
-                tui,
-                app_server,
-                initial_user_message,
-                new_thread_name,
-                Some(codex_app_server_protocol::ThreadStartSource::Clear),
-            )
-            .await;
+            match first {
+                ClearFirstInput::Message(message) => {
+                    self.start_fresh_session_with_intent(
+                        tui,
+                        app_server,
+                        FreshSessionIntent::ClearRecovery(displayed),
+                        message,
+                        new_thread_name,
+                    )
+                    .await;
+                }
+                ClearFirstInput::ApprovedPlan(plan) => {
+                    let _ = crate::boxed_future!(
+                        self.implement_plan_in_fresh_session(tui, app_server, plan)
+                    )
+                    .await;
+                }
+            }
             return;
         }
         let Some(predecessor_thread_id) = displayed else {
             return;
         };
-        let mut config = match self.load_new_session_config(app_server).await {
+        let (config, _local_settings) = match self.load_new_session_config(app_server).await {
             Ok(config) => config,
             Err(err) => {
-                if let Some(message) = initial_user_message {
+                if let ClearFirstInput::Message(Some(message)) = first {
                     self.chat_widget.restore_user_message_to_composer(message);
                 }
                 self.chat_widget
@@ -1155,23 +1654,10 @@ impl App {
                 return;
             }
         };
-        apply_managed_new_thread_defaults(
-            &mut config,
-            app_server.managed_new_thread_defaults(),
-            &self.cli_kv_overrides,
-            &self.harness_overrides,
-        );
         let model_settings = codex_app_server_protocol::ThreadClearModelSettings {
             model: config.model,
             reasoning_effort: config.model_reasoning_effort,
         };
-        let summary = session_summary(
-            self.chat_widget.token_usage(),
-            self.chat_widget.thread_id(),
-            self.chat_widget.thread_name(),
-            self.chat_widget.rollout_path().as_deref(),
-        );
-
         let response = match app_server
             .thread_clear(predecessor_thread_id, model_settings)
             .await
@@ -1203,8 +1689,12 @@ impl App {
                 return;
             }
         };
+        let task_tools_available = app_server.task_tools_available(predecessor_thread_id);
+        if task_tools_available {
+            app_server.remember_task_tool_thread(successor_thread_id);
+        }
         let retention = app_server
-            .retain_clear_successor(&response.successor_thread.id)
+            .retain_clear_successor(&response.successor_thread.id, response.retention.clone())
             .await;
         let mut session = self
             .session_state_for_thread_read(successor_thread_id, &response.successor_thread)
@@ -1216,7 +1706,27 @@ impl App {
             session,
             turns: response.successor_thread.turns,
             blocks_direct_input,
-            task_tools_available: false,
+            task_tools_available,
+        };
+
+        // The clear is committed. A failed plan handoff must not leave the UI
+        // attached to the predecessor whose subscription the server has moved.
+        let (initial_user_message, plan_error) = match first {
+            ClearFirstInput::Message(message) => (message, None),
+            ClearFirstInput::ApprovedPlan(plan) => match prepare_approved_plan_prompt(
+                app_server,
+                successor_thread_id,
+                &config.codex_home,
+                plan,
+            )
+            .await
+            {
+                Ok(prompt) => (Some(prompt.into()), None),
+                Err(err) => (
+                    None,
+                    Some(format!("Failed to hand off the approved plan: {err:#}")),
+                ),
+            },
         };
 
         let name_error = if let Some(name) = new_thread_name {
@@ -1236,10 +1746,19 @@ impl App {
 
         // The server has now atomically moved this connection from A to B. Local listener cleanup
         // may safely follow the authoritative response, but must never precede the request above.
-        self.shutdown_current_thread_except(app_server, Some(successor_thread_id))
+        self.stop_realtime_conversation(app_server).await;
+        self.detach_current_thread_for_navigation(app_server, Some(successor_thread_id))
             .await;
-        let tracked_thread_ids: Vec<ThreadId> =
-            self.thread_event_channels.keys().copied().collect();
+        let tracked_thread_ids: Vec<ThreadId> = self
+            .thread_event_channels
+            .iter()
+            .filter(|(_, channel)| {
+                channel
+                    .backend_id
+                    .is_none_or(|id| id == app_server.backend_id())
+            })
+            .map(|(id, _)| *id)
+            .collect();
         for thread_id in tracked_thread_ids {
             if thread_id == successor_thread_id {
                 continue;
@@ -1273,16 +1792,8 @@ impl App {
             if let Some(err) = name_error {
                 self.chat_widget.add_error_message(err);
             }
-            if let Some(summary) = summary {
-                let mut lines: Vec<Line<'static>> = Vec::new();
-                if let Some(usage_line) = summary.usage_line {
-                    lines.push(usage_line.into());
-                }
-                if let Some(command) = summary.resume_hint {
-                    let spans = vec!["To continue this session, run ".into(), command.cyan()];
-                    lines.push(spans.into());
-                }
-                self.chat_widget.add_plain_history_lines(lines);
+            if let Some(err) = plan_error {
+                self.chat_widget.add_error_message(err);
             }
         }
         tui.frame_requester().schedule_frame();
@@ -1295,6 +1806,24 @@ impl App {
         presentation: ThreadAttachPresentation,
         initial_user_message: Option<crate::chatwidget::UserMessage>,
     ) -> Result<()> {
+        self.replace_chat_widget_with_account(
+            tui,
+            started,
+            presentation,
+            initial_user_message,
+            /*account*/ None,
+        )
+        .await
+    }
+
+    async fn replace_chat_widget_with_account(
+        &mut self,
+        tui: &mut tui::Tui,
+        started: AppServerStartedThread,
+        presentation: ThreadAttachPresentation,
+        initial_user_message: Option<crate::chatwidget::UserMessage>,
+        account: Option<SessionAccount>,
+    ) -> Result<()> {
         // Initial messages are for freshly attached primary threads only. Thread switches and
         // resume/fork flows pass `None` so they cannot replay old history and then auto-submit a new
         // user turn by accident.
@@ -1306,13 +1835,19 @@ impl App {
             self.active_thread_rx = Some(receiver);
         }
         self.store_active_thread_receiver().await;
-        if matches!(presentation, ThreadAttachPresentation::FreshWithDraft) {
-            self.reset_transcript_state_after_clear();
-            tui.clear_pending_history_lines();
-            tui.defer_thread_switch_clear();
-        } else {
-            self.reset_for_thread_switch(tui)?;
-        }
+        self.reset_transcript_state_after_clear();
+        tui.clear_pending_history_lines();
+        let presentation = match presentation {
+            ThreadAttachPresentation::FreshAfterClear => ThreadAttachPresentation::Fresh,
+            ThreadAttachPresentation::FreshWithDraft => {
+                tui.defer_thread_switch_clear();
+                presentation
+            }
+            ThreadAttachPresentation::Fresh | ThreadAttachPresentation::SessionLineage => {
+                tui.clear_for_thread_switch()?;
+                presentation
+            }
+        };
         self.pending_thread_switch_resets += 1;
         self.app_event_tx.send(
             if matches!(presentation, ThreadAttachPresentation::FreshWithDraft) {
@@ -1322,18 +1857,27 @@ impl App {
             },
         );
         self.reset_thread_event_state().await;
-        let init = self.chatwidget_init_for_forked_or_resumed_thread(
+        let mut init = self.chatwidget_init_for_forked_or_resumed_thread(
             tui,
             self.config.clone(),
             initial_user_message,
         );
+        if let Some(account) = account {
+            self.account_email_request_id = None;
+            self.feedback_audience = account.feedback_audience();
+            init.has_chatgpt_account = account.has_chatgpt_account();
+            init.has_codex_backend_auth = init.has_chatgpt_account;
+            init.requires_openai_auth = account.requires_openai_auth;
+            init.status_account_display = account.display;
+            init.initial_plan_type = account.plan;
+        }
         self.replace_chat_widget(ChatWidget::new_with_app_event(init));
         if matches!(
             presentation,
             ThreadAttachPresentation::Fresh | ThreadAttachPresentation::FreshWithDraft
         ) {
             self.chat_widget.mark_fresh_task_for_sparkle(&started);
-            // FreshWithDraft inherits its provisional greeting and replay at the handoff.
+            // FreshWithDraft inherits its provisional replay at the handoff.
             if matches!(presentation, ThreadAttachPresentation::Fresh) {
                 self.chat_widget
                     .empty_state_animation
@@ -1445,7 +1989,7 @@ impl App {
                 refreshed_thread_ids.insert(thread.thread_id);
             }
         }
-        self.sync_active_agent_label();
+        self.refresh_agent_picker();
 
         LoadedSubagentBackfill {
             completed: !had_read_error,
@@ -1496,6 +2040,10 @@ impl App {
         app_server: &mut AppServerSession,
         target_session: SessionTarget,
     ) -> Result<AppRunControl> {
+        if let Err(error) = target_session.ensure_backend(app_server.backend_id()) {
+            self.add_session_picker_error(error.to_string());
+            return Ok(AppRunControl::Continue);
+        }
         if self.ignore_same_thread_resume(&target_session) {
             self.agents_overview
                 .hidden_threads
@@ -1515,60 +2063,52 @@ impl App {
         if self.reject_pending_permission_root_switch() {
             return Ok(AppRunControl::Continue);
         }
-        let (mut resume_config, local_settings) = match self
-            .resume_config_for_target(tui, app_server, &target_session)
+        let prepared = match self
+            .prepare_target_session(
+                tui,
+                app_server,
+                &target_session,
+                super::resume_preparation::ResumeSource::Active,
+            )
             .await
         {
-            Ok(config) => config,
+            Ok(prepared) => prepared,
             Err(control) => return Ok(control),
         };
-        let baseline_approval = resume_config.permissions.approval_policy.value();
-        let baseline_permissions = RuntimePermissionProfileOverride::from_config(&resume_config);
-        self.apply_runtime_policy_overrides(&mut resume_config, RuntimePolicyOverrideScope::All);
+        self.activate_prepared_session(tui, app_server, prepared)
+            .await
+    }
 
-        if let Some(history_mode) = target_session.history_mode {
-            app_server.remember_thread_history_mode(target_session.thread_id, history_mode);
+    pub(super) async fn activate_prepared_session(
+        &mut self,
+        tui: &mut tui::Tui,
+        app_server: &mut AppServerSession,
+        prepared: super::resume_preparation::PreparedResume,
+    ) -> Result<AppRunControl> {
+        let super::resume_preparation::PreparedResume {
+            backend_id,
+            config: resume_config,
+            local_settings,
+            thread: resumed,
+            read_only,
+            history_notice,
+            provider_error,
+            retention,
+        } = prepared;
+        if backend_id != app_server.backend_id() {
+            self.add_session_picker_error(
+                "This session belongs to a different backend. Open the session picker again."
+                    .to_string(),
+            );
+            return Ok(AppRunControl::Continue);
         }
-        let resumed = app_server
-            .resume_thread(
-                &local_settings,
-                resume_config.clone(),
-                target_session.thread_id,
-                self.resume_model_settings(),
-            )
-            .await;
-        let mut history_notice = None;
-        let (resumed, read_only) = match resumed {
-            Ok(resumed) => (resumed, false),
-            Err(err) if crate::app_server_session::is_active_writer_error(&err) => match app_server
-                .read_thread_for_viewing(&resume_config, &local_settings, target_session.thread_id)
-                .await
-            {
-                Ok((thread, notice)) => {
-                    history_notice = notice;
-                    (thread, true)
-                }
-                Err(read_err) => {
-                    self.add_session_picker_error(format!(
-                        "Failed to view thread open elsewhere: {read_err}"
-                    ));
-                    return Ok(AppRunControl::Continue);
-                }
-            },
-            Err(err) => {
-                let path_display = target_session.display_label();
-                self.add_session_picker_error(format!(
-                    "Failed to resume session from {path_display}: {err}"
-                ));
-                return Ok(AppRunControl::Continue);
-            }
-        };
         let resumed_thread_id = resumed.session.thread_id;
-        let retained_input = (self.chat_widget.is_external_writer_view()
+        let retained_input = ((self.chat_widget.is_external_writer_view()
+            || self.chat_widget.has_provider_error())
             && self.chat_widget.thread_id() == Some(resumed_thread_id))
         .then(|| self.chat_widget.capture_thread_input_state())
         .flatten();
-        self.shutdown_current_thread_except(app_server, Some(resumed_thread_id))
+        self.detach_current_thread_for_navigation(app_server, Some(resumed_thread_id))
             .await;
         self.local_settings = local_settings;
         self.refresh_server_version_overview_notice(CODEX_CLI_VERSION);
@@ -1589,7 +2129,13 @@ impl App {
             .await
         {
             Ok(()) => {
-                if let Some(input) = retained_input {
+                if let Some(retention) = retention {
+                    retention.commit();
+                }
+                self.remember_attached_host_project(app_server);
+                if let Some(mut input) = retained_input {
+                    // A successful resume is the authority for clearing the old rejection.
+                    input.provider_error = None;
                     self.chat_widget.restore_thread_input_state(
                         Some(input),
                         ThreadInputStateRestoreMode {
@@ -1597,25 +2143,34 @@ impl App {
                         },
                     );
                 }
-                if read_only {
+                if let Some(error) = provider_error {
+                    self.chat_widget
+                        .show_provider_error(error, /*rejected_message_id*/ None);
+                } else if read_only {
                     self.ensure_thread_channel(resumed_thread_id)
                         .mark_external_writer();
                     self.chat_widget.show_external_writer_thread();
-                    if let Some(notice) = history_notice {
-                        self.chat_widget
-                            .add_info_message(notice.to_string(), /*hint*/ None);
-                    }
                 }
-                if self.app_server_target.uses_remote_workspace() {
-                    let config = self.chat_widget.config_ref();
-                    let approval = config.permissions.approval_policy.value();
-                    self.runtime_approval_policy_override = (approval != baseline_approval)
-                        .then_some(RuntimeApprovalPolicyOverride::Restored(approval.into()));
-                    self.runtime_permission_profile_override = (!baseline_permissions
-                        .matches_config(config))
-                    .then(|| RuntimePermissionProfileOverride::from_restored_config(config));
+                if let Some(notice) = history_notice {
+                    self.chat_widget
+                        .add_info_message(notice.to_string(), /*hint*/ None);
                 }
                 self.backfill_loaded_subagent_threads(app_server).await;
+                if matches!(
+                    self.runtime_approval_policy_override,
+                    Some(RuntimeApprovalPolicyOverride::Restored(_))
+                ) {
+                    self.runtime_approval_policy_override = None;
+                }
+                if self
+                    .runtime_permission_profile_override
+                    .as_ref()
+                    .is_some_and(|profile| {
+                        profile.turn_override == RuntimePermissionProfileTurnOverride::Preserve
+                    })
+                {
+                    self.runtime_permission_profile_override = None;
+                }
                 if !read_only {
                     self.replay_agents_overview_requests(app_server, resumed_thread_id)
                         .await;
@@ -1628,11 +2183,7 @@ impl App {
                     .await;
                 }
             }
-            Err(err) => {
-                self.add_session_picker_error(format!(
-                    "Failed to attach to resumed app-server thread: {err}"
-                ));
-            }
+            Err(err) => return Err(err),
         }
 
         Ok(AppRunControl::Continue)

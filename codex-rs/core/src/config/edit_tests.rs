@@ -1054,11 +1054,20 @@ fn blocking_replace_mcp_servers_round_trips() {
     let codex_home = tmp.path();
 
     let mut servers = BTreeMap::new();
-    servers.insert("ema".to_string(), serde_json::from_value(serde_json::json!({
-        "url": "https://ema.example/mcp", "auth": "ema_auth", "scopes": ["tools"],
-        "oauth_resource": "https://ema.example",
-        "oauth": {"client_id": "resource-client", "authorization_server_issuer": "https://as.example"}
-    })).expect("EMA server"));
+    servers.insert(
+        "ema".to_string(),
+        serde_json::from_value(serde_json::json!({
+            "url": "https://ema.example/mcp", "auth": "ema_auth", "scopes": ["tools"],
+            "oauth_resource": "https://ema.example",
+            "oauth": {
+                "client_id": "resource-client",
+                "client_secret": "test-ema-secret",
+                "token_endpoint_auth_method": "client_secret_post",
+                "authorization_server_issuer": "https://as.example"
+            }
+        }))
+        .expect("EMA server"),
+    );
     servers.insert(
         "stdio".to_string(),
         McpServerConfig {
@@ -1082,9 +1091,9 @@ fn blocking_replace_mcp_servers_round_trips() {
             required: false,
             startup_readiness: Default::default(),
             supports_parallel_tool_calls: true,
-            tool_input_schema_max_bytes: None,
             thread_identity_eligible: false,
             control_endpoint_eligible: false,
+            tool_input_schema_max_bytes: None,
             omit_tools_from: None,
             disabled_reason: None,
             startup_timeout_sec: None,
@@ -1119,9 +1128,9 @@ fn blocking_replace_mcp_servers_round_trips() {
             required: false,
             startup_readiness: Default::default(),
             supports_parallel_tool_calls: false,
-            tool_input_schema_max_bytes: None,
             thread_identity_eligible: false,
             control_endpoint_eligible: false,
+            tool_input_schema_max_bytes: None,
             omit_tools_from: None,
             disabled_reason: None,
             startup_timeout_sec: Some(std::time::Duration::from_secs(5)),
@@ -1158,6 +1167,8 @@ oauth_resource = \"https://ema.example\"
 
 [mcp_servers.ema.oauth]
 client_id = \"resource-client\"
+client_secret = \"test-ema-secret\"
+token_endpoint_auth_method = \"client_secret_post\"
 authorization_server_issuer = \"https://as.example\"
 
 [mcp_servers.http]
@@ -1192,107 +1203,6 @@ B = \"2\"
     assert_eq!(raw, expected);
 }
 
-#[test]
-fn blocking_replace_mcp_servers_persists_thread_identity_eligible() {
-    let tmp = tempdir().expect("tmpdir");
-    let codex_home = tmp.path();
-
-    let mut servers = BTreeMap::new();
-    servers.insert(
-        "docs".to_string(),
-        McpServerConfig {
-            auth: Default::default(),
-            transport: McpServerTransportConfig::Stdio {
-                command: "docs-server".to_string(),
-                args: Vec::new(),
-                env: None,
-                env_vars: Vec::new(),
-                cwd: None,
-            },
-            environment_id: codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(),
-            enabled: true,
-            required: false,
-            supports_parallel_tool_calls: false,
-            startup_readiness: Default::default(),
-            tool_input_schema_max_bytes: None,
-            thread_identity_eligible: true,
-            control_endpoint_eligible: false,
-            omit_tools_from: None,
-            disabled_reason: None,
-            startup_timeout_sec: None,
-            tool_timeout_sec: None,
-            default_tools_approval_mode: None,
-            enabled_tools: None,
-            disabled_tools: None,
-            scopes: None,
-            oauth: None,
-            oauth_resource: None,
-            tools: HashMap::new(),
-        },
-    );
-
-    apply_blocking(codex_home, &[ConfigEdit::ReplaceMcpServers(servers)]).expect("persist");
-
-    let raw = std::fs::read_to_string(codex_home.join(CONFIG_TOML_FILE)).expect("read config");
-    let expected = "\
-[mcp_servers.docs]
-command = \"docs-server\"
-thread_identity_eligible = true
-";
-    assert_eq!(raw, expected);
-}
-
-#[test]
-fn blocking_replace_mcp_servers_persists_thread_identity_eligible_inline() {
-    let tmp = tempdir().expect("tmpdir");
-    let codex_home = tmp.path();
-    std::fs::write(
-        codex_home.join(CONFIG_TOML_FILE),
-        "[mcp_servers]\nfoo = { command = \"cmd\" }\n",
-    )
-    .expect("seed");
-
-    let mut servers = BTreeMap::new();
-    servers.insert(
-        "foo".to_string(),
-        McpServerConfig {
-            auth: Default::default(),
-            transport: McpServerTransportConfig::Stdio {
-                command: "cmd".to_string(),
-                args: Vec::new(),
-                env: None,
-                env_vars: Vec::new(),
-                cwd: None,
-            },
-            environment_id: codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(),
-            enabled: true,
-            required: false,
-            supports_parallel_tool_calls: false,
-            startup_readiness: Default::default(),
-            tool_input_schema_max_bytes: None,
-            thread_identity_eligible: true,
-            control_endpoint_eligible: false,
-            omit_tools_from: None,
-            disabled_reason: None,
-            startup_timeout_sec: None,
-            tool_timeout_sec: None,
-            default_tools_approval_mode: None,
-            enabled_tools: None,
-            disabled_tools: None,
-            scopes: None,
-            oauth: None,
-            oauth_resource: None,
-            tools: HashMap::new(),
-        },
-    );
-
-    apply_blocking(codex_home, &[ConfigEdit::ReplaceMcpServers(servers)]).expect("persist");
-
-    let contents = std::fs::read_to_string(codex_home.join(CONFIG_TOML_FILE)).expect("read config");
-    let expected = "[mcp_servers]\nfoo = { command = \"cmd\" , thread_identity_eligible = true }\n";
-    assert_eq!(contents, expected);
-}
-
 #[test_case::test_case(30_000; "positive limit")]
 #[test_case::test_case(usize::MAX; "largest native limit")]
 fn blocking_replace_mcp_servers_serializes_tool_approval_overrides(output_token_limit: usize) {
@@ -1316,9 +1226,9 @@ fn blocking_replace_mcp_servers_serializes_tool_approval_overrides(output_token_
             required: false,
             startup_readiness: Default::default(),
             supports_parallel_tool_calls: false,
-            tool_input_schema_max_bytes: None,
             thread_identity_eligible: false,
             control_endpoint_eligible: false,
+            tool_input_schema_max_bytes: None,
             omit_tools_from: None,
             disabled_reason: None,
             startup_timeout_sec: None,
@@ -1396,9 +1306,9 @@ foo = { command = "cmd" }
             required: false,
             startup_readiness: Default::default(),
             supports_parallel_tool_calls: false,
-            tool_input_schema_max_bytes: None,
             thread_identity_eligible: false,
             control_endpoint_eligible: false,
+            tool_input_schema_max_bytes: None,
             omit_tools_from: None,
             disabled_reason: None,
             startup_timeout_sec: None,
@@ -1452,9 +1362,9 @@ foo = { command = "cmd" } # keep me
             required: false,
             startup_readiness: Default::default(),
             supports_parallel_tool_calls: false,
-            tool_input_schema_max_bytes: None,
             thread_identity_eligible: false,
             control_endpoint_eligible: false,
+            tool_input_schema_max_bytes: None,
             omit_tools_from: None,
             disabled_reason: None,
             startup_timeout_sec: None,
@@ -1507,9 +1417,9 @@ foo = { command = "cmd", args = ["--flag"] } # keep me
             required: false,
             startup_readiness: Default::default(),
             supports_parallel_tool_calls: false,
-            tool_input_schema_max_bytes: None,
             thread_identity_eligible: false,
             control_endpoint_eligible: false,
+            tool_input_schema_max_bytes: None,
             omit_tools_from: None,
             disabled_reason: None,
             startup_timeout_sec: None,
@@ -1563,9 +1473,9 @@ foo = { command = "cmd" }
             required: false,
             startup_readiness: Default::default(),
             supports_parallel_tool_calls: false,
-            tool_input_schema_max_bytes: None,
             thread_identity_eligible: false,
             control_endpoint_eligible: false,
+            tool_input_schema_max_bytes: None,
             omit_tools_from: None,
             disabled_reason: None,
             startup_timeout_sec: None,
@@ -1610,28 +1520,36 @@ fn blocking_clear_path_noop_when_missing() {
 }
 
 #[test]
-fn blocking_set_path_updates_notifications() {
+fn blocking_notification_toggle_updates_boolean_and_preserves_custom_filters() {
     let tmp = tempdir().expect("tmpdir");
     let codex_home = tmp.path();
+    let config_path = codex_home.join(CONFIG_TOML_FILE);
 
-    let item = value(false);
     apply_blocking(
         codex_home,
-        &[ConfigEdit::SetPath {
-            segments: vec!["tui".to_string(), "notifications".to_string()],
-            value: item,
-        }],
+        &[ConfigEdit::SetTuiNotificationsEnabled { enabled: false }],
     )
     .expect("apply");
+    assert_eq!(
+        std::fs::read_to_string(&config_path).expect("read config"),
+        "[tui]\nnotifications = false\n"
+    );
 
-    let raw = std::fs::read_to_string(codex_home.join(CONFIG_TOML_FILE)).expect("read config");
-    let config: TomlValue = toml::from_str(&raw).expect("parse config");
-    let notifications = config
-        .get("tui")
-        .and_then(|item| item.as_table())
-        .and_then(|tbl| tbl.get("notifications"))
-        .and_then(toml::Value::as_bool);
-    assert_eq!(notifications, Some(false));
+    let custom_filters = "[tui]\nnotifications = [\"approval-requested\"]\n";
+    std::fs::write(&config_path, custom_filters).expect("write config");
+    let error = apply_blocking(
+        codex_home,
+        &[ConfigEdit::SetTuiNotificationsEnabled { enabled: false }],
+    )
+    .expect_err("custom filters should reject a boolean toggle");
+    assert_eq!(
+        error.to_string(),
+        "Event-specific notifications are configured. Edit those filters in the config file."
+    );
+    assert_eq!(
+        std::fs::read_to_string(config_path).expect("read config"),
+        custom_filters
+    );
 }
 
 #[tokio::test]
@@ -1804,4 +1722,37 @@ fn replace_mcp_servers_blocking_clears_table_when_empty() {
 
     let contents = std::fs::read_to_string(codex_home.join(CONFIG_TOML_FILE)).expect("read config");
     assert!(!contents.contains("mcp_servers"));
+}
+
+#[test]
+fn blocking_replace_mcp_servers_preserves_explicit_disclosure_eligibility() {
+    let tmp = tempdir().expect("tmpdir");
+    let opted_in: McpServerConfig = serde_json::from_value(serde_json::json!({
+        "command": "fixture", "thread_identity_eligible": true, "control_endpoint_eligible": true,
+    }))
+    .expect("eligible server");
+    let ordinary: McpServerConfig =
+        serde_json::from_value(serde_json::json!({"command": "fixture"})).unwrap();
+    let servers = BTreeMap::from([
+        ("eligible".to_string(), opted_in.clone()),
+        ("ordinary".to_string(), ordinary),
+    ]);
+    apply_blocking(tmp.path(), &[ConfigEdit::ReplaceMcpServers(servers)]).expect("persist");
+    let raw = std::fs::read_to_string(tmp.path().join(CONFIG_TOML_FILE)).expect("read config");
+    let document: toml::Value = toml::from_str(&raw).expect("parse config");
+    let eligible: McpServerConfig = document["mcp_servers"]["eligible"]
+        .clone()
+        .try_into()
+        .unwrap();
+    assert_eq!(eligible, opted_in);
+    assert!(
+        document["mcp_servers"]["ordinary"]
+            .get("thread_identity_eligible")
+            .is_none()
+    );
+    assert!(
+        document["mcp_servers"]["ordinary"]
+            .get("control_endpoint_eligible")
+            .is_none()
+    );
 }

@@ -2,9 +2,9 @@
 
 use std::sync::Arc;
 
+use crate::auth::McpAuthProvider;
 use anyhow::Result;
 use anyhow::bail;
-use codex_api::SharedAuthProvider;
 use codex_config::types::AuthKeyringBackendKind;
 use codex_config::types::OAuthCredentialsStoreMode;
 use codex_exec_server::Environment;
@@ -24,18 +24,20 @@ use crate::EffectiveMcpServer;
 use crate::McpEventStream;
 use crate::McpProtocolMode;
 use crate::McpRuntimeContext;
+use crate::resource_client::EventStreamCustody;
 use crate::rmcp_client::DEFAULT_STARTUP_TIMEOUT;
-use crate::rmcp_client::make_rmcp_client;
+use crate::rmcp_client::make_rmcp_client_in_retirement;
 use crate::rmcp_client::mcp_initialize_request_params;
 
 pub(crate) struct EventStreamConnectionSettings {
+    pub event_pool: crate::McpConnectionPool,
     pub server: EffectiveMcpServer,
     pub store_mode: OAuthCredentialsStoreMode,
     pub keyring_backend_kind: AuthKeyringBackendKind,
     pub oauth_refresh_mode: McpOAuthRefreshMode,
     pub runtime_context: McpRuntimeContext,
     pub resolved_environment: std::result::Result<Option<Arc<Environment>>, String>,
-    pub auth_provider: Option<SharedAuthProvider>,
+    pub auth_provider: Option<McpAuthProvider>,
     pub auth_manager: Option<Arc<AuthManager>>,
     pub auth: Option<CodexAuth>,
     pub protocol_mode: McpProtocolMode,
@@ -78,7 +80,9 @@ impl McpEventStreamOpener {
 
                 let startup_timeout = connection.server.config().startup_timeout_sec
                     .unwrap_or(DEFAULT_STARTUP_TIMEOUT);
-                let client = Arc::new(tokio::time::timeout(startup_timeout, make_rmcp_client(
+                let lease = connection.event_pool.reserve_event_connection();
+                let client = Arc::new(tokio::time::timeout(startup_timeout, make_rmcp_client_in_retirement(
+                    /*ema_auth*/ None,
                     CODEX_APPS_MCP_SERVER_NAME,
                     connection.server.clone(),
                     connection.store_mode,
@@ -88,9 +92,11 @@ impl McpEventStreamOpener {
                     connection.resolved_environment.clone(),
                     connection.auth_provider.clone(),
                     connection.protocol_mode,
-                    // Streams outlive runtime generations; keep their owner private.
-                    codex_rmcp_client::RmcpClientRetirement::default(),
+                    lease.retirement(),
                 )).await??);
+                if !lease.bind(&client) {
+                    bail!("event MCP factory returned a client outside its retained retirement owner");
+                }
                 client.initialize(
                     mcp_initialize_request_params(
                         ElicitationCapability::default(),
@@ -107,7 +113,8 @@ impl McpEventStreamOpener {
                 ).await?;
                 McpEventStream::open(
                     client,
-                    /*connection*/ None,
+                    EventStreamCustody::Private(lease),
+                    connection.event_pool.clone(),
                     self.cancellation_receiver.clone(),
                     event_name,
                     arguments,

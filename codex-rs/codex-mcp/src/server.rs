@@ -1,10 +1,12 @@
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::auth::McpAuthProvider;
+use crate::mcp::CODEX_APPS_MCP_SERVER_NAME;
 use crate::runtime::McpRuntimeContext;
-use codex_api::SharedAuthProvider;
 use codex_config::AppToolApproval;
 use codex_config::McpServerAuth;
 use codex_config::McpServerConfig;
@@ -17,6 +19,7 @@ use codex_exec_server::Environment;
 use codex_login::CodexAuth;
 use codex_protocol::mcp::ClientMcpExtensions;
 use codex_rmcp_client::McpOAuthRefreshMode;
+use codex_rmcp_client::McpProtocolMode;
 use codex_rmcp_client::StoredOAuthCredentialSnapshot;
 use codex_rmcp_client::StoredOAuthTokens;
 use codex_utils_path_uri::PathUri;
@@ -82,6 +85,35 @@ impl EffectiveMcpServer {
         &self.config
     }
 
+    /// Checks whether Core can discover the protocol of a local stdio server.
+    ///
+    /// The reserved `codex_apps` server has a per-chat catalog. Servers with runtime or
+    /// enterprise-managed credentials need that chat's authentication state.
+    pub(crate) fn can_discover_local_stdio(
+        &self,
+        server_name: &str,
+        runtime_auth_provider: Option<&McpAuthProvider>,
+    ) -> bool {
+        server_name != CODEX_APPS_MCP_SERVER_NAME
+            && self.config.is_local_environment()
+            && runtime_auth_provider.is_none()
+            && !matches!(self.config.auth, McpServerAuth::EmaAuth)
+            && self
+                .stdio_protocol_mode(McpProtocolMode::DiscoverLocalStdio)
+                .is_some()
+    }
+
+    /// Returns the handshake a stdio launch would use, or `None` for HTTP or an invalid version.
+    pub(crate) fn stdio_protocol_mode(&self, mode: McpProtocolMode) -> Option<McpProtocolMode> {
+        let McpServerTransportConfig::Stdio { env, .. } = &self.config.transport else {
+            return None;
+        };
+        let version = env
+            .as_ref()
+            .and_then(|env| env.get("CODEX_MCP_PROTOCOL_VERSION"));
+        mode.stdio_mode(version.map(OsStr::new)).ok()
+    }
+
     pub fn enabled(&self) -> bool {
         self.config.enabled
     }
@@ -131,6 +163,7 @@ pub(crate) fn has_explicit_http_authorization(config: &McpServerConfig) -> bool 
 /// those belong to a publication and can change without reconnecting.
 #[derive(Clone)]
 pub(crate) struct McpServerConnectionIdentity {
+    connection_bindings: crate::connection_handshake::ConnectionBindings,
     auth: McpServerAuth,
     pub(crate) credential_policy: McpCredentialPolicy,
     transport: McpServerTransportConfig,
@@ -146,24 +179,12 @@ pub(crate) struct McpServerConnectionIdentity {
     referenced_environment_variables: Vec<(String, Option<OsString>)>,
     runtime_auth: Option<CodexAuth>,
     runtime_auth_token: Option<String>,
+    runtime_auth_mode: Option<codex_features::RuntimeAuthMode>,
     codex_apps_cache_identity: Option<(PathBuf, ConnectorRuntimeContextKey)>,
     client_elicitation_capability: ElicitationCapability,
     client_mcp_extensions: ClientMcpExtensions,
     agent_plugin: bool,
     requires_read_only_mcp_tools: bool,
-    /// Whether this server opted into thread-identity binding (default
-    /// `false`). Mirrors `McpServerConfig::thread_identity_eligible`.
-    pub(crate) thread_identity_eligible: bool,
-    /// Canonical Codex `ThreadId` for the owning session, or `None` for a
-    /// threadless caller. Part of the connection identity so a thread
-    /// change (fork, delegate, reconstructed resume) forces a fresh
-    /// connection rather than reusing a stale bind; see
-    /// `kcf-runtime/04-mcp-thread-identity-contract.md`.
-    pub(crate) canonical_thread_id: Option<String>,
-    /// Hosting control endpoint. Eligible providers must reconnect if it
-    /// changes so a physical MCP connection cannot retain a stale endpoint.
-    pub(crate) control_endpoint: Option<String>,
-    pub(crate) control_endpoint_eligible: bool,
 }
 
 impl McpServerConnectionIdentity {
@@ -177,13 +198,12 @@ impl McpServerConnectionIdentity {
         oauth_refresh_mode: McpOAuthRefreshMode,
         resolved_environment: &Result<Option<Arc<Environment>>, String>,
         runtime_context: &McpRuntimeContext,
-        runtime_auth_provider: Option<&SharedAuthProvider>,
+        runtime_auth_provider: Option<&McpAuthProvider>,
+        runtime_auth_mode: Option<codex_features::RuntimeAuthMode>,
         auth: Option<&CodexAuth>,
         codex_apps_cache_identity: Option<(PathBuf, ConnectorRuntimeContextKey)>,
         client_elicitation_capability: ElicitationCapability,
         client_mcp_extensions: ClientMcpExtensions,
-        canonical_thread_id: Option<String>,
-        control_endpoint: Option<String>,
         previous_identity: Option<&Self>,
     ) -> Self {
         let config = server.config();
@@ -272,6 +292,7 @@ impl McpServerConnectionIdentity {
             .is_some_and(StoredOAuthCredentialSnapshot::store_was_contended);
 
         Self {
+            connection_bindings: runtime_context.connection_bindings(config),
             auth: config.auth.clone(),
             credential_policy: server.credential_policy(),
             transport: config.transport.clone(),
@@ -289,18 +310,12 @@ impl McpServerConnectionIdentity {
             referenced_environment_variables,
             runtime_auth,
             runtime_auth_token,
+            runtime_auth_mode,
             codex_apps_cache_identity,
             client_elicitation_capability,
             client_mcp_extensions,
             agent_plugin: server.is_agent_plugin(),
             requires_read_only_mcp_tools: server.requires_read_only_mcp_tools(),
-            thread_identity_eligible: config.thread_identity_eligible,
-            canonical_thread_id,
-            control_endpoint: config
-                .control_endpoint_eligible
-                .then_some(control_endpoint)
-                .flatten(),
-            control_endpoint_eligible: config.control_endpoint_eligible,
         }
     }
 
@@ -318,7 +333,8 @@ impl McpServerConnectionIdentity {
             (None, None) => true,
             (Some(_), None) | (None, Some(_)) => false,
         };
-        self.auth == other.auth
+        self.connection_bindings == other.connection_bindings
+            && self.auth == other.auth
             && self.credential_policy == other.credential_policy
             && self.transport == other.transport
             && self.environment_id == other.environment_id
@@ -335,20 +351,12 @@ impl McpServerConnectionIdentity {
             && self.referenced_environment_variables == other.referenced_environment_variables
             && same_runtime_auth
             && self.runtime_auth_token == other.runtime_auth_token
+            && self.runtime_auth_mode == other.runtime_auth_mode
             && self.codex_apps_cache_identity == other.codex_apps_cache_identity
             && self.client_elicitation_capability == other.client_elicitation_capability
             && self.client_mcp_extensions == other.client_mcp_extensions
             && self.agent_plugin == other.agent_plugin
             && self.requires_read_only_mcp_tools == other.requires_read_only_mcp_tools
-            && self.thread_identity_eligible == other.thread_identity_eligible
-            && self.control_endpoint_eligible == other.control_endpoint_eligible
-            // Ineligible servers never bind an identity, so a thread change
-            // (fork, delegate, reconstructed resume) must not force them to
-            // reconnect; ordinary servers stay unaffected. Eligible servers
-            // must reconnect and rebind on a thread change rather than reuse
-            // a connection bound to a stale thread id.
-            && (!self.thread_identity_eligible || self.canonical_thread_id == other.canonical_thread_id)
-            && (!self.control_endpoint_eligible || self.control_endpoint == other.control_endpoint)
     }
 
     pub(crate) fn oauth_credentials(&self) -> Result<Option<&StoredOAuthTokens>, &String> {

@@ -1,4 +1,5 @@
 use super::*;
+use crate::backend::BundleClient;
 use codex_config::CloudConfigBundle;
 use codex_http_client::OutboundProxyPolicy;
 use codex_login::CodexAuth;
@@ -19,6 +20,7 @@ async fn exhausted_generation_never_wraps_or_reopens_ordinary_construction() {
                 "http://127.0.0.1:1".to_owned(),
                 home.path().to_path_buf(),
                 HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+                &ConfigRequirementsToml::default(),
             )
             .await
             .is_err()
@@ -70,6 +72,7 @@ async fn storage_constructor_spanning_completed_reset_cannot_adopt_new_generatio
             "http://127.0.0.1:1".to_owned(),
             path.clone(),
             HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+            &ConfigRequirementsToml::default(),
         )
         .await
         .expect("managed reset");
@@ -89,4 +92,68 @@ async fn storage_constructor_spanning_completed_reset_cannot_adopt_new_generatio
                 .exists()
         );
     }
+}
+
+#[tokio::test]
+async fn personal_auth_one_shot_keeps_generation_fence_without_fetching_policy() {
+    let home = tempfile::tempdir().expect("home");
+    let mut config = codex_core::config::ConfigBuilder::default()
+        .codex_home(home.path().to_path_buf())
+        .build()
+        .await
+        .unwrap()
+        .auth_config();
+    // Known non-managed plan skips policy fetch; the deliberately invalid HTTP
+    // policy endpoint also discriminates an unexpected network/validation path.
+    config.chatgpt_base_url = Some("http://127.0.0.1:1".into());
+    let auth =
+        CodexAuth::from_external_chatgpt_tokens("e30.e30.c2ln", "synthetic-account", Some("plus"))
+            .unwrap();
+    let loader = managed_config_bundle_loader_for_auth(
+        config.clone(),
+        &auth,
+        &ConfigRequirementsToml::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(loader.get().await.unwrap(), None);
+    let lifecycle = home_lifecycle(home.path()).unwrap();
+    lifecycle.retire_owners().await.unwrap();
+    assert!(loader.get().await.is_err());
+    assert!(loader.get_snapshot().await.bundle.is_err());
+    assert!(
+        managed_config_bundle_loader_for_auth(config, &auth, &ConfigRequirementsToml::default())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn failed_replacement_constructor_retires_originals_and_keeps_admission_closed() {
+    let home = tempfile::tempdir().unwrap();
+    let old = CloudConfigBundleService::new(
+        AuthManager::from_auth_for_testing(CodexAuth::from_api_key("synthetic-key")),
+        Arc::new(UnexpectedFetch(AtomicUsize::new(0))),
+        home.path().to_path_buf(),
+        CLOUD_CONFIG_BUNDLE_TIMEOUT,
+    );
+    let (loader, original) = managed_config_bundle_loader_for_service(old).unwrap();
+    assert_eq!(loader.get().await.unwrap(), None);
+    let result = strict_loader_from_constructor::<crate::chatgpt::ChatGptSource<UnexpectedFetch>>(
+        home.path().to_path_buf(),
+        || Err(lifecycle_error("synthetic replacement refusal")),
+    )
+    .await;
+    assert!(result.is_err());
+    assert!(original.await.unwrap_err().is_cancelled());
+    assert!(loader.get().await.is_err());
+    let lifecycle = home_lifecycle(home.path()).unwrap();
+    assert!(lifecycle.owners.lock().unwrap().retiring);
+    let later = CloudConfigBundleService::new(
+        AuthManager::from_auth_for_testing(CodexAuth::from_api_key("synthetic-key")),
+        Arc::new(UnexpectedFetch(AtomicUsize::new(0))),
+        home.path().to_path_buf(),
+        CLOUD_CONFIG_BUNDLE_TIMEOUT,
+    );
+    assert!(managed_config_bundle_loader_for_service(later).is_err());
 }

@@ -65,6 +65,7 @@ async fn choose_model(
             &event,
             AppEvent::OpenReasoningPopup { .. }
                 | AppEvent::UpdateModel(_)
+                | AppEvent::ApplyModelSelection { .. }
                 | AppEvent::SelectSessionModel { .. }
                 | AppEvent::AstraSelectedFromModelPicker { .. }
         ) {
@@ -350,7 +351,7 @@ async fn a_command_pending_on_fresh_astra_start_can_finish_before_the_sparkle() 
         app.pending_startup_thread_start = true;
         app.chat_widget.handle_paste(command.into());
         let mut server = crate::start_embedded_app_server_for_picker(&app.config).await?;
-        app.handle_startup_thread_started(&mut server, Ok(started("gpt-6-astra").into()))
+        app.handle_startup_thread_started(&mut server, Ok(started("gpt-6-astra")))
             .await?;
         assert_eq!(
             (
@@ -544,6 +545,7 @@ async fn astra_picker_confirms_the_model_at_application_after_an_automatic_updat
             if matches!(
                 &event,
                 AppEvent::UpdateModel(_)
+                    | AppEvent::ApplyModelSelection { .. }
                     | AppEvent::UpdateReasoningEffort(_)
                     | AppEvent::SelectSessionModel { .. }
                     | AppEvent::ApplyAdvancedReasoning { .. }
@@ -621,6 +623,7 @@ fn astra_picker_xhigh_applies_on_a_bounded_stack() -> Result<()> {
                     if matches!(
                         &event,
                         AppEvent::AstraSelectedFromModelPicker { .. }
+                            | AppEvent::ApplyModelSelection { .. }
                             | AppEvent::UpdateReasoningEffort(_)
                             | AppEvent::PersistModelSelection { .. }
                     ) {
@@ -782,7 +785,7 @@ async fn early_input_and_real_work_consume_the_sparkle() -> Result<()> {
         let mut server = crate::start_embedded_app_server_for_picker(&app.config).await?;
         let thread = started("gpt-6-astra");
         let thread_id = thread.session.thread_id;
-        app.handle_startup_thread_started(&mut server, Ok(thread.into()))
+        app.handle_startup_thread_started(&mut server, Ok(thread))
             .await?;
         if scenario == "turn" {
             app.handle_app_server_event(

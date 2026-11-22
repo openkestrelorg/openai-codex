@@ -20,6 +20,9 @@ pub(crate) struct RetentionSnapshot {
     pub(crate) granted: bool,
     pub(crate) unretained_since: Instant,
     pub(crate) retiring: bool,
+    /// An in-flight `thread/clear` holds this exact runtime as its source.
+    /// Idle retirement is disarmed while set and re-armed on release.
+    pub(crate) clear_held: bool,
 }
 
 pub(super) struct RetentionLifecycle {
@@ -30,11 +33,15 @@ pub(super) struct RetentionLifecycle {
     runtime: Weak<codex_core::CodexThread>,
     reconciled: bool,
     listener_completion: Option<futures::future::Shared<futures::future::BoxFuture<'static, bool>>>,
+    /// Signalled (lock-free) by a pre-work clear cancellation whose `Drop`
+    /// deferred its release; the listener consumes it under the mutex.
+    clear_wake: Arc<tokio::sync::Notify>,
 }
 
 impl RetentionLifecycle {
     pub(super) fn new(identity: Weak<Mutex<ThreadState>>) -> Self {
         Self {
+            clear_wake: Arc::new(tokio::sync::Notify::new()),
             identity,
             ticket: None,
             report: None,
@@ -47,6 +54,7 @@ impl RetentionLifecycle {
                 granted: false,
                 unretained_since: Instant::now(),
                 retiring: false,
+                clear_held: false,
             })
             .0,
         }
@@ -54,8 +62,17 @@ impl RetentionLifecycle {
 }
 
 impl RetentionLifecycle {
+    pub(super) fn clear_wake(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.clear_wake)
+    }
+
     pub(super) fn is_retiring(&self) -> bool {
         self.snapshot.borrow().retiring
+    }
+
+    /// True only when this row was seeded for exactly this observation entry.
+    pub(super) fn is_identity(&self, state: &Arc<Mutex<ThreadState>>) -> bool {
+        self.identity.ptr_eq(&Arc::downgrade(state))
     }
 
     pub(super) fn has_complete_report(&self) -> bool {
@@ -103,6 +120,39 @@ impl ThreadStateManagerInner {
             }
             true
         });
+    }
+
+    /// Publishes whether the exact clear reservation for `thread_id` is held.
+    /// Release restarts the unretained clock so idle unload is re-armed with a
+    /// full delay after the clear, never fired mid-clear.
+    pub(super) fn publish_clear_hold(&mut self, thread_id: ThreadId) {
+        let held = self.exact_clear_reservation_held(thread_id);
+        let Some(record) = self.lifecycle.get_mut(&thread_id) else {
+            return;
+        };
+        record.snapshot.send_if_modified(|snapshot| {
+            if snapshot.clear_held == held {
+                return false;
+            }
+            snapshot.clear_held = held;
+            snapshot.revision = Uuid::now_v7();
+            if !held && !snapshot.granted {
+                snapshot.unretained_since = Instant::now();
+            }
+            true
+        });
+    }
+
+    /// True only while a clear reservation is held for exactly the current
+    /// observation entry of `thread_id` (not a stale same-id incarnation).
+    pub(super) fn exact_clear_reservation_held(&self, thread_id: ThreadId) -> bool {
+        match (
+            self.clear_transition_reservations.get(&thread_id),
+            self.threads.get(&thread_id),
+        ) {
+            (Some(held), Some(entry)) => held.identity.ptr_eq(&Arc::downgrade(&entry.state)),
+            _ => false,
+        }
     }
 }
 
@@ -193,6 +243,45 @@ impl ThreadStateManager {
             return false;
         };
         record.reconciled = runtime.retirement_reconciled();
+        state
+            .retired_lifecycle
+            .insert((claim.thread_id, claim.generation), record);
+        true
+    }
+
+    /// Late resource release after an incomplete original report. Under the
+    /// manager lock, MOVE the exact retiring row unchanged into retired custody:
+    /// its ticket and recorded report stay (still drained by
+    /// `drain_retirement_tickets`), `reconciled` stays false, and a same-id
+    /// successor later receives a fresh lifecycle row and fresh grants.
+    /// The evidence check is read-only; this never drives cleanup.
+    pub(crate) async fn archive_late_release(
+        &self,
+        claim: RetentionRetirementClaim,
+        runtime: &Arc<codex_core::CodexThread>,
+    ) -> bool {
+        let mut state = self.state.lock().await;
+        if state.retirement_claims_closed {
+            return false;
+        }
+        let Some(record) = state.lifecycle.get(&claim.thread_id) else {
+            return false;
+        };
+        if !record.is_retiring()
+            || record.snapshot.borrow().generation != claim.generation
+            || !record.runtime.ptr_eq(&Arc::downgrade(runtime))
+            || record.ticket.is_none()
+            || record
+                .report
+                .as_ref()
+                .is_none_or(codex_core::ThreadRetirementReport::is_complete)
+            || !runtime.late_release_is_quiescent()
+        {
+            return false;
+        }
+        let Some(record) = state.lifecycle.remove(&claim.thread_id) else {
+            return false;
+        };
         state
             .retired_lifecycle
             .insert((claim.thread_id, claim.generation), record);
@@ -299,6 +388,20 @@ impl ThreadStateManager {
             .get(&thread_id)
             .map(|entry| Arc::clone(&entry.state))
             .ok_or(RetentionRetirementRefusal::UnknownThread)?;
+        // An in-flight clear is admitted work on this exact runtime: it still
+        // dispatches A's clear SessionEnd and must perform the A -> B
+        // subscription move. Checked first, under the same mutex as the
+        // reservation, so a listener holding a pre-reservation snapshot is
+        // refused Busy (retryable) rather than Changed.
+        // A proven pre-work clear cancellation may have deferred its release
+        // to this claim. Consuming it moves the snapshot, so nothing is
+        // committed here; the caller re-evaluates against the re-armed one.
+        if state.consume_pending_clear_release(thread_id) {
+            return Err(RetentionRetirementRefusal::Busy);
+        }
+        if state.exact_clear_reservation_held(thread_id) {
+            return Err(RetentionRetirementRefusal::Busy);
+        }
         let listener = entry
             .try_lock()
             .map_err(|_| RetentionRetirementRefusal::Busy)?;

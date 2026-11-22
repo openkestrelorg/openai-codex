@@ -9,8 +9,111 @@ use tokio_util::sync::CancellationToken;
 use tracing::Subscriber;
 use tracing::info;
 use tracing::warn;
+use tracing_subscriber::Layer;
 use tracing_subscriber::registry::LookupSpan;
+use tracing_subscriber::reload;
 
+type OtelExportLayer<S> = Option<Box<dyn Layer<S> + Send + Sync + 'static>>;
+type OtelReloadLayers<S> = (
+    Vec<Box<dyn Layer<S> + Send + Sync + 'static>>,
+    reload::Handle<OtelExportLayer<S>, S>,
+);
+
+pub(crate) fn layers<S>(provider: Option<&OtelProvider>) -> OtelReloadLayers<S>
+where
+    S: Subscriber + for<'span> LookupSpan<'span> + Send + Sync + 'static,
+{
+    let logger_export_layer: OtelExportLayer<S> = provider
+        .and_then(OtelProvider::logger_export_layer)
+        .map(Layer::boxed);
+    let (logger_layer, logger_handle) = reload::Layer::new(logger_export_layer);
+
+    let layers: Vec<Box<dyn Layer<S> + Send + Sync + 'static>> = vec![
+        logger_layer
+            .with_filter(tracing_subscriber::filter::filter_fn(
+                OtelProvider::log_export_filter,
+            ))
+            .boxed(),
+        // The subscriber graph is fixed after startup. Keep the global tracer
+        // bridge installed even when tracing starts disabled so an account
+        // switch can install a trace exporter later.
+        OtelProvider::reloadable_tracing_layer(OTEL_SERVICE_NAME).boxed(),
+    ];
+    (layers, logger_handle)
+}
+
+pub(crate) fn spawn<S>(
+    mut provider: Option<OtelProvider>,
+    logger_reload_handle: reload::Handle<OtelExportLayer<S>, S>,
+    config_manager: ConfigManager,
+    auth_manager: Arc<AuthManager>,
+    default_analytics_enabled: bool,
+    shutdown_token: CancellationToken,
+) -> JoinHandle<()>
+where
+    S: Subscriber + for<'span> LookupSpan<'span> + Send + Sync + 'static,
+{
+    let mut auth_changes = auth_manager.auth_change_receiver();
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = shutdown_token.cancelled() => break,
+                changed = auth_changes.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+
+                    // Account handlers install the new cloud loader after publishing auth changes.
+                    tokio::time::sleep(Duration::from_millis(/*millis*/ 50)).await;
+
+                    let config = match config_manager.load_latest_config(/*fallback_cwd*/ None).await {
+                        Ok(config) => config,
+                        Err(error) => {
+                            warn!(%error, "failed to reload telemetry config after account change");
+                            continue;
+                        }
+                    };
+                    let next_provider = match codex_core::otel_init::build_provider(
+                        &config,
+                        env!("CARGO_PKG_VERSION"),
+                        Some(OTEL_SERVICE_NAME),
+                        default_analytics_enabled,
+                    ) {
+                        Ok(provider) => provider,
+                        Err(error) => {
+                            warn!(%error, "failed to rebuild telemetry exporters after account change");
+                            continue;
+                        }
+                    };
+                    if let Err(error) = logger_reload_handle.reload(
+                        next_provider
+                            .as_ref()
+                            .and_then(OtelProvider::logger_export_layer)
+                            .map(Layer::boxed),
+                    ) {
+                        warn!(%error, "failed to install telemetry exporters after account change");
+                        continue;
+                    }
+                    if let Some(previous_provider) = std::mem::replace(&mut provider, next_provider) {
+                        drop(tokio::task::spawn_blocking(move || previous_provider.shutdown()));
+                    }
+                    info!(
+                        event.name = "codex.app_server.otel_reloaded",
+                        "reloaded telemetry exporters after account change"
+                    );
+                }
+            }
+        }
+
+        if let Some(provider) = provider {
+            let _ = tokio::task::spawn_blocking(move || provider.shutdown()).await;
+        }
+    })
+}
+
+// Managed publication and retained retirement. Standalone constructor wiring
+// must supply the real owner deadline and inspect the returned shutdown result.
 pub(crate) struct ManagedReloader<S> {
     provider: Option<OtelProvider>,
     routes: codex_otel::ManagedTelemetryRoutes<S>,
@@ -119,8 +222,12 @@ where
     }
 }
 
+/// Existing shutdown telemetry drain cap; standalone hosts clamp it to their owner.
+pub(crate) const TELEMETRY_DRAIN_CAP: Duration = Duration::from_secs(30);
+
 /// Serializes managed commands with the legacy auth watcher. The returned task
 /// is the exporter owner and must remain owned through standalone shutdown.
+#[cfg(test)]
 pub(crate) fn spawn_managed<S>(
     initial: codex_otel::TelemetryPublication,
     routes: codex_otel::ManagedTelemetryRoutes<S>,
@@ -128,6 +235,34 @@ pub(crate) fn spawn_managed<S>(
     auth_manager: Arc<AuthManager>,
     default_analytics_enabled: bool,
     shutdown_token: CancellationToken,
+) -> (
+    crate::otel_reset_control::TelemetryResetControl,
+    JoinHandle<ManagedReloader<S>>,
+)
+where
+    S: Subscriber + for<'span> LookupSpan<'span> + Send + Sync + 'static,
+{
+    spawn_managed_with_owner_deadline(
+        initial,
+        routes,
+        config_manager,
+        auth_manager,
+        default_analytics_enabled,
+        shutdown_token,
+        tokio::sync::watch::channel(None).1,
+    )
+}
+
+/// As `spawn_managed`; the shutdown drain is `min(TELEMETRY_DRAIN_CAP, owner)`
+/// when the host has published its owner deadline before cancelling.
+pub(crate) fn spawn_managed_with_owner_deadline<S>(
+    initial: codex_otel::TelemetryPublication,
+    routes: codex_otel::ManagedTelemetryRoutes<S>,
+    config_manager: ConfigManager,
+    auth_manager: Arc<AuthManager>,
+    default_analytics_enabled: bool,
+    shutdown_token: CancellationToken,
+    owner_deadline: tokio::sync::watch::Receiver<Option<tokio::time::Instant>>,
 ) -> (
     crate::otel_reset_control::TelemetryResetControl,
     JoinHandle<ManagedReloader<S>>,
@@ -230,9 +365,10 @@ where
                 let (provider, retired) = publication.retire_previous(state.provider.take());
                 state.provider = provider;
                 state.retired.push(retired);
-                state
-                    .drain(tokio::time::Instant::now() + Duration::from_secs(30))
-                    .await
+                let cap = tokio::time::Instant::now() + TELEMETRY_DRAIN_CAP;
+                let owner = *owner_deadline.borrow();
+                let deadline = owner.map_or(cap, |owner| owner.min(cap));
+                state.drain(deadline).await
             }
             Err(_) => Err(crate::otel_reset_control::TelemetryResetError::Unavailable),
         });

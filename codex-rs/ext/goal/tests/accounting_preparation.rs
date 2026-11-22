@@ -46,6 +46,7 @@ fn abandoned_preparation_preserves_every_accounting_field_and_late_review_is_ine
                 id: "empty-final".into(),
                 content: vec![AgentMessageContent::Text { text: "".into() }],
                 phase: Some(MessagePhase::FinalAnswer),
+                moderation: None,
                 memory_citation: None,
                 delivery: None,
                 questions: None,
@@ -198,4 +199,23 @@ fn idle_progress_during_preparation_is_not_rewound_or_double_charged() {
         Some("goal".into()),
         other.current_active_goal_id_for_turn("turn")
     );
+}
+
+#[test]
+fn abandoned_preparation_preserves_interrupted_owner_until_new_commit() {
+    let state = GoalAccountingState::default();
+    let previous = state.prepare_turn("interrupted", ModeKind::Default, &TokenUsage::default());
+    state.commit_prepared_turn("interrupted", &previous);
+    state.interrupt_turn("interrupted");
+    let before = format!("{state:?}");
+    let abandoned = state.prepare_turn("abandoned", ModeKind::Default, &TokenUsage::default());
+    drop(abandoned);
+    assert_eq!(before, format!("{state:?}"));
+    assert_eq!(Some("interrupted".into()), state.interrupted_turn_id());
+    let accepted = state.prepare_turn("accepted", ModeKind::Default, &TokenUsage::default());
+    state.commit_prepared_turn("wrong", &accepted);
+    assert_eq!(before, format!("{state:?}"));
+    state.commit_prepared_turn("accepted", &accepted);
+    assert_eq!(None, state.interrupted_turn_id());
+    assert_eq!(Some("accepted".into()), state.current_turn_id());
 }

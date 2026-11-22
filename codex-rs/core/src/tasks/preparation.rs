@@ -73,7 +73,7 @@ impl MailboxPreparationSlot {
         clippy::expect_used,
         reason = "poisoned preparation state cannot authorize a retry"
     )]
-    pub(super) fn defer_if_busy(&self, wake: &Notify) -> bool {
+    pub(crate) fn defer_if_busy(&self, wake: &Notify) -> bool {
         let state = self.state.lock().expect("mailbox preparation poisoned");
         if state.replacing > 0 {
             // The last replacement guard owns the retry wake.
@@ -127,7 +127,7 @@ impl MailboxPreparationSlot {
         clippy::expect_used,
         reason = "poisoned preparation state cannot supply a trustworthy witness"
     )]
-    pub(super) fn cancel_for_replacement(&self) -> Option<CancellationToken> {
+    pub(crate) fn cancel_for_replacement(&self) -> Option<CancellationToken> {
         let state = self.state.lock().expect("mailbox preparation poisoned");
         state.current.as_ref().map(|preparation| {
             preparation.cancellation.cancel();
@@ -137,7 +137,7 @@ impl MailboxPreparationSlot {
 }
 
 impl MailboxPreparation {
-    pub(super) async fn cancelled(&self) {
+    pub(crate) async fn cancelled(&self) {
         self.preparation.cancellation.cancelled().await;
     }
 

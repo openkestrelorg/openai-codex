@@ -76,12 +76,11 @@ fn connection_identity(
         &Ok(None),
         runtime_context,
         /*runtime_auth_provider*/ None,
+        /*runtime_auth_mode*/ None,
         /*auth*/ None,
         /*codex_apps_cache_identity*/ None,
         ElicitationCapability::default(),
         ClientMcpExtensions::default(),
-        /*canonical_thread_id*/ None,
-        /*control_endpoint*/ None,
         /*previous_identity*/ None,
     )
 }
@@ -173,8 +172,48 @@ fn tool_catalog_cache_does_not_reuse_catalogs_across_credential_policies() {
             .expect("explicit authorization permits catalog caching")
     };
     let host_context = context(&host_identity);
-    host_context.publish_if_newest(host_context.begin_fetch(), &[]);
+    host_context.publish_if_newest(host_context.begin_fetch(), &[], /*meta*/ None);
 
     assert_eq!(context(&host_identity).current_tools(), Some(Vec::new()));
     assert_eq!(context(&executor_identity).current_tools(), None);
+}
+
+#[test]
+fn disclosure_scope_fences_reuse_without_fragmenting_ordinary_connections() {
+    let context = runtime_context();
+    let first = context
+        .clone()
+        .with_canonical_thread_id("thread-a".into())
+        .with_control_endpoint(Some("unix:///host-a".into()));
+    let second = context
+        .clone()
+        .with_canonical_thread_id("thread-b".into())
+        .with_control_endpoint(Some("unix:///host-b".into()));
+    let mut config: McpServerConfig =
+        serde_json::from_value(serde_json::json!({"command": "fixture"})).unwrap();
+    let ordinary = EffectiveMcpServer::from_host_config(config.clone());
+    assert!(
+        connection_identity(&ordinary, &first)
+            .has_same_connection_config(&connection_identity(&ordinary, &second))
+    );
+
+    config.thread_identity_eligible = true;
+    let thread_bound = EffectiveMcpServer::from_host_config(config.clone());
+    let identity = connection_identity(&thread_bound, &first);
+    assert!(identity.has_same_connection_config(&connection_identity(&thread_bound, &first)));
+    assert!(!identity.has_same_connection_config(&connection_identity(&thread_bound, &second)));
+    assert!(!identity.has_same_connection_config(&connection_identity(&thread_bound, &context)));
+    assert!(!identity.has_same_connection_config(&connection_identity(&ordinary, &first)));
+
+    config.thread_identity_eligible = false;
+    config.control_endpoint_eligible = true;
+    let endpoint_bound = EffectiveMcpServer::from_host_config(config);
+    assert!(
+        !connection_identity(&endpoint_bound, &first)
+            .has_same_connection_config(&connection_identity(&endpoint_bound, &second))
+    );
+    assert!(
+        !connection_identity(&endpoint_bound, &first)
+            .has_same_connection_config(&connection_identity(&endpoint_bound, &context))
+    );
 }

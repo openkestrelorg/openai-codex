@@ -93,6 +93,8 @@ async fn hosted_plugin_runtime_ps_mcp_tool_calls_use_current_auth_manager_token(
     let runtime = McpRuntime::new(McpRuntimeInput {
         attempt_requirement: codex_mcp::McpAttemptRequirement::Ungated,
         startup_work: None,
+        network_policy_metadata: None,
+        runtime_auth: None,
         startup_policy: McpStartupPolicy::Eager,
         config: mcp_config,
         plugins_available: false,
@@ -113,8 +115,6 @@ async fn hosted_plugin_runtime_ps_mcp_tool_calls_use_current_auth_manager_token(
         auth_manager: Some(Arc::clone(&auth_manager)),
         elicitation_reviewer: None,
         elicitation_lifecycle: None,
-        canonical_thread_id: None,
-        control_endpoint: None,
     })
     .await;
     // The model-provider test covers AuthManager reload behavior. Keep this
@@ -147,7 +147,7 @@ async fn hosted_plugin_runtime_ps_mcp_tool_calls_use_current_auth_manager_token(
             /*wait_for_server*/ true,
         )
         .await?;
-    assert_eq!(tool_result.is_error, Some(false));
+    assert_eq!(tool_result.result.is_error, Some(false));
 
     let requests = server
         .received_requests()

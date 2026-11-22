@@ -2,10 +2,10 @@
 //! Backend operations and local admission policy live in the implementations.
 
 use crate::context::MultiAgentRoleInstructions;
+use crate::environment_selection::TurnEnvironmentSnapshot;
 use codex_protocol::AgentPath;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::AgentStatus;
-use codex_protocol::protocol::TurnEnvironmentSelection;
 use codex_protocol::turn_input::CyberAccessProgram;
 
 /// Registry identity shared by loaded and unloaded agents.
@@ -21,12 +21,11 @@ pub struct AgentMetadata {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SpawnAgentForkMode {
     FullHistory,
-    LastNTurns(usize),
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct SpawnAgentOptions {
-    /// Captured parent provenance, independent of tracing's parent-turn ID.
+    /// Exact parent provenance; tracing IDs are not account authority.
     pub parent_authority: Option<crate::ParentTurnAuthority>,
     pub fork_parent_spawn_call_id: Option<String>,
     pub fork_mode: Option<SpawnAgentForkMode>,
@@ -35,7 +34,11 @@ pub struct SpawnAgentOptions {
     /// Attribute delegated usage to the turn that initiated it.
     pub turn_trigger: Option<String>,
     pub root_turn_id: Option<String>,
-    pub environments: Option<Vec<TurnEnvironmentSelection>>,
+    /// Inheritable bindings captured by the step that requested the child.
+    pub environments: Option<TurnEnvironmentSnapshot>,
+    /// Plugin choices from the turn requesting the child. Omission inherits the parent's
+    /// current choices; an explicit list, including an empty one, overrides them and history.
+    pub disabled_plugin_ids: Option<Vec<String>>,
     pub multi_agent_v2_usage_hints: Option<ResolvedMultiAgentV2UsageHints>,
     pub cyber_access_program: Option<CyberAccessProgram>,
 }

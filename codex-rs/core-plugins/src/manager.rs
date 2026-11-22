@@ -1,3 +1,12 @@
+use crate::remote::reset_authority::RemotePluginBundleSyncGeneration;
+#[path = "manager_errors.rs"]
+mod errors;
+pub use errors::PluginInstallError;
+pub use errors::PluginUninstallError;
+use errors::marketplace_error_sub_error_type;
+use errors::marketplace_error_type;
+use errors::plugin_install_error_type;
+
 #[path = "remote_mutations.rs"]
 mod remote_mutations;
 pub use remote_mutations::RemotePluginInstallOutcome;
@@ -14,6 +23,8 @@ use super::LoadedPlugin;
 use super::PluginLoadOutcome;
 use crate::PluginGitMode;
 use crate::app_mcp_routing::apply_app_mcp_routing_policy;
+use crate::app_mcp_routing::plugin_supports_apps;
+use crate::http_client_selector::HttpClientSelector;
 use crate::installed_marketplaces::installed_marketplace_roots_from_layer_stack;
 use crate::is_openai_curated_marketplace_name;
 use crate::loaded_cache_metrics;
@@ -38,8 +49,6 @@ use crate::loader::refresh_non_curated_plugin_cache_force_reinstall_detailed;
 use crate::loader::remote_installed_plugins_to_config;
 use crate::manifest::PluginManifestFormat;
 use crate::manifest::PluginManifestInterface;
-use crate::manifest::load_plugin_manifest;
-use crate::manifest::load_plugin_manifest_with_format;
 use crate::marketplace::MarketplaceError;
 use crate::marketplace::MarketplaceInterface;
 use crate::marketplace::MarketplaceListError;
@@ -52,7 +61,7 @@ use crate::marketplace::ResolvedMarketplacePlugin;
 use crate::marketplace::find_installable_marketplace_plugin;
 use crate::marketplace::find_marketplace_plugin;
 use crate::marketplace::home_dir;
-use crate::marketplace::list_marketplaces_with_home;
+use crate::marketplace::list_marketplaces_with_cache;
 use crate::marketplace::plugin_interface_with_marketplace_category;
 use crate::marketplace_policy::MarketplacePolicy;
 use crate::marketplace_policy::configured_plugins_from_stack;
@@ -60,6 +69,8 @@ use crate::marketplace_upgrade::ConfigLayerReload;
 use crate::marketplace_upgrade::ConfiguredMarketplaceUpgradeError;
 use crate::marketplace_upgrade::ConfiguredMarketplaceUpgradeOutcome;
 use crate::marketplace_upgrade::upgrade_configured_git_marketplaces_with_mode;
+use crate::remote::CODEX_PRODUCT_SKU;
+use crate::remote::InstalledPluginDisplayAssets;
 use crate::remote::REMOTE_GLOBAL_MARKETPLACE_NAME;
 use crate::remote::RecommendedPluginsMode;
 use crate::remote::RemoteInstalledPlugin;
@@ -72,7 +83,6 @@ use crate::remote::RemotePluginMaterialization;
 use crate::remote::RemotePluginScope;
 use crate::remote::RemotePluginServiceConfig;
 use crate::remote_legacy::RemotePluginFetchError;
-use crate::remote_legacy::RemotePluginMutationError;
 use crate::remote_plugin_id_resolver::RemoteInstalledPluginsSnapshot;
 use crate::remote_plugin_id_resolver::RemotePluginIdResolver;
 use crate::remote_plugin_id_resolver::persisted_remote_plugin_id_for_installation;
@@ -81,11 +91,10 @@ use crate::startup_sync::OPENAI_PLUGINS_GIT_URL;
 use crate::startup_sync::curated_plugins_api_marketplace_path;
 use crate::startup_sync::curated_plugins_repo_path;
 use crate::startup_sync::read_curated_plugins_sha;
-use crate::startup_sync::sync_openai_plugins_repo;
+use crate::startup_sync::sync_openai_plugins_repo_until;
 use crate::store::PluginInstallResult as StorePluginInstallResult;
 use crate::store::PluginStore;
 use crate::store::PluginStoreError;
-use crate::store::error_context_sub_error_type;
 use crate::tool_suggest_metadata::ToolSuggestMetadataCache;
 use codex_analytics::AnalyticsEventsClient;
 use codex_analytics::PluginInstallSource;
@@ -95,12 +104,16 @@ use codex_config::clear_user_plugin;
 use codex_config::set_user_plugin_enabled;
 use codex_config::skill_config_rules_from_stack;
 use codex_config::types::PluginConfig;
+use codex_config::types::PluginsConfigToml;
 use codex_config::types::ToolSuggestDisabledTool;
 use codex_config::types::ToolSuggestDiscoverableType;
 use codex_connectors::ConnectorSnapshot;
 use codex_connectors::PluginConnectorSource;
+use codex_features::RuntimeAuthMode;
 use codex_hooks::plugin_hook_declarations;
+use codex_http_client::ClientRouteClass;
 use codex_http_client::HttpClientFactory;
+use codex_http_client::RouteAwareClientPool;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use codex_plugin::AppConnectorId;
@@ -113,6 +126,7 @@ use codex_plugin::prompt_safe_plugin_description;
 use codex_protocol::auth::AuthMode;
 use codex_protocol::protocol::HookEventName;
 use codex_protocol::protocol::Product;
+use codex_runtime_agent_instance::RuntimeAuthSlot;
 use codex_skills::SkillMetadata;
 use codex_skills::SkillRootLoader;
 use codex_skills::SkillRootSnapshots;
@@ -120,6 +134,7 @@ use codex_tools::DiscoverablePluginInfo;
 use codex_tools::DiscoverableTool;
 use codex_tools::filter_request_plugin_install_discoverable_tools_for_client;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_path_uri::PathUri;
 use codex_utils_plugins::PluginIdentity;
 use codex_utils_plugins::PluginSkillRoot;
 use std::collections::BTreeSet;
@@ -130,6 +145,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::sync::RwLock;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
@@ -138,6 +154,7 @@ use std::time::Instant;
 use tokio::sync::OnceCell;
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::sync::Semaphore;
+use tokio::sync::mpsc;
 use tokio::sync::watch;
 use tracing::instrument;
 use tracing::warn;
@@ -150,20 +167,327 @@ const LOADED_PLUGINS_CACHE_CAPACITY: usize = 8;
 
 type EffectivePluginsChangedCallback = Arc<dyn Fn(EffectivePluginsChange) + Send + Sync + 'static>;
 
+/// Per-queue lifetime metadata, deliberately outside every cache identity.
+#[derive(Clone)]
+struct QueuedPluginRequest<T> {
+    request: T,
+    owner: Option<codex_model_provider::DeferredAuthTask>,
+    obligations: Vec<codex_model_provider::DeferredAuthTask>,
+    callback_owner: Option<codex_model_provider::DeferredAuthTask>,
+}
+impl<T> QueuedPluginRequest<T> {
+    fn prepare(registry: &crate::PluginTaskRegistry, request: T) -> Result<Self, ()> {
+        Ok(Self {
+            request,
+            owner: registry.prepare_auth_request()?,
+            obligations: Vec::new(),
+            callback_owner: None,
+        })
+    }
+
+    /// Only for a pending request whose effects are retained by coalescing.
+    /// Non-curated replacement/dedup does not transfer unrelated old work.
+    fn inherit(&mut self, previous: &Self) {
+        if self.owner.is_none() {
+            self.owner = previous.owner.clone();
+        } else {
+            self.obligations.extend(previous.owner.iter().cloned());
+        }
+        self.obligations
+            .extend(previous.obligations.iter().cloned());
+    }
+
+    fn mark_unavailable(&self) -> bool {
+        let mut managed = false;
+        for owner in self
+            .owner
+            .iter()
+            .chain(self.callback_owner.iter())
+            .chain(self.obligations.iter())
+        {
+            owner.record_failure(codex_model_provider::AuthTaskFailure::Unavailable);
+            managed = true;
+        }
+        managed
+    }
+}
+impl<T> std::ops::Deref for QueuedPluginRequest<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.request
+    }
+}
+impl<T> std::ops::DerefMut for QueuedPluginRequest<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.request
+    }
+}
+
+/// Kept by the accepted command itself, not its cancellable result observer.
+/// Refused/unpolled/panicked dispatch cannot silently finish inherited work.
+struct QueuedPluginObligations {
+    owners: Vec<codex_model_provider::DeferredAuthTask>,
+    completed: bool,
+}
+impl QueuedPluginObligations {
+    fn complete(&mut self) {
+        self.completed = true;
+    }
+}
+impl Drop for QueuedPluginObligations {
+    fn drop(&mut self) {
+        if !self.completed {
+            for owner in &self.owners {
+                owner.record_failure(codex_model_provider::AuthTaskFailure::Unavailable);
+            }
+        }
+    }
+}
+
+async fn run_queued_plugin_work<T: Send + 'static>(
+    owner: &Option<codex_model_provider::DeferredAuthTask>,
+    obligations: Vec<codex_model_provider::DeferredAuthTask>,
+    future: impl std::future::Future<Output = T> + Send + 'static,
+) -> Result<T, codex_model_provider::AuthTaskFailure> {
+    let mut obligations = QueuedPluginObligations {
+        owners: obligations,
+        completed: false,
+    };
+    let command = async move {
+        let value = future.await;
+        obligations.complete();
+        value
+    };
+    match owner {
+        Some(owner) => owner.run(command).await,
+        None => Ok(command.await),
+    }
+}
+
+async fn invoke_queued_plugin_callback(
+    callback: EffectivePluginsChangedCallback,
+    change: EffectivePluginsChange,
+    owner: Option<codex_model_provider::DeferredAuthTask>,
+    backend: Option<codex_model_provider::DeferredAuthTask>,
+) {
+    // A callback retained from A runs in A, not replacement backend B. A same-
+    // original callback runs directly, preserving synchronous effects/order and
+    // avoiding a command awaiting itself in its own serial mailbox.
+    let separate = owner.filter(|owner| {
+        backend
+            .as_ref()
+            .is_none_or(|backend| !owner.same_original(backend))
+    });
+    match separate {
+        Some(owner) => {
+            if let Err(failure) = owner
+                .run(async move {
+                    callback(change);
+                })
+                .await
+            {
+                codex_model_provider::record_auth_task_failure(failure);
+                warn!(?failure, "queued plugin callback custody failed");
+            }
+        }
+        None => callback(change),
+    }
+}
+
+enum AsyncPluginWorkerKind {
+    InstalledRefresh,
+    CatalogRefresh,
+}
+struct AsyncPluginWorkerReset {
+    manager: Arc<PluginsManager>,
+    kind: AsyncPluginWorkerKind,
+    armed: bool,
+}
+impl Drop for AsyncPluginWorkerReset {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // Move captures out before dropping or marking them; no external
+        // destructor/host call runs under a queue write lock.
+        let managed = match self.kind {
+            AsyncPluginWorkerKind::InstalledRefresh => {
+                let abandoned = {
+                    let mut state = self
+                        .manager
+                        .remote_installed_plugins_cache_refresh_state
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    state.in_flight = false;
+                    state.requested.take()
+                };
+                abandoned
+                    .as_ref()
+                    .is_some_and(QueuedPluginRequest::mark_unavailable)
+            }
+            AsyncPluginWorkerKind::CatalogRefresh => {
+                let abandoned = {
+                    let mut state = self
+                        .manager
+                        .remote_catalog_cache_refresh_state
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    state.in_flight = false;
+                    std::mem::take(&mut state.requests)
+                };
+                let mut managed = false;
+                for request in &abandoned {
+                    managed |= request.mark_unavailable();
+                }
+                managed
+            }
+        };
+        if managed {
+            self.manager.task_registry.worker_stop().mark_unavailable();
+        }
+    }
+}
+
+enum BlockingPluginWorkerKind {
+    MarketplaceUpgrade,
+    NonCuratedRefresh,
+}
+struct BlockingPluginWorkerReset {
+    manager: Arc<PluginsManager>,
+    kind: BlockingPluginWorkerKind,
+    armed: bool,
+}
+impl Drop for BlockingPluginWorkerReset {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        match self.kind {
+            BlockingPluginWorkerKind::MarketplaceUpgrade => {
+                self.manager
+                    .configured_marketplace_upgrade_state
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .in_flight = false;
+            }
+            BlockingPluginWorkerKind::NonCuratedRefresh => {
+                let abandoned = {
+                    let mut state = self
+                        .manager
+                        .non_curated_cache_refresh_state
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if state.in_flight || state.requested.is_some() {
+                        state.in_flight = false;
+                        self.manager
+                            .non_curated_cache_refresh_completion
+                            .send_modify(|completion| {
+                                completion.sequence = completion.sequence.wrapping_add(1);
+                            });
+                    }
+                    state.requested.take()
+                };
+                if abandoned
+                    .as_ref()
+                    .is_some_and(QueuedPluginRequest::mark_unavailable)
+                {
+                    self.manager.task_registry.worker_stop().mark_unavailable();
+                }
+            }
+        }
+    }
+}
+
+/// Existing once-per-process start flag, released on refusal, creation failure
+/// or panic as well as ordinary sync failure. Only successful sync commits it.
+struct CuratedSyncStart {
+    started: &'static AtomicBool,
+    committed: bool,
+}
+impl CuratedSyncStart {
+    fn begin(started: &'static AtomicBool) -> Option<Self> {
+        (!started.swap(true, Ordering::SeqCst)).then(|| Self {
+            started,
+            committed: false,
+        })
+    }
+}
+impl Drop for CuratedSyncStart {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.started.store(false, Ordering::SeqCst);
+        }
+    }
+}
+
+/// The callback and every invocation clone release their captured values with
+/// the selected runtime entered, including refusal/cancellation on an OS thread.
+#[derive(Clone)]
+struct RuntimePluginCallback {
+    runtime: tokio::runtime::Handle,
+    callback: Option<EffectivePluginsChangedCallback>,
+}
+impl RuntimePluginCallback {
+    fn call(&self, change: EffectivePluginsChange) {
+        self.callback
+            .as_ref()
+            .unwrap_or_else(|| panic!("callback capture is live"))(change);
+    }
+}
+
+impl Drop for RuntimePluginCallback {
+    fn drop(&mut self) {
+        let _entered = self.runtime.enter();
+        drop(self.callback.take());
+    }
+}
+
+fn dispatch_on_runtime(
+    registry: crate::PluginTaskRegistry,
+    runtime: tokio::runtime::Handle,
+    callback: EffectivePluginsChangedCallback,
+) -> EffectivePluginsChangedCallback {
+    let owned = RuntimePluginCallback {
+        runtime,
+        callback: Some(callback),
+    };
+    Arc::new(move |change| {
+        let invocation = owned.clone();
+        let runtime = invocation.runtime.clone();
+        let _entered = runtime.enter();
+        if registry
+            .spawn_callback_on(&runtime, async move {
+                invocation.call(change);
+            })
+            .is_err()
+        {
+            warn!("effective-plugin change not delivered: plugin task registry is closed");
+        }
+    })
+}
+
 #[derive(Debug, Clone)]
 pub struct PluginsConfigInput {
     pub config_layer_stack: ConfigLayerStack,
+    pub plugins: PluginsConfigToml,
     pub model_provider_id: String,
     pub plugins_enabled: bool,
     pub remote_plugin_enabled: bool,
     pub chatgpt_base_url: String,
     pub product_sku: Option<String>,
+    plugin_recommendations_enabled: bool,
     http_client_factory: HttpClientFactory,
+    remote_http_clients: Arc<OnceLock<Arc<dyn HttpClientSelector>>>,
+    runtime_http_clients: Arc<OnceLock<Arc<dyn HttpClientSelector>>>,
+    runtime_auth_mode: Option<RuntimeAuthMode>,
 }
 
 impl PluginsConfigInput {
+    // Require validated policy at construction; a default followed by a setter could fail open.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         config_layer_stack: ConfigLayerStack,
+        plugins: PluginsConfigToml,
         model_provider_id: String,
         plugins_enabled: bool,
         remote_plugin_enabled: bool,
@@ -173,28 +497,83 @@ impl PluginsConfigInput {
     ) -> Self {
         Self {
             config_layer_stack,
+            plugins,
             model_provider_id,
             plugins_enabled,
             remote_plugin_enabled,
             chatgpt_base_url,
             http_client_factory,
             product_sku,
+            plugin_recommendations_enabled: false,
+            remote_http_clients: Arc::new(OnceLock::new()),
+            runtime_http_clients: Arc::new(OnceLock::new()),
+            runtime_auth_mode: None,
         }
     }
 
-    /// Builds route-aware service state for remote plugin requests.
-    pub fn remote_plugin_service_config(&self) -> RemotePluginServiceConfig {
-        RemotePluginServiceConfig::new(
-            self.chatgpt_base_url.clone(),
-            self.http_client_factory.clone(),
-            self.product_sku.clone(),
-        )
+    pub fn with_plugin_recommendations_enabled(mut self, enabled: bool) -> Self {
+        self.plugin_recommendations_enabled = enabled;
+        self
     }
+
+    pub fn with_runtime_auth_mode(mut self, mode: Option<RuntimeAuthMode>) -> Self {
+        self.runtime_auth_mode = mode;
+        self
+    }
+
+    /// Shares lazy route-aware connection pools across this input and its clones.
+    /// Runtime mode strips sensitive headers on cross-origin redirects.
+    pub fn remote_plugin_service_config(
+        &self,
+        runtime_auth: Option<(RuntimeAuthSlot, RuntimeAuthMode)>,
+    ) -> RemotePluginServiceConfig {
+        let runtime_auth = runtime_auth.filter(|_| {
+            codex_http_client::classify_openai_api_url(&self.chatgpt_base_url)
+                != codex_http_client::OpenAiDestination::Other
+        });
+        let (http_clients, factory) = if runtime_auth.is_some() {
+            (
+                &self.runtime_http_clients,
+                self.http_client_factory
+                    .clone()
+                    .with_sensitive_header_protection(),
+            )
+        } else {
+            (&self.remote_http_clients, self.http_client_factory.clone())
+        };
+        let http_clients = http_clients.get_or_init(|| {
+            Arc::new(
+                RouteAwareClientPool::with_chatgpt_cloudflare_cookies_without_request_logging(
+                    factory,
+                    ClientRouteClass::Api,
+                ),
+            )
+        });
+        RemotePluginServiceConfig {
+            chatgpt_base_url: self.chatgpt_base_url.clone(),
+            product_sku: self
+                .product_sku
+                .clone()
+                .unwrap_or_else(|| CODEX_PRODUCT_SKU.to_string()),
+            http_clients: Arc::clone(http_clients),
+            runtime_auth,
+        }
+    }
+}
+
+/// Operation that requested a background sync of installed plugin bundles.
+#[derive(Clone, Copy, Debug)]
+pub enum InstalledPluginSyncSource {
+    PluginInstalled,
+    PluginList,
+    Startup,
 }
 
 /// Effective-plugin changes that downstream composition layers may act on.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EffectivePluginsChange {
+    /// Joins this notification to its installed-plugin cache publication in diagnostics.
+    pub metadata_change_id: Option<uuid::Uuid>,
     /// Remote bundles installed or updated by background installed-plugin sync.
     pub materialized_remote_plugins: Vec<RemotePluginMaterialization>,
 }
@@ -255,10 +634,15 @@ struct RemoteInstalledPluginsCache {
     // A cancelled pass may mutate bundles before publication; retry must notify consumers.
     needs_effective_plugins_refresh: bool,
     plugins: Option<Vec<RemoteInstalledPlugin>>,
+    display_assets: InstalledPluginDisplayAssets,
+}
+
+struct InstalledPluginCacheUpdate {
+    metadata_change_id: Option<uuid::Uuid>,
 }
 
 enum RemoteInstalledPluginsCachePublication {
-    Refresh,
+    Refresh(InstalledPluginDisplayAssets),
     Reconcile,
 }
 
@@ -269,8 +653,6 @@ enum RemoteInstalledPluginsCachePublication {
 /// installed state, then release it before unrelated analytics, OAuth, or runtime refresh work.
 struct RemoteInstalledPluginSyncGuard {
     _permit: OwnedSemaphorePermit,
-    reset_generation: RemoteInstalledPluginsGeneration,
-    bundle_generation: crate::remote::RemotePluginBundleSyncGeneration,
 }
 
 struct RemoteInstalledPluginsReconciliationGuard<'a> {
@@ -290,7 +672,6 @@ impl Drop for RemoteInstalledPluginsReconciliationGuard<'_> {
 
 struct RemoteInstalledPluginsCacheRefreshRequest {
     generation: u64,
-    reset_generation: RemoteInstalledPluginsGeneration,
     service_config: RemotePluginServiceConfig,
     auth: Option<CodexAuth>,
     notify: RemoteInstalledPluginsCacheRefreshNotify,
@@ -311,27 +692,14 @@ enum RemoteInstalledPluginsCacheRefreshNotify {
 
 #[derive(Default)]
 struct RemoteInstalledPluginsCacheRefreshState {
-    generation: RemoteInstalledPluginsGeneration,
-    requested: Option<RemoteInstalledPluginsCacheRefreshRequest>,
+    requested: Option<QueuedPluginRequest<RemoteInstalledPluginsCacheRefreshRequest>>,
     in_flight: bool,
-}
-
-/// An identity token rather than a wrapping counter: a retired request can never
-/// become current again, even after arbitrarily many account resets.
-#[derive(Clone, Default)]
-struct RemoteInstalledPluginsGeneration(Arc<()>);
-
-impl RemoteInstalledPluginsGeneration {
-    fn is_current(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
-    }
 }
 
 struct RemoteCatalogCacheRefreshRequest {
     service_config: RemotePluginServiceConfig,
     auth: Option<CodexAuth>,
     scopes: BTreeSet<RemotePluginScope>,
-    mode: RemoteCatalogCacheRefreshMode,
 }
 
 impl RemoteCatalogCacheRefreshRequest {
@@ -346,15 +714,9 @@ impl RemoteCatalogCacheRefreshRequest {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum RemoteCatalogCacheRefreshMode {
-    OnlyIfStale,
-    Force,
-}
-
 #[derive(Default)]
 struct RemoteCatalogCacheRefreshState {
-    requests: VecDeque<RemoteCatalogCacheRefreshRequest>,
+    requests: VecDeque<QueuedPluginRequest<RemoteCatalogCacheRefreshRequest>>,
     in_flight: bool,
 }
 
@@ -389,7 +751,7 @@ enum NonCuratedCacheRefreshMode {
 
 #[derive(Default)]
 struct NonCuratedCacheRefreshState {
-    requested: Option<NonCuratedCacheRefreshRequest>,
+    requested: Option<QueuedPluginRequest<NonCuratedCacheRefreshRequest>>,
     last_refreshed: Option<NonCuratedCacheRefreshRequest>,
     in_flight: bool,
 }
@@ -403,10 +765,6 @@ struct NonCuratedCacheRefreshCompletion {
 #[derive(Default)]
 struct ConfiguredMarketplaceUpgradeState {
     in_flight: bool,
-}
-
-fn remote_plugin_service_config(config: &PluginsConfigInput) -> RemotePluginServiceConfig {
-    config.remote_plugin_service_config()
 }
 
 fn featured_plugin_ids_cache_key(
@@ -467,7 +825,7 @@ pub struct PluginDetail {
     pub installed: bool,
     pub enabled: bool,
     pub skills: Vec<SkillMetadata>,
-    pub disabled_skill_paths: HashSet<AbsolutePathBuf>,
+    pub disabled_skill_paths: HashSet<PathUri>,
     /// Packaged onboarding path; callers apply visibility and enablement.
     pub onboarding_skill: Option<AbsolutePathBuf>,
     pub hooks: Vec<PluginHookSummary>,
@@ -564,6 +922,7 @@ pub struct PluginsManager {
     remote_catalog_cache_refresh_state: RwLock<RemoteCatalogCacheRefreshState>,
     restriction_product: Option<Product>,
     auth_manager: Arc<AuthManager>,
+    runtime_auth: RuntimeAuthSlot,
     analytics_events_client: RwLock<Option<AnalyticsEventsClient>>,
     plugin_install_source: PluginInstallSource,
     task_registry: crate::PluginTaskRegistry,
@@ -631,6 +990,7 @@ impl LoadedPluginsCache {
 #[derive(Clone, PartialEq, Eq)]
 struct PluginLoadCacheKey {
     configured_plugins: HashMap<String, PluginConfig>,
+    plugin_policy: PluginsConfigToml,
     skill_config_rules: SkillConfigRules,
     remote_global_catalog_active: bool,
     auth_identity: Option<RemoteInstalledPluginsAuthIdentity>,
@@ -643,11 +1003,19 @@ impl PluginLoadCacheKey {
         remote_global_catalog_active: bool,
         auth_identity: RemoteInstalledPluginsAuthIdentity,
     ) -> Self {
+        let mut configured_plugins =
+            configured_plugins_from_stack(&config.config_layer_stack, codex_home);
+        let mut plugin_policy = config.plugins.clone();
+        // Apps policy is resolved separately and does not affect loaded plugin contents.
+        for plugin in configured_plugins
+            .values_mut()
+            .chain(plugin_policy.plugins.values_mut())
+        {
+            plugin.apps.clear();
+        }
         Self {
-            configured_plugins: configured_plugins_from_stack(
-                &config.config_layer_stack,
-                codex_home,
-            ),
+            configured_plugins,
+            plugin_policy,
             skill_config_rules: skill_config_rules_from_stack(&config.config_layer_stack),
             remote_global_catalog_active,
             // Local curated loads are auth-independent; only remote snapshots vary by account.
@@ -665,6 +1033,52 @@ fn target_curated_marketplace(auth_mode: Option<AuthMode>) -> TargetCuratedMarke
 }
 
 impl PluginsManager {
+    /// Build remote service state from the request's effective mode and this harness's runtime.
+    pub fn remote_plugin_service_config(
+        &self,
+        config: &PluginsConfigInput,
+    ) -> RemotePluginServiceConfig {
+        config.remote_plugin_service_config(
+            config
+                .runtime_auth_mode
+                .map(|mode| (Arc::clone(&self.runtime_auth), mode)),
+        )
+    }
+
+    /// Signal workers without waiting or claiming that their originals joined.
+    pub fn request_shutdown(&self, deadline: tokio::time::Instant) {
+        self.task_registry.request_shutdown(deadline);
+    }
+
+    /// Observe this manager's actual plugin originals, never a cancellation acknowledgement.
+    pub async fn shutdown_until(&self, deadline: tokio::time::Instant) -> crate::PluginTaskDrain {
+        self.task_registry.shutdown_until(deadline).await
+    }
+
+    pub fn auth_manager(&self) -> Arc<AuthManager> {
+        Arc::clone(&self.auth_manager)
+    }
+
+    pub fn runtime_auth_slot(&self) -> RuntimeAuthSlot {
+        Arc::clone(&self.runtime_auth)
+    }
+
+    /// Reuse host configuration without sharing another actor's remote caches or credentials.
+    pub fn for_auth_context(
+        &self,
+        auth_manager: Arc<AuthManager>,
+        runtime_auth: RuntimeAuthSlot,
+    ) -> Self {
+        Self::new_with_options(
+            self.codex_home.clone(),
+            self.restriction_product,
+            auth_manager,
+            runtime_auth,
+            Arc::clone(&self.skill_root_loader),
+        )
+        .with_plugin_install_source(self.plugin_install_source)
+    }
+
     pub fn new(
         codex_home: PathBuf,
         auth_manager: Arc<AuthManager>,
@@ -674,6 +1088,7 @@ impl PluginsManager {
             codex_home,
             Some(Product::Codex),
             auth_manager,
+            RuntimeAuthSlot::default(),
             skill_root_loader,
         )
     }
@@ -682,6 +1097,7 @@ impl PluginsManager {
         codex_home: PathBuf,
         restriction_product: Option<Product>,
         auth_manager: Arc<AuthManager>,
+        runtime_auth: RuntimeAuthSlot,
         skill_root_loader: Arc<dyn SkillRootLoader<PluginSkillRoot>>,
     ) -> Self {
         // Product restrictions are enforced at marketplace admission time for a given CODEX_HOME:
@@ -693,9 +1109,12 @@ impl PluginsManager {
         // This assumes a single CODEX_HOME is only used by one product.
         let remote_installed_plugin_bundle_sync_gate =
             crate::remote::remote_installed_plugin_bundle_sync_gate(&codex_home);
+        let store = PluginStore::new(codex_home.clone());
+        let tool_suggest_metadata_cache =
+            ToolSuggestMetadataCache::new(Arc::clone(&store.manifest_cache));
         Self {
-            codex_home: codex_home.clone(),
-            store: PluginStore::new(codex_home),
+            codex_home,
+            store,
             featured_plugin_ids_cache: RwLock::new(None),
             recommended_plugins_cache: RwLock::new(HashMap::new()),
             recommended_plugins_refreshes: RwLock::new(HashMap::new()),
@@ -711,7 +1130,7 @@ impl PluginsManager {
             loaded_plugins_cache: Mutex::new(LoadedPluginsCache::default()),
             loaded_plugins_load_semaphore: Semaphore::new(/*permits*/ 1),
             skill_root_loader,
-            tool_suggest_metadata_cache: ToolSuggestMetadataCache::new(),
+            tool_suggest_metadata_cache,
             remote_installed_plugins_cache: RwLock::new(RemoteInstalledPluginsCache::default()),
             remote_installed_plugin_bundle_sync_gate,
             remote_installed_plugins_cache_refresh_state: RwLock::new(
@@ -722,16 +1141,11 @@ impl PluginsManager {
             ),
             restriction_product,
             auth_manager,
+            runtime_auth,
             analytics_events_client: RwLock::new(None),
             plugin_install_source: PluginInstallSource::Manual,
             task_registry: crate::PluginTaskRegistry::default(),
         }
-    }
-
-    /// Closes plugin worker admission and observes every worker started by
-    /// this manager under the caller's original absolute deadline.
-    pub async fn shutdown_until(&self, deadline: tokio::time::Instant) -> crate::PluginTaskDrain {
-        self.task_registry.shutdown_until(deadline).await
     }
 
     pub fn with_plugin_install_source(mut self, source: PluginInstallSource) -> Self {
@@ -884,6 +1298,7 @@ impl PluginsManager {
             let load_started = Instant::now();
             let plugins = load_plugins_from_layer_stack(
                 &config.config_layer_stack,
+                &config.plugins,
                 self.remote_installed_plugins_snapshot(),
                 &self.store,
                 Some(&plugin_skill_snapshots),
@@ -1005,6 +1420,7 @@ impl PluginsManager {
         let target_curated_marketplace = target_curated_marketplace(self.auth_mode());
         load_plugin_hooks_from_layer_stack(
             config_layer_stack,
+            &config.plugins,
             self.remote_installed_plugin_configs(),
             &self.store,
             target_curated_marketplace,
@@ -1170,6 +1586,7 @@ impl PluginsManager {
                     plugin_id,
                     &plugin_root,
                     self.skill_root_loader.as_ref(),
+                    &self.store.manifest_cache,
                 )
                 .await
             }
@@ -1191,6 +1608,7 @@ impl PluginsManager {
                     plugin_id,
                     &plugin_root,
                     self.skill_root_loader.as_ref(),
+                    &self.store.manifest_cache,
                 )
                 .await
             }
@@ -1237,10 +1655,23 @@ impl PluginsManager {
         &self,
         visible_marketplaces: &[&str],
     ) -> Option<Vec<crate::remote::RemoteMarketplace>> {
+        self.build_remote_installed_plugin_marketplaces_from_cache_with_display_assets(
+            visible_marketplaces,
+            InstalledPluginDisplayAssets::Include,
+        )
+    }
+
+    /// A runtime snapshot cannot satisfy a caller that requires display enrichment.
+    pub fn build_remote_installed_plugin_marketplaces_from_cache_with_display_assets(
+        &self,
+        visible_marketplaces: &[&str],
+        display_assets: InstalledPluginDisplayAssets,
+    ) -> Option<Vec<crate::remote::RemoteMarketplace>> {
         let auth = self.auth_manager.auth_cached();
         self.build_remote_installed_plugin_marketplaces_from_cache_for_auth(
             auth.as_ref(),
             visible_marketplaces,
+            display_assets,
         )
     }
 
@@ -1248,6 +1679,7 @@ impl PluginsManager {
         &self,
         auth: Option<&CodexAuth>,
         visible_marketplaces: &[&str],
+        display_assets: InstalledPluginDisplayAssets,
     ) -> Option<Vec<crate::remote::RemoteMarketplace>> {
         let cache = match self.remote_installed_plugins_cache.read() {
             Ok(cache) => cache,
@@ -1255,6 +1687,11 @@ impl PluginsManager {
         };
         if cache.auth_identity.as_ref()
             != Some(&RemoteInstalledPluginsAuthIdentity::from_auth(auth))
+        {
+            return None;
+        }
+        if display_assets == InstalledPluginDisplayAssets::Include
+            && cache.display_assets == InstalledPluginDisplayAssets::Skip
         {
             return None;
         }
@@ -1287,7 +1724,7 @@ impl PluginsManager {
 
         crate::remote::cached_global_remote_discoverable_plugins(
             self.codex_home.as_path(),
-            &remote_plugin_service_config(config),
+            &self.remote_plugin_service_config(config),
             auth,
         )
     }
@@ -1299,31 +1736,43 @@ impl PluginsManager {
         visible_marketplaces: &[&str],
         on_effective_plugins_changed: Option<EffectivePluginsChangedCallback>,
     ) -> Result<Vec<crate::remote::RemoteMarketplace>, RemotePluginCatalogError> {
-        let reset_generation = self.remote_installed_plugins_generation();
+        self.build_and_cache_remote_installed_plugin_marketplaces_with_display_assets(
+            config,
+            auth,
+            visible_marketplaces,
+            on_effective_plugins_changed,
+            InstalledPluginDisplayAssets::Include,
+        )
+        .await
+    }
+
+    /// Fetch installed runtime metadata without optional display enrichment.
+    pub async fn build_and_cache_remote_installed_plugin_marketplaces_with_display_assets(
+        &self,
+        config: &PluginsConfigInput,
+        auth: Option<&CodexAuth>,
+        visible_marketplaces: &[&str],
+        on_effective_plugins_changed: Option<EffectivePluginsChangedCallback>,
+        display_assets: InstalledPluginDisplayAssets,
+    ) -> Result<Vec<crate::remote::RemoteMarketplace>, RemotePluginCatalogError> {
         let generation = self
             .prepare_remote_installed_plugins_cache_generation(auth)
             .ok_or(RemotePluginCatalogError::AuthRequired)?;
-        let plugins = crate::remote::fetch_remote_installed_plugins(
-            &remote_plugin_service_config(config),
+        let plugins = crate::remote::fetch_remote_installed_plugins_with_display_assets(
+            &self.remote_plugin_service_config(config),
             auth,
+            display_assets,
         )
         .await?;
         let marketplaces = crate::remote::group_remote_installed_plugins_by_marketplaces(
             &plugins,
             visible_marketplaces,
         );
-        let state = self
-            .remote_installed_plugins_cache_refresh_state
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !reset_generation.is_current(&state.generation) {
-            return Err(RemotePluginCatalogError::AuthChanged);
-        }
-        let Some(changed) = self.write_remote_installed_plugins_cache_snapshot(
+        let Some(update) = self.write_remote_installed_plugins_cache_snapshot(
             generation,
             plugins,
             auth,
-            RemoteInstalledPluginsCachePublication::Refresh,
+            RemoteInstalledPluginsCachePublication::Refresh(display_assets),
         ) else {
             let auth_identity = RemoteInstalledPluginsAuthIdentity::from_auth(auth);
             if !self.remote_installed_plugins_auth_is_current(&auth_identity) {
@@ -1333,16 +1782,23 @@ impl PluginsManager {
                 .build_remote_installed_plugin_marketplaces_from_cache_for_auth(
                     auth,
                     visible_marketplaces,
+                    display_assets,
                 )
                 .unwrap_or(marketplaces));
         };
-        if changed && let Some(on_effective_plugins_changed) = on_effective_plugins_changed {
-            on_effective_plugins_changed(EffectivePluginsChange::default());
+        if update.metadata_change_id.is_some()
+            && let Some(on_effective_plugins_changed) = on_effective_plugins_changed
+        {
+            on_effective_plugins_changed(EffectivePluginsChange {
+                metadata_change_id: update.metadata_change_id,
+                ..Default::default()
+            });
         }
         Ok(self
             .build_remote_installed_plugin_marketplaces_from_cache_for_auth(
                 auth,
                 visible_marketplaces,
+                display_assets,
             )
             .unwrap_or(marketplaces))
     }
@@ -1427,7 +1883,7 @@ impl PluginsManager {
         plugins: Vec<RemoteInstalledPlugin>,
         auth: Option<&CodexAuth>,
         publication: RemoteInstalledPluginsCachePublication,
-    ) -> Option<bool> {
+    ) -> Option<InstalledPluginCacheUpdate> {
         let auth_identity = RemoteInstalledPluginsAuthIdentity::from_auth(auth);
         if !self.remote_installed_plugins_auth_is_current(&auth_identity) {
             return None;
@@ -1460,23 +1916,38 @@ impl PluginsManager {
         }
         let needs_effective_plugins_refresh =
             is_reconcile && std::mem::take(&mut cache.needs_effective_plugins_refresh);
-        if cache.plugins.as_ref() == Some(&plugins) {
-            drop(cache);
-            if needs_effective_plugins_refresh {
-                self.clear_loaded_plugins_cache();
+        cache.display_assets = match publication {
+            RemoteInstalledPluginsCachePublication::Refresh(display_assets) => display_assets,
+            RemoteInstalledPluginsCachePublication::Reconcile => {
+                InstalledPluginDisplayAssets::Include
             }
-            return Some(needs_effective_plugins_refresh);
-        }
-        let metadata_changed = cache.plugins.as_ref().is_none_or(|previous| {
-            !crate::remote_metadata::installed_plugin_metadata_eq(previous, &plugins)
-        });
-        cache.plugins = Some(plugins);
-        drop(cache);
+        };
+        let previous = cache.plugins.as_deref();
+        let payload_changed = previous != Some(plugins.as_slice());
+        let metadata_changed = payload_changed
+            && previous.is_none_or(|old| {
+                !crate::remote_metadata::installed_plugin_metadata_eq(old, &plugins)
+            });
         let changed = needs_effective_plugins_refresh || metadata_changed;
-        if changed {
+        let metadata_change_id = changed.then(uuid::Uuid::new_v4);
+        let initial_snapshot = previous.is_none();
+        let changes = if metadata_changed && tracing::enabled!(tracing::Level::INFO) {
+            crate::remote_metadata::installed_plugin_metadata_changes(
+                previous.unwrap_or_default(),
+                &plugins,
+            )
+        } else {
+            Default::default()
+        };
+        if payload_changed {
+            cache.plugins = Some(plugins);
+        }
+        drop(cache);
+        if let Some(change_id) = metadata_change_id {
+            tracing::info!(%change_id, ?changes, initial_snapshot, reconciliation_retry = needs_effective_plugins_refresh, is_reconcile, "installed plugin runtime metadata invalidated");
             self.clear_loaded_plugins_cache();
         }
-        Some(changed)
+        Some(InstalledPluginCacheUpdate { metadata_change_id })
     }
 
     #[cfg(test)]
@@ -1489,82 +1960,56 @@ impl PluginsManager {
             generation,
             plugins,
             auth.as_ref(),
-            RemoteInstalledPluginsCachePublication::Refresh,
+            RemoteInstalledPluginsCachePublication::Refresh(InstalledPluginDisplayAssets::Include),
         )
         .expect("test cache generation should remain current")
+        .metadata_change_id
+        .is_some()
+    }
+
+    /// Strict managed reset is separate from ordinary best-effort cache clear.
+    /// Retire physical publication first; any error/cancellation keeps it closed.
+    pub async fn reset_remote_installed_plugins(&self) -> std::io::Result<()> {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let retirement =
+            crate::remote::reset_authority::retire_remote_plugin_bundle_sync(&self.codex_home)?;
+        let unavailable = || std::io::Error::other("plugin reset cache authority unavailable");
+        let retired = {
+            // Match the scheduler's state -> cache lock order. Never drop queued
+            // callback/auth owners or plugin payloads while these locks are held.
+            let mut refresh = self
+                .remote_installed_plugins_cache_refresh_state
+                .write()
+                .map_err(|_| unavailable())?;
+            let mut cache = self
+                .remote_installed_plugins_cache
+                .write()
+                .map_err(|_| unavailable())?;
+            let mut loaded = self
+                .loaded_plugins_cache
+                .lock()
+                .map_err(|_| unavailable())?;
+            let next_cache = cache.generation.checked_add(1).ok_or_else(unavailable)?;
+            let next_loaded = loaded.generation.checked_add(1).ok_or_else(unavailable)?;
+            cache.generation = next_cache;
+            loaded.generation = next_loaded;
+            cache.reconciliation_generation = None;
+            cache.needs_effective_plugins_refresh = false;
+            (
+                refresh.requested.take(),
+                cache.plugins.take(),
+                cache.auth_identity.take(),
+                std::mem::take(&mut loaded.entries),
+            )
+            // Keep the real running worker registered. Its old numeric generation
+            // cannot publish, and its original task join is owned separately.
+        };
+        drop(retired);
+        self.tool_suggest_metadata_cache.clear_for_managed_reset()?;
+        retirement.wait_until(deadline).await
     }
 
     pub fn clear_remote_installed_plugins_cache(&self) -> bool {
-        self.retire_remote_installed_plugins_cache().0
-    }
-
-    /// Invalidates pending bundle publication and waits for filesystem commits
-    /// that entered before the fence. A timeout remains a reset failure; retries
-    /// also wait for commits retired by earlier reset attempts.
-    pub async fn reset_remote_installed_plugins(&self) -> std::io::Result<()> {
-        let (_, mut active) = self.retire_remote_installed_plugins_cache();
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            loop {
-                if *active.borrow_and_update() == 0 {
-                    return Ok(());
-                }
-                active.changed().await.map_err(|_| {
-                    std::io::Error::other(
-                        "remote plugin commit observation closed before retirement",
-                    )
-                })?;
-            }
-        })
-        .await
-        .map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "remote plugin filesystem retirement timed out",
-            )
-        })?
-    }
-
-    fn retire_remote_installed_plugins_cache(&self) -> (bool, watch::Receiver<usize>) {
-        let mut state = self
-            .remote_installed_plugins_cache_refresh_state
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.generation = RemoteInstalledPluginsGeneration::default();
-        state.requested = None;
-        let active = crate::remote::retire_remote_plugin_bundle_sync(&self.codex_home);
-        // Keep the running loop registered: it will discard its old result and
-        // then drain any request submitted for the new generation.
-        (self.clear_remote_installed_plugins_cache_contents(), active)
-    }
-
-    fn remote_installed_plugins_generation(&self) -> RemoteInstalledPluginsGeneration {
-        self.remote_installed_plugins_cache_refresh_state
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .generation
-            .clone()
-    }
-
-    fn remote_installed_plugins_admission(
-        &self,
-    ) -> (
-        RemoteInstalledPluginsGeneration,
-        crate::remote::RemotePluginBundleSyncGeneration,
-    ) {
-        // Match reset's lock order and capture both authorities at one boundary.
-        // Otherwise reset between the two captures could pair an old callback
-        // token with a new filesystem epoch.
-        let state = self
-            .remote_installed_plugins_cache_refresh_state
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        (
-            state.generation.clone(),
-            crate::remote::RemotePluginBundleSyncGeneration::capture(&self.codex_home),
-        )
-    }
-
-    fn clear_remote_installed_plugins_cache_contents(&self) -> bool {
         let mut cache = match self.remote_installed_plugins_cache.write() {
             Ok(cache) => cache,
             Err(err) => err.into_inner(),
@@ -1615,9 +2060,13 @@ impl PluginsManager {
             EffectivePluginsChange::default(),
         );
 
+        if !config.plugin_recommendations_enabled {
+            return;
+        }
+
         let manager = Arc::clone(self);
         let config = config.clone();
-        let _ = self.task_registry.spawn(async move {
+        let _ = self.task_registry.spawn_callback(async move {
             manager
                 .recommended_plugins_mode_for_config(&config, auth.as_ref())
                 .await;
@@ -1629,15 +2078,13 @@ impl PluginsManager {
         config: &PluginsConfigInput,
         auth: Option<CodexAuth>,
         on_effective_plugins_changed: Option<EffectivePluginsChangedCallback>,
-        reset_generation: RemoteInstalledPluginsGeneration,
     ) {
-        self.maybe_start_remote_installed_plugins_cache_refresh_for_generation(
+        self.maybe_start_remote_installed_plugins_cache_refresh_with_notify(
             config,
             auth,
             RemoteInstalledPluginsCacheRefreshNotify::AfterSuccessfulRefresh,
             on_effective_plugins_changed,
             EffectivePluginsChange::default(),
-            reset_generation,
         );
     }
 
@@ -1649,48 +2096,19 @@ impl PluginsManager {
         on_effective_plugins_changed: Option<EffectivePluginsChangedCallback>,
         change: EffectivePluginsChange,
     ) {
-        let reset_generation = self.remote_installed_plugins_generation();
-        self.maybe_start_remote_installed_plugins_cache_refresh_for_generation(
-            config,
-            auth,
-            notify,
-            on_effective_plugins_changed,
-            change,
-            reset_generation,
-        );
-    }
-
-    fn maybe_start_remote_installed_plugins_cache_refresh_for_generation(
-        self: &Arc<Self>,
-        config: &PluginsConfigInput,
-        auth: Option<CodexAuth>,
-        notify: RemoteInstalledPluginsCacheRefreshNotify,
-        on_effective_plugins_changed: Option<EffectivePluginsChangedCallback>,
-        change: EffectivePluginsChange,
-        reset_generation: RemoteInstalledPluginsGeneration,
-    ) {
         if !config.plugins_enabled {
             return;
         }
 
-        let state = self
-            .remote_installed_plugins_cache_refresh_state
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !reset_generation.is_current(&state.generation) {
-            return;
-        }
         let Some(generation) =
             self.prepare_remote_installed_plugins_cache_generation(auth.as_ref())
         else {
             return;
         };
-        drop(state);
         self.schedule_remote_installed_plugins_cache_refresh(
             RemoteInstalledPluginsCacheRefreshRequest {
                 generation,
-                reset_generation,
-                service_config: remote_plugin_service_config(config),
+                service_config: self.remote_plugin_service_config(config),
                 auth,
                 notify,
                 on_effective_plugins_changed,
@@ -1704,8 +2122,8 @@ impl PluginsManager {
         config: &PluginsConfigInput,
         auth: Option<CodexAuth>,
         on_effective_plugins_changed: Option<EffectivePluginsChangedCallback>,
+        source: InstalledPluginSyncSource,
     ) {
-        let (reset_generation, bundle_generation) = self.remote_installed_plugins_admission();
         if !config.plugins_enabled {
             return;
         }
@@ -1718,36 +2136,41 @@ impl PluginsManager {
         else {
             return;
         };
+        let Ok(publication_generation) =
+            RemotePluginBundleSyncGeneration::capture(&self.codex_home)
+        else {
+            warn!("remote plugin publication authority unavailable");
+            return;
+        };
         let manager = Arc::clone(self);
         let config = config.clone();
-        let admitted = self.task_registry.spawn(async move {
+        let stop = self.task_registry.worker_stop();
+        let admitted = self.task_registry.spawn_callback(async move {
             let _permit = permit;
             let result = manager
                 .reconcile_remote_installed_plugins_after_acquiring_gate(
-                    &config, Some(&auth), &reset_generation, bundle_generation.clone(),
+                    &config, Some(&auth), &publication_generation, &stop,
                 )
                 .await;
+            // Shutdown is not an ordinary failure: do not attempt a refused
+            // follow-up birth that would poison this managed auth context.
+            if stop.is_stopped() { return; }
             match result {
-                Ok((outcome, effective_plugins_changed)) => {
-                    let state = manager.remote_installed_plugins_cache_refresh_state
-                        .read().unwrap_or_else(std::sync::PoisonError::into_inner);
-                    if !reset_generation.is_current(&state.generation) {
-                        return;
-                    }
-                    let Some(_lease) = bundle_generation.begin_commit() else {
-                        return;
-                    };
+                Ok((outcome, update)) => {
                     tracing::info!(
                         materialized_remote_plugins = ?outcome.materialized_remote_plugins,
                         changed_plugins = ?outcome.changed_plugins,
                         failed_remote_plugin_ids = ?outcome.failed_remote_plugin_ids,
                         failed_materialization_remote_plugin_ids = ?outcome.failed_materialization_remote_plugin_ids,
+                        ?source,
+                        metadata_change_id = ?update.metadata_change_id,
                         "completed remote installed plugin bundle sync"
                     );
-                    if (effective_plugins_changed || !outcome.changed_plugins.is_empty())
+                    if (update.metadata_change_id.is_some() || !outcome.changed_plugins.is_empty())
                         && let Some(on_effective_plugins_changed) = on_effective_plugins_changed
                     {
                         on_effective_plugins_changed(EffectivePluginsChange {
+                            metadata_change_id: update.metadata_change_id,
                             materialized_remote_plugins: outcome.materialized_remote_plugins,
                         });
                     }
@@ -1757,23 +2180,18 @@ impl PluginsManager {
                         error = %err,
                         "remote installed plugin bundle sync failed"
                     );
-                    manager.maybe_start_remote_installed_plugins_cache_refresh_for_generation(
+                    manager.maybe_start_remote_installed_plugins_cache_refresh_with_notify(
                         &config,
                         Some(auth),
                         RemoteInstalledPluginsCacheRefreshNotify::IfCacheChanged,
                         on_effective_plugins_changed,
                         EffectivePluginsChange::default(),
-                        reset_generation,
                     );
                 }
             }
         });
-        if let Err(error) = admitted {
-            // Rejected admission drops the future and releases its owned permit.
-            warn!(
-                ?error,
-                "remote installed plugin bundle sync admission closed"
-            );
+        if admitted.is_err() {
+            warn!("failed to admit remote installed plugin bundle sync task");
         }
     }
 
@@ -1782,7 +2200,6 @@ impl PluginsManager {
     async fn acquire_remote_installed_plugin_sync_guard(
         &self,
     ) -> Result<RemoteInstalledPluginSyncGuard, RemoteInstalledPluginBundleSyncError> {
-        let (reset_generation, bundle_generation) = self.remote_installed_plugins_admission();
         let permit = tokio::time::timeout(
             REMOTE_INSTALLED_PLUGIN_SYNC_WAIT_TIMEOUT,
             Arc::clone(&self.remote_installed_plugin_bundle_sync_gate).acquire_owned(),
@@ -1790,18 +2207,7 @@ impl PluginsManager {
         .await
         .map_err(|_| RemoteInstalledPluginBundleSyncError::LockTimeout)?
         .map_err(|_| RemoteInstalledPluginBundleSyncError::Superseded)?;
-        let state = self
-            .remote_installed_plugins_cache_refresh_state
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !reset_generation.is_current(&state.generation) {
-            return Err(RemoteInstalledPluginBundleSyncError::Superseded);
-        }
-        Ok(RemoteInstalledPluginSyncGuard {
-            _permit: permit,
-            reset_generation,
-            bundle_generation,
-        })
+        Ok(RemoteInstalledPluginSyncGuard { _permit: permit })
     }
 
     /// Synchronizes remote bundles and publishes the same installed-plugin snapshot.
@@ -1814,13 +2220,15 @@ impl PluginsManager {
         config: &PluginsConfigInput,
         auth: Option<&CodexAuth>,
     ) -> Result<RemoteInstalledPluginBundleSyncOutcome, RemoteInstalledPluginBundleSyncError> {
-        let guard = self.acquire_remote_installed_plugin_sync_guard().await?;
+        let publication_generation = RemotePluginBundleSyncGeneration::capture(&self.codex_home)
+            .map_err(|_| RemoteInstalledPluginBundleSyncError::Superseded)?;
+        let _guard = self.acquire_remote_installed_plugin_sync_guard().await?;
         let (outcome, _) = self
             .reconcile_remote_installed_plugins_after_acquiring_gate(
                 config,
                 auth,
-                &guard.reset_generation,
-                guard.bundle_generation.clone(),
+                &publication_generation,
+                &crate::WorkerStop::never(),
             )
             .await?;
         Ok(outcome)
@@ -1830,21 +2238,18 @@ impl PluginsManager {
         &self,
         config: &PluginsConfigInput,
         auth: Option<&CodexAuth>,
-        reset_generation: &RemoteInstalledPluginsGeneration,
-        bundle_generation: crate::remote::RemotePluginBundleSyncGeneration,
-    ) -> Result<(RemoteInstalledPluginBundleSyncOutcome, bool), RemoteInstalledPluginBundleSyncError>
-    {
-        let generation = {
-            let state = self
-                .remote_installed_plugins_cache_refresh_state
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if !reset_generation.is_current(&state.generation) {
-                return Err(RemoteInstalledPluginBundleSyncError::Superseded);
-            }
-            self.begin_remote_installed_plugins_reconcile(auth)
-                .ok_or(RemoteInstalledPluginBundleSyncError::Superseded)?
-        };
+        publication_generation: &RemotePluginBundleSyncGeneration,
+        stop: &crate::WorkerStop,
+    ) -> Result<
+        (
+            RemoteInstalledPluginBundleSyncOutcome,
+            InstalledPluginCacheUpdate,
+        ),
+        RemoteInstalledPluginBundleSyncError,
+    > {
+        let generation = self
+            .begin_remote_installed_plugins_reconcile(auth)
+            .ok_or(RemoteInstalledPluginBundleSyncError::Superseded)?;
         let mut reconciliation = RemoteInstalledPluginsReconciliationGuard {
             manager: self,
             generation,
@@ -1871,14 +2276,16 @@ impl PluginsManager {
             .flat_map(HashMap::keys)
             .cloned()
             .collect::<Vec<_>>();
-        let result = crate::remote::sync_remote_installed_plugin_bundles_once_with_snapshot(
-            self.codex_home.clone(),
-            &remote_plugin_service_config(config),
-            auth,
-            &previous_plugin_ids,
-            bundle_generation,
-        )
-        .await?;
+        let result =
+            crate::remote::sync_remote_installed_plugin_bundles_once_with_snapshot_and_generation(
+                self.codex_home.clone(),
+                &self.remote_plugin_service_config(config),
+                auth,
+                &previous_plugin_ids,
+                publication_generation,
+                stop,
+            )
+            .await?;
         let mut outcome = result.outcome;
         // The generation fence keeps this comparison on the snapshot replaced by this pass.
         // In a known snapshot, absence means inactive: cached reinstalls need the same hints
@@ -1917,14 +2324,10 @@ impl PluginsManager {
         outcome
             .changed_plugins
             .sort_unstable_by(|left, right| left.plugin_id.cmp(&right.plugin_id));
-        let state = self
-            .remote_installed_plugins_cache_refresh_state
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !reset_generation.is_current(&state.generation) {
+        if stop.is_stopped() {
             return Err(RemoteInstalledPluginBundleSyncError::Superseded);
         }
-        let Some(effective_plugins_changed) = self.write_remote_installed_plugins_cache_snapshot(
+        let Some(update) = self.write_remote_installed_plugins_cache_snapshot(
             generation,
             result.installed_plugins,
             auth,
@@ -1933,10 +2336,10 @@ impl PluginsManager {
             return Err(RemoteInstalledPluginBundleSyncError::Superseded);
         };
         reconciliation.committed = true;
-        if !effective_plugins_changed && !outcome.changed_plugins.is_empty() {
+        if update.metadata_change_id.is_none() && !outcome.changed_plugins.is_empty() {
             self.clear_loaded_plugins_cache();
         }
-        Ok((outcome, effective_plugins_changed))
+        Ok((outcome, update))
     }
 
     fn maybe_start_remote_catalog_cache_refresh(
@@ -1944,17 +2347,15 @@ impl PluginsManager {
         config: &PluginsConfigInput,
         auth: Option<CodexAuth>,
         scopes: BTreeSet<RemotePluginScope>,
-        mode: RemoteCatalogCacheRefreshMode,
     ) {
         if !config.plugins_enabled || scopes.is_empty() {
             return;
         }
 
         self.schedule_remote_catalog_cache_refresh(RemoteCatalogCacheRefreshRequest {
-            service_config: remote_plugin_service_config(config),
+            service_config: self.remote_plugin_service_config(config),
             auth,
             scopes,
-            mode,
         });
     }
 
@@ -1970,7 +2371,6 @@ impl PluginsManager {
             &context.global_config,
             auth.clone(),
             options.remote_catalog_cache_refresh_scopes,
-            RemoteCatalogCacheRefreshMode::OnlyIfStale,
         );
         self.maybe_start_remote_plugin_caches_refresh(
             &context.global_config,
@@ -1981,6 +2381,7 @@ impl PluginsManager {
             &context.global_config,
             auth,
             on_effective_plugins_changed,
+            InstalledPluginSyncSource::PluginList,
         );
     }
 
@@ -2046,7 +2447,7 @@ impl PluginsManager {
             return Ok(featured_plugin_ids);
         }
         let featured_plugin_ids = crate::remote_legacy::fetch_remote_featured_plugin_ids(
-            &remote_plugin_service_config(config),
+            &self.remote_plugin_service_config(config),
             auth,
             self.restriction_product,
         )
@@ -2097,7 +2498,7 @@ impl PluginsManager {
         let mode = refresh
             .get_or_init(|| async {
                 match crate::remote::fetch_recommended_plugins(
-                    &remote_plugin_service_config(config),
+                    &self.remote_plugin_service_config(config),
                     auth,
                 )
                 .await
@@ -2292,7 +2693,7 @@ impl PluginsManager {
         let plugin_id = resolved.plugin_id.as_key();
         // This only forwards the backend mutation before the local install flow.
         if let Err(err) = crate::remote_legacy::enable_remote_plugin(
-            &remote_plugin_service_config(config),
+            &self.remote_plugin_service_config(config),
             auth,
             &plugin_id,
         )
@@ -2429,32 +2830,36 @@ impl PluginsManager {
             .manifest_fallback
             .contents_if_has_metadata()
             .map(str::to_string);
-        let result: StorePluginInstallResult = tokio::task::spawn_blocking(move || {
-            let materialized =
-                materialize_marketplace_plugin_source(codex_home.as_path(), &resolved.source)
-                    .map_err(PluginStoreError::Invalid)?;
-            let source_path = materialized.path;
-            match (plugin_version, manifest_fallback_contents.as_deref()) {
-                (Some(plugin_version), Some(manifest_contents)) => store
-                    .install_with_version_and_fallback_manifest(
+        let stop = self.task_registry.worker_stop();
+        let result: StorePluginInstallResult = codex_model_provider::run_blocking_call_with_scope(
+            move || crate::retirement::WorkerStopScope::enter(stop),
+            move || {
+                let materialized =
+                    materialize_marketplace_plugin_source(codex_home.as_path(), &resolved.source)
+                        .map_err(PluginStoreError::Invalid)?;
+                let source_path = materialized.path;
+                match (plugin_version, manifest_fallback_contents.as_deref()) {
+                    (Some(plugin_version), Some(manifest_contents)) => store
+                        .install_with_version_and_fallback_manifest(
+                            source_path,
+                            resolved.plugin_id,
+                            plugin_version,
+                            manifest_contents,
+                        ),
+                    (Some(plugin_version), None) => {
+                        store.install_with_version(source_path, resolved.plugin_id, plugin_version)
+                    }
+                    (None, Some(manifest_contents)) => store.install_with_fallback_manifest(
                         source_path,
                         resolved.plugin_id,
-                        plugin_version,
                         manifest_contents,
                     ),
-                (Some(plugin_version), None) => {
-                    store.install_with_version(source_path, resolved.plugin_id, plugin_version)
+                    (None, None) => store.install(source_path, resolved.plugin_id),
                 }
-                (None, Some(manifest_contents)) => store.install_with_fallback_manifest(
-                    source_path,
-                    resolved.plugin_id,
-                    manifest_contents,
-                ),
-                (None, None) => store.install(source_path, resolved.plugin_id),
-            }
-        })
+            },
+        )
         .await
-        .map_err(PluginInstallError::join)??;
+        .map_err(PluginInstallError::blocking)??;
 
         set_user_plugin_enabled(
             &self.codex_home,
@@ -2500,7 +2905,7 @@ impl PluginsManager {
         let plugin_key = plugin_id.as_key();
         // This only forwards the backend mutation before the local uninstall flow.
         crate::remote_legacy::uninstall_remote_plugin(
-            &remote_plugin_service_config(config),
+            &self.remote_plugin_service_config(config),
             auth,
             &plugin_key,
         )
@@ -2520,9 +2925,13 @@ impl PluginsManager {
         };
         let store = self.store.clone();
         let plugin_id_for_store = plugin_id.clone();
-        tokio::task::spawn_blocking(move || store.uninstall(&plugin_id_for_store))
-            .await
-            .map_err(PluginUninstallError::join)??;
+        let stop = self.task_registry.worker_stop();
+        codex_model_provider::run_blocking_call_with_scope(
+            move || crate::retirement::WorkerStopScope::enter(stop),
+            move || store.uninstall(&plugin_id_for_store),
+        )
+        .await
+        .map_err(PluginUninstallError::blocking)??;
 
         clear_user_plugin(&self.codex_home, plugin_id.as_key())
             .await
@@ -2611,7 +3020,11 @@ impl PluginsManager {
                             && plugin.source.is_install_materialized()
                             && let Some(plugin_id) = plugin_id.as_ref()
                             && let Some(plugin_root) = self.store.active_plugin_root(plugin_id)
-                            && let Some(manifest) = load_plugin_manifest(plugin_root.as_path())
+                            && let Some(manifest) = self
+                                .store
+                                .manifest_cache
+                                .load(plugin_root.as_path())
+                                .map(|loaded| loaded.manifest)
                         {
                             local_version = manifest.version.clone();
                             let marketplace_category = interface
@@ -2823,14 +3236,24 @@ impl PluginsManager {
         } else {
             let codex_home = self.codex_home.clone();
             let source = plugin.source.clone();
-            let materialized = tokio::task::spawn_blocking(move || {
-                materialize_marketplace_plugin_source(codex_home.as_path(), &source)
-            })
+            let stop = self.task_registry.worker_stop();
+            let materialized = codex_model_provider::run_blocking_call_with_scope(
+                move || crate::retirement::WorkerStopScope::enter(stop),
+                move || materialize_marketplace_plugin_source(codex_home.as_path(), &source),
+            )
             .await
-            .map_err(|err| {
-                MarketplaceError::InvalidPlugin(format!(
-                    "failed to materialize plugin source: {err}"
-                ))
+            .map_err(|err| match err {
+                codex_model_provider::AuthBlockingCallError::Join(err) => {
+                    MarketplaceError::InvalidPlugin(format!(
+                        "failed to materialize plugin source: {err}"
+                    ))
+                }
+                codex_model_provider::AuthBlockingCallError::Custody(failure) => {
+                    MarketplaceError::Io {
+                        context: "plugin materialization custody failed",
+                        source: std::io::Error::other(format!("{failure:?}")),
+                    }
+                }
             })?
             .map_err(MarketplaceError::InvalidPlugin)?;
             materialized.path.clone()
@@ -2842,7 +3265,7 @@ impl PluginsManager {
         }
         let loaded_manifest =
             if codex_utils_plugins::find_plugin_manifest_path(source_path.as_path()).is_some() {
-                load_plugin_manifest_with_format(source_path.as_path())
+                self.store.manifest_cache.load(source_path.as_path())
             } else {
                 plugin
                     .manifest_fallback
@@ -2889,10 +3312,11 @@ impl PluginsManager {
             if !path.as_path().starts_with(plugin_root.as_path()) {
                 return None;
             }
+            let path_uri = PathUri::from_abs_path(&path);
             resolved_skills
                 .skills
                 .iter()
-                .any(|skill| skill.path_to_skills_md == path)
+                .any(|skill| skill.path_to_skills_md == path_uri)
                 .then_some(path)
         });
         let plugin_data_root = self.store.plugin_data_root(&plugin_id);
@@ -2910,7 +3334,7 @@ impl PluginsManager {
             })
             .collect();
         let auth_mode = self.auth_mode();
-        let mut app_declarations = if manifest_format == PluginManifestFormat::Legacy {
+        let mut app_declarations = if plugin_supports_apps(manifest_format, &plugin_id) {
             load_plugin_apps_from_manifest(source_path.as_path(), &manifest.paths).await
         } else {
             Vec::new()
@@ -2925,14 +3349,12 @@ impl PluginsManager {
             manifest_format,
         )
         .await;
-        if manifest_format == PluginManifestFormat::Legacy {
-            apply_app_mcp_routing_policy(
-                &mut app_declarations,
-                &mut mcp_servers,
-                auth_mode,
-                /*plugin_active*/ true,
-            );
-        }
+        apply_app_mcp_routing_policy(
+            &mut app_declarations,
+            &mut mcp_servers,
+            auth_mode,
+            /*plugin_active*/ true,
+        );
         let apps = app_connector_ids_from_declarations(&app_declarations);
         let mut seen_app_connector_ids = HashSet::new();
         let mut app_category_by_id = HashMap::new();
@@ -2969,11 +3391,13 @@ impl PluginsManager {
         })
     }
 
+    /// Starts background tasks and sends marketplace upgrade warnings through the supplied channel.
     pub fn maybe_start_plugin_startup_tasks_for_config(
         self: &Arc<Self>,
         config: &PluginsConfigInput,
         reload_config: ConfigLayerReload,
         on_effective_plugins_changed: Option<EffectivePluginsChangedCallback>,
+        upgrade_warnings: mpsc::UnboundedSender<String>,
     ) {
         if config.plugins_enabled {
             self.maybe_start_curated_repo_sync_for_config(
@@ -2995,11 +3419,28 @@ impl PluginsManager {
             if should_spawn_marketplace_auto_upgrade {
                 let manager = Arc::clone(self);
                 let config = config.clone();
-                let on_effective_plugins_changed = on_effective_plugins_changed.clone();
-                let runtime = tokio::runtime::Handle::current();
-                if self
-                    .task_registry
-                    .spawn_thread("plugins-marketplace-auto-upgrade", move || {
+                let completion = BlockingPluginWorkerReset {
+                    manager: manager.clone(),
+                    kind: BlockingPluginWorkerKind::MarketplaceUpgrade,
+                    armed: true,
+                };
+                let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+                    warn!("failed to admit marketplace upgrade without a runtime");
+                    let _ = upgrade_warnings.send(
+                        "Codex could not start marketplace updates: runtime unavailable"
+                            .to_string(),
+                    );
+                    return;
+                };
+                let on_effective_plugins_changed =
+                    on_effective_plugins_changed.clone().map(|callback| {
+                        dispatch_on_runtime(self.task_registry.clone(), runtime, callback)
+                    });
+                let task_warnings = upgrade_warnings.clone();
+                if let Err(()) = self.task_registry.spawn_request_thread(
+                    "plugins-marketplace-auto-upgrade",
+                    move || {
+                        let mut completion = completion;
                         let outcome = manager.upgrade_configured_marketplaces_for_config_with_mode(
                             &config,
                             /*marketplace_name*/ None,
@@ -3008,15 +3449,12 @@ impl PluginsManager {
                         );
                         match outcome {
                             Ok(outcome) => {
-                                if !outcome.upgraded_roots.is_empty()
+                                if !manager.task_registry.worker_stop().is_stopped()
+                                    && !outcome.upgraded_roots.is_empty()
                                     && let Some(on_effective_plugins_changed) =
                                         on_effective_plugins_changed
                                 {
-                                    runtime.spawn(async move {
-                                        on_effective_plugins_changed(
-                                            EffectivePluginsChange::default(),
-                                        );
-                                    });
+                                    on_effective_plugins_changed(EffectivePluginsChange::default());
                                 }
                                 for error in outcome.errors {
                                     warn!(
@@ -3024,10 +3462,16 @@ impl PluginsManager {
                                         error = %error.message,
                                         "failed to auto-upgrade configured marketplace"
                                     );
+                                    let _ = task_warnings.send(format!(
+                                        "Codex could not update marketplace `{}`: {}",
+                                        error.marketplace_name, error.message
+                                    ));
                                 }
                             }
                             Err(err) => {
                                 warn!("failed to auto-upgrade configured marketplaces: {err}");
+                                let _ = task_warnings
+                                    .send(format!("Codex could not update marketplaces: {err}"));
                             }
                         }
 
@@ -3035,64 +3479,34 @@ impl PluginsManager {
                             Ok(state) => state,
                             Err(err) => err.into_inner(),
                         };
+                        completion.armed = false;
                         state.in_flight = false;
-                    })
-                    .is_err()
-                {
-                    let mut state = match self.configured_marketplace_upgrade_state.write() {
-                        Ok(state) => state,
-                        Err(err) => err.into_inner(),
-                    };
-                    state.in_flight = false;
+                    },
+                ) {
                     warn!("failed to admit configured marketplace auto-upgrade task");
+                    let _ = upgrade_warnings.send(
+                        "Codex could not start marketplace updates: task owner unavailable"
+                            .to_string(),
+                    );
                 }
             }
             let config_for_remote_sync = config.clone();
             let manager = Arc::clone(self);
-            let on_effective_plugins_changed = on_effective_plugins_changed.clone();
-            let _ = self.task_registry.spawn(async move {
+            let _ = self.task_registry.spawn_callback(async move {
                 let auth = manager.auth_manager.auth().await;
-                manager.maybe_start_remote_plugin_caches_refresh(
+                manager.maybe_start_remote_installed_plugins_cache_refresh_with_notify(
                     &config_for_remote_sync,
                     auth.clone(),
+                    RemoteInstalledPluginsCacheRefreshNotify::IfCacheChanged,
                     on_effective_plugins_changed.clone(),
+                    EffectivePluginsChange::default(),
                 );
                 manager.maybe_start_remote_installed_plugin_bundle_sync(
                     &config_for_remote_sync,
-                    auth.clone(),
-                    on_effective_plugins_changed,
-                );
-                let mut scopes = crate::remote::cached_remote_plugin_catalog_scopes(
-                    manager.codex_home.as_path(),
-                    &remote_plugin_service_config(&config_for_remote_sync),
-                    auth.as_ref(),
-                );
-                if config_for_remote_sync.remote_plugin_enabled {
-                    scopes.insert(RemotePluginScope::Global);
-                } else {
-                    scopes.retain(|scope| *scope == RemotePluginScope::Workspace);
-                }
-                manager.maybe_start_remote_catalog_cache_refresh(
-                    &config_for_remote_sync,
                     auth,
-                    scopes,
-                    RemoteCatalogCacheRefreshMode::Force,
+                    on_effective_plugins_changed,
+                    InstalledPluginSyncSource::Startup,
                 );
-            });
-
-            let config_for_featured_plugins = config.clone();
-            let manager = Arc::clone(self);
-            let _ = self.task_registry.spawn(async move {
-                let auth = manager.auth_manager.auth().await;
-                if let Err(err) = manager
-                    .featured_plugin_ids_for_config(&config_for_featured_plugins, auth.as_ref())
-                    .await
-                {
-                    warn!(
-                        error = %err,
-                        "failed to warm featured plugin ids cache"
-                    );
-                }
             });
         }
     }
@@ -3119,6 +3533,7 @@ impl PluginsManager {
         mode: PluginGitMode,
         reload_config: &ConfigLayerReload,
     ) -> Result<ConfiguredMarketplaceUpgradeOutcome, String> {
+        crate::retirement::ensure_worker_running("configured marketplace upgrade")?;
         let mut outcome = upgrade_configured_git_marketplaces_with_mode(
             self.codex_home.as_path(),
             &config.config_layer_stack,
@@ -3134,6 +3549,18 @@ impl PluginsManager {
             ));
         }
         if !outcome.upgraded_roots.is_empty() {
+            if let Err(message) =
+                crate::retirement::ensure_worker_running("post-upgrade plugin refresh")
+            {
+                self.clear_cache();
+                outcome.errors.push(ConfiguredMarketplaceUpgradeError {
+                    marketplace_name: marketplace_name
+                        .unwrap_or("all configured marketplaces")
+                        .to_string(),
+                    message,
+                });
+                return Ok(outcome);
+            }
             let mut configured_plugin_keys = configured_plugins_from_stack(
                 &config.config_layer_stack,
                 self.codex_home.as_path(),
@@ -3235,21 +3662,26 @@ impl PluginsManager {
 
     fn schedule_remote_installed_plugins_cache_refresh(
         self: &Arc<Self>,
-        mut request: RemoteInstalledPluginsCacheRefreshRequest,
+        request: RemoteInstalledPluginsCacheRefreshRequest,
     ) {
         if self.remote_installed_plugins_cache_generation_if_current(request.auth.as_ref())
             != Some(request.generation)
         {
             return;
         }
-        let should_spawn = {
+        let Ok(mut request) = QueuedPluginRequest::prepare(&self.task_registry, request) else {
+            warn!("failed to admit queued installed-plugin request");
+            return;
+        };
+        if request.request.on_effective_plugins_changed.is_some() {
+            request.callback_owner = request.owner.clone();
+        }
+        let mut discarded_callbacks = Vec::new();
+        let (should_spawn, displaced) = {
             let mut state = match self.remote_installed_plugins_cache_refresh_state.write() {
                 Ok(state) => state,
                 Err(err) => err.into_inner(),
             };
-            if !request.reset_generation.is_current(&state.generation) {
-                return;
-            }
             if self.remote_installed_plugins_cache_generation_if_current(request.auth.as_ref())
                 != Some(request.generation)
             {
@@ -3272,10 +3704,13 @@ impl PluginsManager {
                     && let Some(existing_callback) =
                         existing_request.on_effective_plugins_changed.as_ref()
                 {
+                    discarded_callbacks.extend(request.on_effective_plugins_changed.take());
                     request.on_effective_plugins_changed = Some(Arc::clone(existing_callback));
+                    request.callback_owner = existing_request.callback_owner.clone();
                 } else if request.on_effective_plugins_changed.is_none() {
                     request.on_effective_plugins_changed =
                         existing_request.on_effective_plugins_changed.clone();
+                    request.callback_owner = existing_request.callback_owner.clone();
                 }
                 for materialization in &existing_request.change.materialized_remote_plugins {
                     if !request
@@ -3294,36 +3729,35 @@ impl PluginsManager {
                     .change
                     .materialized_remote_plugins
                     .sort_by_key(|materialization| materialization.plugin_id.as_key());
+                request.inherit(existing_request);
             }
-            state.requested = Some(request);
-            if state.in_flight {
-                false
-            } else {
-                state.in_flight = true;
-                true
-            }
+            let displaced = state.requested.replace(request);
+            let should_spawn = !state.in_flight;
+            state.in_flight = true;
+            (should_spawn, displaced)
         };
+        drop(displaced);
+        drop(discarded_callbacks);
         if !should_spawn {
             return;
         }
 
         let manager = Arc::clone(self);
+        let completion = AsyncPluginWorkerReset {
+            manager: manager.clone(),
+            kind: AsyncPluginWorkerKind::InstalledRefresh,
+            armed: true,
+        };
         if self
             .task_registry
             .spawn(async move {
                 manager
-                    .run_remote_installed_plugins_cache_refresh_loop()
+                    .run_remote_installed_plugins_cache_refresh_loop(completion)
                     .await;
             })
             .is_err()
         {
-            let mut state = match self.remote_installed_plugins_cache_refresh_state.write() {
-                Ok(state) => state,
-                Err(err) => err.into_inner(),
-            };
-            state.in_flight = false;
-            state.requested = None;
-            warn!("failed to admit remote installed plugins cache refresh task");
+            warn!("failed to admit schedule_remote_installed_plugins_cache_refresh task");
         }
     }
 
@@ -3331,65 +3765,77 @@ impl PluginsManager {
         self: &Arc<Self>,
         request: RemoteCatalogCacheRefreshRequest,
     ) {
-        let should_spawn = {
-            let mut state = match self.remote_catalog_cache_refresh_state.write() {
-                Ok(state) => state,
-                Err(err) => err.into_inner(),
-            };
-            if let Some(pending) = state
+        let Ok(mut request) = QueuedPluginRequest::prepare(&self.task_registry, request) else {
+            warn!("failed to admit queued catalog request");
+            return;
+        };
+        let (should_spawn, displaced) = {
+            let mut state = self
+                .remote_catalog_cache_refresh_state
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let displaced = if let Some(index) = state
                 .requests
-                .iter_mut()
-                .find(|pending| pending.has_same_cache_identity(&request))
+                .iter()
+                .position(|pending| pending.request.has_same_cache_identity(&request.request))
             {
-                pending.scopes.extend(request.scopes);
-                pending.auth = request.auth;
-                pending.mode = match (pending.mode, request.mode) {
-                    (RemoteCatalogCacheRefreshMode::Force, _)
-                    | (_, RemoteCatalogCacheRefreshMode::Force) => {
-                        RemoteCatalogCacheRefreshMode::Force
-                    }
-                    (
-                        RemoteCatalogCacheRefreshMode::OnlyIfStale,
-                        RemoteCatalogCacheRefreshMode::OnlyIfStale,
-                    ) => RemoteCatalogCacheRefreshMode::OnlyIfStale,
-                };
+                let mut previous = state
+                    .requests
+                    .remove(index)
+                    .unwrap_or_else(|| panic!("selected pending catalog request"));
+                request
+                    .request
+                    .scopes
+                    .extend(previous.request.scopes.iter().cloned());
+                // Preserve the original pending service config and latest auth,
+                // exactly as the old coalescer; equality is not authority.
+                std::mem::swap(
+                    &mut request.request.service_config,
+                    &mut previous.request.service_config,
+                );
+                request.inherit(&previous);
+                state.requests.insert(index, request);
+                Some(previous)
             } else {
                 state.requests.push_back(request);
-            }
-            if state.in_flight {
-                false
-            } else {
-                state.in_flight = true;
-                true
-            }
+                None
+            };
+            let should_spawn = !state.in_flight;
+            state.in_flight = true;
+            (should_spawn, displaced)
         };
+        drop(displaced);
         if !should_spawn {
             return;
         }
-
         let manager = Arc::clone(self);
+        let completion = AsyncPluginWorkerReset {
+            manager: manager.clone(),
+            kind: AsyncPluginWorkerKind::CatalogRefresh,
+            armed: true,
+        };
         if self
             .task_registry
             .spawn(async move {
-                manager.run_remote_catalog_cache_refresh_loop().await;
+                manager
+                    .run_remote_catalog_cache_refresh_loop(completion)
+                    .await;
             })
             .is_err()
         {
-            let mut state = match self.remote_catalog_cache_refresh_state.write() {
-                Ok(state) => state,
-                Err(err) => err.into_inner(),
-            };
-            state.in_flight = false;
-            state.requests.clear();
-            warn!("failed to admit remote catalog cache refresh task");
+            warn!("failed to admit schedule_remote_catalog_cache_refresh task");
         }
     }
 
     fn schedule_non_curated_plugin_cache_refresh(
         self: &Arc<Self>,
-        mut request: NonCuratedCacheRefreshRequest,
+        request: NonCuratedCacheRefreshRequest,
     ) {
-        let should_spawn = {
+        let Ok(mut request) = QueuedPluginRequest::prepare(&self.task_registry, request) else {
+            warn!("failed to admit queued non-curated request");
+            return;
+        };
+        let (should_spawn, displaced) = {
             let mut state = match self.non_curated_cache_refresh_state.write() {
                 Ok(state) => state,
                 Err(err) => err.into_inner(),
@@ -3421,7 +3867,7 @@ impl PluginsManager {
             }
             // Reconcile each canonical plugin generation once before publishing its resource.
             if state.requested.as_ref().is_some_and(|requested| {
-                requested == &request
+                requested.request == request.request
                     || (requested.git_mode == PluginGitMode::Manual
                         && request.git_mode == PluginGitMode::Automatic
                         && requested.roots == request.roots
@@ -3441,36 +3887,28 @@ impl PluginsManager {
             {
                 return;
             }
-            state.requested = Some(request);
-            if state.in_flight {
-                false
-            } else {
-                state.in_flight = true;
-                true
-            }
+            let displaced = state.requested.replace(request);
+            let should_spawn = !state.in_flight;
+            state.in_flight = true;
+            (should_spawn, displaced)
         };
+        drop(displaced);
         if !should_spawn {
             return;
         }
 
         let manager = Arc::clone(self);
-        if self
-            .task_registry
-            .spawn_thread("plugins-non-curated-cache-refresh", move || {
-                manager.run_non_curated_plugin_cache_refresh_loop()
-            })
-            .is_err()
+        let completion = BlockingPluginWorkerReset {
+            manager: manager.clone(),
+            kind: BlockingPluginWorkerKind::NonCuratedRefresh,
+            armed: true,
+        };
+        if let Err(()) =
+            self.task_registry
+                .spawn_thread("plugins-non-curated-cache-refresh", move || {
+                    manager.run_non_curated_plugin_cache_refresh_loop(completion);
+                })
         {
-            let mut state = match self.non_curated_cache_refresh_state.write() {
-                Ok(state) => state,
-                Err(err) => err.into_inner(),
-            };
-            state.in_flight = false;
-            state.requested = None;
-            self.non_curated_cache_refresh_completion
-                .send_modify(|completion| {
-                    completion.sequence = completion.sequence.wrapping_add(1);
-                });
             warn!("failed to admit non-curated plugin cache refresh task");
         }
     }
@@ -3480,31 +3918,54 @@ impl PluginsManager {
         http_client_factory: HttpClientFactory,
         on_effective_plugins_changed: Option<EffectivePluginsChangedCallback>,
     ) {
-        if CURATED_REPO_SYNC_STARTED.swap(true, Ordering::SeqCst) {
+        let Some(start) = CuratedSyncStart::begin(&CURATED_REPO_SYNC_STARTED) else {
             return;
-        }
-        let on_effective_plugins_changed =
-            on_effective_plugins_changed.map(|on_effective_plugins_changed| {
-                let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-                    return on_effective_plugins_changed;
-                };
-                let task_registry = self.task_registry.clone();
-                let callback: EffectivePluginsChangedCallback = Arc::new(move |change| {
-                    let on_effective_plugins_changed = Arc::clone(&on_effective_plugins_changed);
-                    let _ = task_registry.spawn_on(&runtime, async move {
-                        on_effective_plugins_changed(change);
-                    });
-                });
-                callback
-            });
+        };
+        drop(self.start_curated_repo_sync_with(
+            http_client_factory,
+            on_effective_plugins_changed,
+            start,
+            sync_openai_plugins_repo_until,
+        ));
+    }
+
+    /// The same admission/thread/cache/callback path is used with a controlled
+    /// read engine in tests. Production supplies only the stop-aware sync above.
+    fn start_curated_repo_sync_with<F>(
+        self: &Arc<Self>,
+        http_client_factory: HttpClientFactory,
+        on_effective_plugins_changed: Option<EffectivePluginsChangedCallback>,
+        start: CuratedSyncStart,
+        sync: F,
+    ) -> Option<crate::retirement::Receipt>
+    where
+        F: FnOnce(&Path, HttpClientFactory, crate::WorkerStop) -> Result<String, String>
+            + Send
+            + 'static,
+    {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            warn!("curated plugins repo sync requires a Tokio runtime; not started");
+            return None;
+        };
+        let on_effective_plugins_changed = on_effective_plugins_changed
+            .map(|callback| dispatch_on_runtime(self.task_registry.clone(), runtime, callback));
         let manager = Arc::clone(self);
         let codex_home = self.codex_home.clone();
-        if self
+        let stop = self.task_registry.worker_stop();
+        match self
             .task_registry
-            .spawn_thread(
-                "plugins-curated-repo-sync",
-                move || match sync_openai_plugins_repo(codex_home.as_path(), http_client_factory) {
+            .spawn_request_thread("plugins-curated-repo-sync", move || {
+                let mut start = start;
+                if stop.is_stopped() {
+                    warn!("curated plugins repo sync stopped before reading");
+                    return;
+                }
+                match sync(codex_home.as_path(), http_client_factory, stop.clone()) {
                     Ok(curated_plugin_version) => {
+                        if stop.is_stopped() {
+                            warn!("curated plugins repo sync stopped before cache refresh");
+                            return;
+                        }
                         let configured_curated_plugin_ids =
                             configured_curated_plugin_ids_from_codex_home(codex_home.as_path());
                         match refresh_curated_plugin_cache(
@@ -3517,78 +3978,105 @@ impl PluginsManager {
                                     cache_refreshed,
                                     on_effective_plugins_changed.as_ref(),
                                 );
+                                start.committed = true;
                             }
                             Err(err) => {
                                 manager.clear_cache();
-                                CURATED_REPO_SYNC_STARTED.store(false, Ordering::SeqCst);
                                 warn!("failed to refresh curated plugin cache after sync: {err}");
                             }
                         }
                     }
                     Err(err) => {
-                        CURATED_REPO_SYNC_STARTED.store(false, Ordering::SeqCst);
                         warn!("failed to sync curated plugins repo: {err}");
                     }
-                },
-            )
-            .is_err()
-        {
-            CURATED_REPO_SYNC_STARTED.store(false, Ordering::SeqCst);
-            warn!("failed to start curated plugins repo sync task");
+                }
+            }) {
+            Ok(receipt) => Some(receipt),
+            Err(()) => {
+                warn!("failed to admit curated plugins repo sync task");
+                None
+            }
         }
     }
 
-    async fn run_remote_installed_plugins_cache_refresh_loop(self: Arc<Self>) {
+    async fn run_remote_installed_plugins_cache_refresh_loop(
+        self: Arc<Self>,
+        mut completion: AsyncPluginWorkerReset,
+    ) {
         loop {
-            let request = {
-                let mut state = match self.remote_installed_plugins_cache_refresh_state.write() {
-                    Ok(state) => state,
-                    Err(err) => err.into_inner(),
-                };
+            if let Err(error) = self
+                .task_registry
+                .worker_stop()
+                .ensure_running("next installed cache request")
+            {
+                warn!(%error, "installed plugin cache worker stopped");
+                return;
+            }
+            let queued = {
+                let mut state = self
+                    .remote_installed_plugins_cache_refresh_state
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 match state.requested.take() {
                     Some(request) => request,
                     None => {
+                        completion.armed = false;
                         state.in_flight = false;
                         return;
                     }
                 }
             };
-
-            let plugins = crate::remote::fetch_remote_installed_plugins(
-                &request.service_config,
-                request.auth.as_ref(),
-            )
+            let QueuedPluginRequest {
+                request,
+                owner,
+                obligations,
+                callback_owner,
+            } = queued;
+            let manager = Arc::clone(&self);
+            let backend_owner = owner.clone();
+            let result = run_queued_plugin_work(&owner, obligations, async move {
+                manager
+                    .refresh_remote_installed_request(request, callback_owner, backend_owner)
+                    .await;
+            })
             .await;
-            self.complete_remote_installed_plugins_cache_refresh(request, plugins);
+            if let Err(failure) = result {
+                self.task_registry.worker_stop().mark_unavailable();
+                warn!(?failure, "installed plugin queued operation custody failed");
+                return;
+            }
         }
     }
 
-    fn complete_remote_installed_plugins_cache_refresh(
+    async fn refresh_remote_installed_request(
         &self,
         request: RemoteInstalledPluginsCacheRefreshRequest,
-        plugins: Result<Vec<RemoteInstalledPlugin>, RemotePluginCatalogError>,
+        callback_owner: Option<codex_model_provider::DeferredAuthTask>,
+        backend_owner: Option<codex_model_provider::DeferredAuthTask>,
     ) {
-        // Reset takes the write guard. Keep this read guard through publication
-        // and its synchronous callback, so acknowledgment cannot overtake either.
-        // Callbacks must not recursively reset or schedule installed refreshes.
-        let state = self
-            .remote_installed_plugins_cache_refresh_state
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !request.reset_generation.is_current(&state.generation) {
+        let stop = self.task_registry.worker_stop();
+        let Some(plugins) = stop
+            .run_read_until_shutdown(crate::remote::fetch_remote_installed_plugins(
+                &request.service_config,
+                request.auth.as_ref(),
+            ))
+            .await
+        else {
             return;
-        }
+        };
         match plugins {
             Ok(plugins) => {
-                let Some(changed) = self.write_remote_installed_plugins_cache_snapshot(
+                let Some(update) = self.write_remote_installed_plugins_cache_snapshot(
                     request.generation,
                     plugins,
                     request.auth.as_ref(),
-                    RemoteInstalledPluginsCachePublication::Refresh,
+                    RemoteInstalledPluginsCachePublication::Refresh(
+                        InstalledPluginDisplayAssets::Include,
+                    ),
                 ) else {
                     return;
                 };
-                let should_notify = changed
+                let should_notify = update.metadata_change_id.is_some()
                     || !request.change.materialized_remote_plugins.is_empty()
                     || matches!(
                         request.notify,
@@ -3597,7 +4085,15 @@ impl PluginsManager {
                 if should_notify
                     && let Some(on_effective_plugins_changed) = request.on_effective_plugins_changed
                 {
-                    on_effective_plugins_changed(request.change);
+                    let mut change = request.change;
+                    change.metadata_change_id = update.metadata_change_id;
+                    invoke_queued_plugin_callback(
+                        on_effective_plugins_changed,
+                        change,
+                        callback_owner.clone(),
+                        backend_owner.clone(),
+                    )
+                    .await;
                 }
             }
             Err(
@@ -3612,7 +4108,13 @@ impl PluginsManager {
                 if changed
                     && let Some(on_effective_plugins_changed) = request.on_effective_plugins_changed
                 {
-                    on_effective_plugins_changed(EffectivePluginsChange::default());
+                    invoke_queued_plugin_callback(
+                        on_effective_plugins_changed,
+                        EffectivePluginsChange::default(),
+                        callback_owner.clone(),
+                        backend_owner.clone(),
+                    )
+                    .await;
                 }
             }
             Err(err) => {
@@ -3628,61 +4130,106 @@ impl PluginsManager {
         }
     }
 
-    async fn run_remote_catalog_cache_refresh_loop(self: Arc<Self>) {
+    async fn run_remote_catalog_cache_refresh_loop(
+        self: Arc<Self>,
+        mut completion: AsyncPluginWorkerReset,
+    ) {
         loop {
-            let request = {
-                let mut state = match self.remote_catalog_cache_refresh_state.write() {
-                    Ok(state) => state,
-                    Err(err) => err.into_inner(),
-                };
+            if let Err(error) = self
+                .task_registry
+                .worker_stop()
+                .ensure_running("next catalog cache request")
+            {
+                warn!(%error, "catalog plugin cache worker stopped");
+                return;
+            }
+            let queued = {
+                let mut state = self
+                    .remote_catalog_cache_refresh_state
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 match state.requests.pop_front() {
                     Some(request) => request,
                     None => {
+                        completion.armed = false;
                         state.in_flight = false;
                         return;
                     }
                 }
             };
+            let QueuedPluginRequest {
+                request,
+                owner,
+                obligations,
+                callback_owner: _,
+            } = queued;
+            let manager = Arc::clone(&self);
+            if let Err(failure) = run_queued_plugin_work(&owner, obligations, async move {
+                manager.refresh_remote_catalog_request(request).await;
+            })
+            .await
+            {
+                self.task_registry.worker_stop().mark_unavailable();
+                warn!(?failure, "catalog plugin queued operation custody failed");
+                return;
+            }
+        }
+    }
 
-            for scope in request.scopes {
-                if request.mode == RemoteCatalogCacheRefreshMode::OnlyIfStale
-                    && crate::remote::has_fresh_cached_remote_plugin_catalog(
-                        self.codex_home.as_path(),
-                        &request.service_config,
-                        request.auth.as_ref(),
-                        scope,
-                    )
-                {
-                    continue;
-                }
+    async fn refresh_remote_catalog_request(&self, request: RemoteCatalogCacheRefreshRequest) {
+        let stop = self.task_registry.worker_stop();
+        for scope in request.scopes {
+            if stop.is_stopped() {
+                return;
+            }
+            if crate::remote::has_fresh_cached_remote_plugin_catalog(
+                self.codex_home.as_path(),
+                &request.service_config,
+                request.auth.as_ref(),
+                scope,
+            ) {
+                continue;
+            }
 
-                match crate::remote::fetch_and_cache_remote_plugin_catalog(
+            let Some(result) = stop
+                .run_read_until_shutdown(crate::remote::fetch_and_cache_remote_plugin_catalog(
                     self.codex_home.as_path(),
                     &request.service_config,
                     request.auth.as_ref(),
                     scope,
-                )
+                ))
                 .await
-                {
-                    Ok(()) => {}
-                    Err(
-                        RemotePluginCatalogError::AuthRequired
-                        | RemotePluginCatalogError::UnsupportedAuthMode,
-                    ) => {}
-                    Err(err) => {
-                        warn!(
-                            error = %err,
-                            scope = ?scope,
-                            "failed to refresh cached remote plugin catalog"
-                        );
-                    }
+            else {
+                return;
+            };
+            match result {
+                Ok(()) => {}
+                Err(
+                    RemotePluginCatalogError::AuthRequired
+                    | RemotePluginCatalogError::UnsupportedAuthMode,
+                ) => {}
+                Err(err) => {
+                    warn!(
+                        error = %err,
+                        scope = ?scope,
+                        "failed to refresh cached remote plugin catalog"
+                    );
                 }
             }
         }
     }
 
-    fn run_non_curated_plugin_cache_refresh_loop(self: Arc<Self>) {
+    fn run_non_curated_plugin_cache_refresh_loop(
+        self: Arc<Self>,
+        mut completion: BlockingPluginWorkerReset,
+    ) {
         loop {
+            if let Err(error) =
+                crate::retirement::ensure_worker_running("next non-curated cache request")
+            {
+                warn!(%error, "non-curated plugin cache worker stopped");
+                return;
+            }
             let request = {
                 let state = match self.non_curated_cache_refresh_state.read() {
                     Ok(state) => state,
@@ -3696,6 +4243,7 @@ impl PluginsManager {
                     Ok(state) => state,
                     Err(err) => err.into_inner(),
                 };
+                completion.armed = false;
                 state.in_flight = false;
                 self.non_curated_cache_refresh_completion
                     .send_modify(|completion| {
@@ -3704,23 +4252,37 @@ impl PluginsManager {
                 return;
             };
 
-            let refresh_result = match request.mode {
-                NonCuratedCacheRefreshMode::IfVersionChanged => {
-                    refresh_non_curated_plugin_cache_detailed(
-                        self.codex_home.as_path(),
-                        &request.roots,
-                        &request.configured_plugin_keys,
-                        request.git_mode,
-                    )
+            let refresh_result = if let Some(owner) = request.owner.as_ref() {
+                let owner = owner.clone();
+                let manager = Arc::clone(&self);
+                let physical_request = request.request.clone();
+                let stop = self.task_registry.worker_stop();
+                let result = tokio::runtime::Handle::current().block_on(async move {
+                    owner
+                        .run(async move {
+                            codex_model_provider::run_blocking_call_with_scope(
+                                move || crate::retirement::WorkerStopScope::enter(stop),
+                                move || manager.refresh_non_curated_request(&physical_request),
+                            )
+                            .await
+                        })
+                        .await
+                });
+                match result {
+                    Ok(Ok(result)) => result,
+                    Ok(Err(error)) => {
+                        self.task_registry.worker_stop().mark_unavailable();
+                        Err(format!("non-curated physical task custody failed: {error}"))
+                    }
+                    Err(failure) => {
+                        self.task_registry.worker_stop().mark_unavailable();
+                        Err(format!(
+                            "non-curated queued task custody failed: {failure:?}"
+                        ))
+                    }
                 }
-                NonCuratedCacheRefreshMode::ForceReinstall => {
-                    refresh_non_curated_plugin_cache_force_reinstall_detailed(
-                        self.codex_home.as_path(),
-                        &request.roots,
-                        &request.configured_plugin_keys,
-                        request.git_mode,
-                    )
-                }
+            } else {
+                self.refresh_non_curated_request(&request.request)
             };
             let (refreshed, cache_changed) = match refresh_result {
                 Ok(refresh_outcome) => {
@@ -3751,13 +4313,17 @@ impl PluginsManager {
                 Err(err) => err.into_inner(),
             };
             if refreshed {
-                state.last_refreshed = Some(request.clone());
+                state.last_refreshed = Some(request.request.clone());
             }
-            let complete = state.requested.as_ref() == Some(&request);
-            if complete {
-                state.requested = None;
+            let complete =
+                state.requested.as_ref().map(|queued| &queued.request) == Some(&request.request);
+            let retired = if complete {
+                completion.armed = false;
                 state.in_flight = false;
-            }
+                state.requested.take()
+            } else {
+                None
+            };
             self.non_curated_cache_refresh_completion
                 .send_modify(|completion| {
                     completion.sequence = completion.sequence.wrapping_add(1);
@@ -3765,8 +4331,34 @@ impl PluginsManager {
                         completion.changed_sequence = completion.changed_sequence.wrapping_add(1);
                     }
                 });
+            drop(state);
+            drop(retired);
             if complete {
                 return;
+            }
+        }
+    }
+
+    fn refresh_non_curated_request(
+        &self,
+        request: &NonCuratedCacheRefreshRequest,
+    ) -> Result<crate::loader::NonCuratedCacheRefreshOutcome, String> {
+        match request.mode {
+            NonCuratedCacheRefreshMode::IfVersionChanged => {
+                refresh_non_curated_plugin_cache_detailed(
+                    self.codex_home.as_path(),
+                    &request.roots,
+                    &request.configured_plugin_keys,
+                    request.git_mode,
+                )
+            }
+            NonCuratedCacheRefreshMode::ForceReinstall => {
+                refresh_non_curated_plugin_cache_force_reinstall_detailed(
+                    self.codex_home.as_path(),
+                    &request.roots,
+                    &request.configured_plugin_keys,
+                    request.git_mode,
+                )
             }
         }
     }
@@ -3785,7 +4377,10 @@ impl PluginsManager {
             .collect::<HashSet<_>>();
         let enabled = configured_plugins
             .into_iter()
-            .filter_map(|(plugin_key, plugin)| plugin.enabled.then_some(plugin_key))
+            .filter_map(|(plugin_key, plugin)| {
+                (plugin.enabled.unwrap_or(true) && config.plugins.allows_plugin(&plugin_key))
+                    .then_some(plugin_key)
+            })
             .collect::<HashSet<_>>();
         ConfiguredPluginStates { installed, enabled }
     }
@@ -3836,7 +4431,8 @@ impl PluginsManager {
         config: &PluginsConfigInput,
         roots: &[AbsolutePathBuf],
     ) -> Result<MarketplaceListOutcome, MarketplaceError> {
-        let mut outcome = list_marketplaces_with_home(roots, home_dir().as_deref())?;
+        let mut outcome =
+            list_marketplaces_with_cache(roots, home_dir().as_deref(), &self.store.manifest_cache)?;
         let policy = MarketplacePolicy::from_requirements(config.config_layer_stack.requirements());
         outcome.marketplaces.retain(|marketplace| {
             policy
@@ -3901,141 +4497,14 @@ pub(crate) fn remote_plugin_install_required_description(
     )
 }
 
-#[derive(Debug, thiserror::Error)]
-pub enum PluginInstallError {
-    #[error("{0}")]
-    Marketplace(#[from] MarketplaceError),
-
-    #[error("{0}")]
-    Remote(#[from] RemotePluginMutationError),
-
-    #[error("{0}")]
-    Store(#[from] PluginStoreError),
-
-    #[error("{0}")]
-    Config(#[from] anyhow::Error),
-
-    #[error("failed to join plugin install task: {0}")]
-    Join(#[from] tokio::task::JoinError),
-}
-
-impl PluginInstallError {
-    fn join(source: tokio::task::JoinError) -> Self {
-        Self::Join(source)
-    }
-
-    pub fn is_invalid_request(&self) -> bool {
-        matches!(
-            self,
-            Self::Marketplace(
-                MarketplaceError::MarketplaceNotFound { .. }
-                    | MarketplaceError::InvalidMarketplaceFile { .. }
-                    | MarketplaceError::PluginNotFound { .. }
-                    | MarketplaceError::PluginNotAvailable { .. }
-                    | MarketplaceError::InvalidPlugin(_)
-            ) | Self::Store(PluginStoreError::Invalid(_))
-        )
-    }
-
-    pub fn sub_error_type(&self) -> Option<String> {
-        match self {
-            Self::Marketplace(err) => marketplace_error_sub_error_type(err),
-            Self::Remote(err) => err.sub_error_type(),
-            Self::Store(err) => err.sub_error_type(),
-            Self::Config(_) => Some("failed_to_enable_plugin".to_string()),
-            Self::Join(_) => Some("plugin_install_task_failed".to_string()),
-        }
-    }
-}
-
-fn plugin_install_error_type(err: &PluginInstallError) -> &'static str {
-    match err {
-        PluginInstallError::Marketplace(err) => marketplace_error_type(err),
-        PluginInstallError::Remote(err) => remote_plugin_mutation_error_type(err),
-        PluginInstallError::Store(err) => plugin_store_error_type(err),
-        PluginInstallError::Config(_) => "config",
-        PluginInstallError::Join(_) => "join",
-    }
-}
-
-fn marketplace_error_type(err: &MarketplaceError) -> &'static str {
-    match err {
-        MarketplaceError::Io { .. } => "marketplace_io",
-        MarketplaceError::MarketplaceNotFound { .. } => "marketplace_not_found",
-        MarketplaceError::InvalidMarketplaceFile { .. } => "invalid_marketplace_file",
-        MarketplaceError::PluginNotFound { .. } => "plugin_not_found",
-        MarketplaceError::PluginNotAvailable { .. } => "plugin_not_available",
-        MarketplaceError::PluginsDisabled => "plugins_disabled",
-        MarketplaceError::InvalidPlugin(_) => "invalid_plugin",
-    }
-}
-
-fn marketplace_error_sub_error_type(err: &MarketplaceError) -> Option<String> {
-    match err {
-        MarketplaceError::Io { context, .. } => Some(error_context_sub_error_type(context)),
-        MarketplaceError::MarketplaceNotFound { .. }
-        | MarketplaceError::InvalidMarketplaceFile { .. }
-        | MarketplaceError::PluginNotFound { .. }
-        | MarketplaceError::PluginNotAvailable { .. }
-        | MarketplaceError::PluginsDisabled
-        | MarketplaceError::InvalidPlugin(_) => None,
-    }
-}
-
-fn remote_plugin_mutation_error_type(err: &RemotePluginMutationError) -> &'static str {
-    match err {
-        RemotePluginMutationError::AuthRequired => "remote_mutation_auth_required",
-        RemotePluginMutationError::UnsupportedAuthMode => "remote_mutation_unsupported_auth_mode",
-        RemotePluginMutationError::AuthToken(_) => "remote_mutation_auth_token",
-        RemotePluginMutationError::InvalidBaseUrl(_) => "remote_mutation_invalid_base_url",
-        RemotePluginMutationError::InvalidBaseUrlPath => "remote_mutation_invalid_base_url_path",
-        RemotePluginMutationError::Request { .. } => "remote_mutation_request",
-        RemotePluginMutationError::UnexpectedStatus { .. } => "remote_mutation_unexpected_status",
-        RemotePluginMutationError::Decode { .. } => "remote_mutation_decode",
-        RemotePluginMutationError::UnexpectedPluginId { .. } => {
-            "remote_mutation_unexpected_plugin_id"
-        }
-        RemotePluginMutationError::UnexpectedEnabledState { .. } => {
-            "remote_mutation_unexpected_enabled_state"
-        }
-    }
-}
-
-fn plugin_store_error_type(err: &PluginStoreError) -> &'static str {
-    match err {
-        PluginStoreError::Io { .. } => "store_io",
-        PluginStoreError::Invalid(_) => "store_invalid",
-    }
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum PluginUninstallError {
-    #[error("{0}")]
-    InvalidPluginId(#[from] PluginIdError),
-
-    #[error("{0}")]
-    Remote(#[from] RemotePluginMutationError),
-
-    #[error("{0}")]
-    Store(#[from] PluginStoreError),
-
-    #[error("{0}")]
-    Config(#[from] anyhow::Error),
-
-    #[error("failed to join plugin uninstall task: {0}")]
-    Join(#[from] tokio::task::JoinError),
-}
-
-impl PluginUninstallError {
-    fn join(source: tokio::task::JoinError) -> Self {
-        Self::Join(source)
-    }
-
-    pub fn is_invalid_request(&self) -> bool {
-        matches!(self, Self::InvalidPluginId(_))
-    }
-}
-
 #[cfg(test)]
 #[path = "manager_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "plugins_config_input_tests.rs"]
+mod plugins_config_input_tests;
+
+#[cfg(test)]
+#[path = "managed_plugin_reset_tests.rs"]
+mod managed_plugin_reset_tests;

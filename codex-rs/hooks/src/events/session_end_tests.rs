@@ -90,6 +90,7 @@ fn session_end_ignores_successful_output() {
     let completed = parse_completed(
         &handler(/*matcher*/ None),
         HandlerRunResult {
+            context_metadata: codex_protocol::models::ContentItemMetadata::harness(),
             started_at: 1,
             completed_at: 2,
             duration_ms: 1,
@@ -182,7 +183,7 @@ impl crate::mcp::HookMcpExecutor for UnexpectedMcpExecutor {
     fn execute(
         &self,
         _call: crate::mcp::HookMcpCall,
-    ) -> futures::future::BoxFuture<'_, anyhow::Result<String>> {
+    ) -> futures::future::BoxFuture<'_, anyhow::Result<crate::mcp::HookMcpOutput>> {
         panic!("command hook fixture must not invoke MCP");
     }
 }
@@ -204,7 +205,7 @@ fn engine(handler: ConfiguredHandler, shell: CommandShell) -> ClaudeHooksEngine 
         runtime,
         Arc::new(UnexpectedMcpExecutor),
     );
-    engine.handlers = vec![handler];
+    engine.handlers = vec![handler].into();
     engine
 }
 
@@ -243,8 +244,10 @@ fn assert_failed_with(events: &[codex_protocol::protocol::HookCompletedEvent], t
 fn handler(matcher: Option<&str>) -> ConfiguredHandler {
     ConfiguredHandler {
         builtin: false,
+        plugin_trust: None,
         event_name: HookEventName::SessionEnd,
-        matcher: matcher.map(str::to_string),
+        matcher: matcher
+            .map(|pattern| crate::engine::HookMatcher::new(pattern).expect("valid matcher")),
         timeout_sec: 2,
         status_message: None,
         additional_context_limit: Default::default(),

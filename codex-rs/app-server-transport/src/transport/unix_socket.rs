@@ -6,10 +6,13 @@ use std::io::Result as IoResult;
 use std::path::Path;
 
 use super::ConnectionProvenance;
+use super::PeerExecutableIdentity;
 use super::TransportEvent;
-use crate::transport::PeerExecutableIdentity;
-use crate::transport::identities_match;
+use super::provenance::identities_match;
 use crate::transport::websocket::run_websocket_connection;
+use crate::websocket_compression::WEBSOCKET_COMPRESSION_HEADER;
+use crate::websocket_compression::WebSocketCompression;
+use crate::websocket_compression::ZSTD_STREAM_PROTOCOL;
 use codex_uds::UnixListener;
 use codex_uds::UnixStream;
 use codex_utils_absolute_path::AbsolutePathBuf;
@@ -26,7 +29,7 @@ use tokio_tungstenite::tungstenite::http::Response;
 use tokio_tungstenite::tungstenite::http::StatusCode;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_util::sync::CancellationToken;
-use tracing::debug;
+use tokio_util::task::TaskTracker;
 use tracing::error;
 use tracing::info;
 use tracing::warn;
@@ -44,34 +47,71 @@ pub enum DaemonShutdownAccess {
     Managed,
 }
 
+/// Starts the control-socket acceptor under the caller's explicit custody.
+///
+/// `owner_custody` is borrowed only to take its non-owning
+/// [`crate::OwnerExpiry`] handle; the acceptor and its connections never hold
+/// it strongly. The caller must keep the `OwnerCustody` alive through the
+/// acceptor's join and its shutdown: work stopped at the owner deadline
+/// (for example a not-admitted refusal still waiting on a stalled peer) is
+/// retained in that custody and released exactly once when the caller drops
+/// it. Dropping it earlier makes later bounded work refuse admission
+/// (`NoCustodyOwner`), which is reported, never silently dropped.
 pub async fn start_control_socket_acceptor(
     socket_path: AbsolutePathBuf,
     transport_event_tx: mpsc::Sender<TransportEvent>,
     shutdown_token: CancellationToken,
     daemon_shutdown_access: DaemonShutdownAccess,
+    compression: WebSocketCompression,
+    owner_custody: &crate::OwnerCustody,
 ) -> IoResult<JoinHandle<()>> {
     start_control_socket_acceptor_with_bound_hook(
         socket_path,
         transport_event_tx,
         shutdown_token,
         daemon_shutdown_access,
+        compression,
+        owner_custody.expiry(),
         || Ok(()),
     )
     .await
 }
 
-/// Runs a startup publication hook after the protected socket and rendezvous
-/// path exist, but before any acceptor task is spawned. Failure drops the socket
-/// guard and prevents a partially published managed process from accepting RPCs.
+/// Publish only after the protected socket exists and before accepting RPCs.
+/// The caller retains the physical owner through the acceptor's retirement.
 pub async fn start_control_socket_acceptor_with_bound_hook(
     socket_path: AbsolutePathBuf,
     transport_event_tx: mpsc::Sender<TransportEvent>,
     shutdown_token: CancellationToken,
     daemon_shutdown_access: DaemonShutdownAccess,
+    compression: WebSocketCompression,
+    owner_expiry: crate::OwnerExpiry,
     on_bound: impl FnOnce() -> IoResult<()>,
 ) -> IoResult<JoinHandle<()>> {
+    let running_identity = PeerExecutableIdentity::capture_running_process().ok();
+    let (listener, socket_guard) = bind_private_daemon_socket(socket_path.as_path()).await?;
+    on_bound()?;
+    info!(socket_path = %socket_guard.socket_path.display(), "app-server control socket listening");
+    Ok(tokio::spawn(run_control_socket_acceptor(
+        listener,
+        transport_event_tx,
+        shutdown_token,
+        socket_guard,
+        daemon_shutdown_access,
+        compression,
+        running_identity,
+        owner_expiry,
+    )))
+}
+
+/// Binds a private daemon socket, retaining its advertised path as a rendezvous
+/// alias on Unix. Keep the guard alive for as long as the listener is in use.
+pub async fn bind_private_daemon_socket(
+    socket_path: &Path,
+) -> IoResult<(UnixListener, DaemonSocketFileGuard)> {
+    let socket_path = AbsolutePathBuf::from_absolute_path(socket_path)?;
     #[cfg(unix)]
-    let (socket_path, rendezvous_path, _startup_lock) = {
+    let (socket_path, rendezvous_path, mut startup_lock) = {
         use std::os::unix::fs::MetadataExt;
 
         if let Some(parent) = socket_path.as_path().parent() {
@@ -98,9 +138,9 @@ pub async fn start_control_socket_acceptor_with_bound_hook(
         }
         codex_uds::prepare_shared_daemon_socket_directory()?;
         let physical_path = protected_socket_path(socket_path.as_path())?;
-        let lock = acquire_app_server_startup_lock(AbsolutePathBuf::from_absolute_path_checked(
-            physical_path.with_extension("lock"),
-        )?)
+        let lock = acquire_removable_app_server_startup_lock(
+            AbsolutePathBuf::from_absolute_path_checked(physical_path.with_extension("lock"))?,
+        )
         .await?;
         prepare_control_socket_path(socket_path.as_path()).await?;
         (
@@ -117,15 +157,18 @@ pub async fn start_control_socket_acceptor_with_bound_hook(
         let (path, guard) = codex_uds::validate_private_socket_path(socket_path.as_path())?;
         (AbsolutePathBuf::from_absolute_path_checked(path)?, guard)
     };
-    // Failure to establish a daemon image must not take down the local
-    // control socket. It simply leaves every daemon peer unproven.
-    let running_process_identity = PeerExecutableIdentity::capture_running_process().ok();
     prepare_control_socket_path(socket_path.as_path()).await?;
     let listener = UnixListener::bind(socket_path.as_path()).await?;
-    let socket_guard = ControlSocketFileGuard {
+    #[cfg(unix)]
+    {
+        startup_lock.remove_on_drop = true;
+    }
+    let socket_guard = DaemonSocketFileGuard {
         socket_path,
         #[cfg(unix)]
         rendezvous_path,
+        #[cfg(unix)]
+        _startup_lock: startup_lock,
         #[cfg(windows)]
         _directory_guard: directory_guard,
     };
@@ -135,34 +178,32 @@ pub async fn start_control_socket_acceptor_with_bound_hook(
         socket_guard.socket_path.as_path(),
         socket_guard.rendezvous_path.as_path(),
     )?;
-    on_bound()?;
-    info!(
-        socket_path = %socket_guard.socket_path.display(),
-        "app-server control socket listening"
-    );
-
-    Ok(tokio::spawn(run_control_socket_acceptor(
-        listener,
-        transport_event_tx,
-        shutdown_token,
-        socket_guard,
-        daemon_shutdown_access,
-        running_process_identity,
-    )))
+    #[cfg(unix)]
+    socket_guard._startup_lock._file.unlock()?;
+    Ok((listener, socket_guard))
 }
 
 async fn run_control_socket_acceptor(
     mut listener: UnixListener,
     transport_event_tx: mpsc::Sender<TransportEvent>,
     shutdown_token: CancellationToken,
-    socket_guard: ControlSocketFileGuard,
+    socket_guard: DaemonSocketFileGuard,
     daemon_shutdown_access: DaemonShutdownAccess,
-    running_process_identity: Option<PeerExecutableIdentity>,
+    compression: WebSocketCompression,
+    running_identity: Option<PeerExecutableIdentity>,
+    owner_expiry: crate::OwnerExpiry,
 ) {
     let _socket_guard = socket_guard;
+    let handshakes = TaskTracker::new();
     loop {
         let stream = tokio::select! {
+            biased;
             _ = shutdown_token.cancelled() => {
+                break;
+            }
+            // The external owner released its custody: admit nothing more.
+            () = owner_expiry.owner_released_wait() => {
+                info!("control socket owner custody released; acceptor stops admitting");
                 break;
             }
             result = listener.accept() => {
@@ -185,12 +226,16 @@ async fn run_control_socket_acceptor(
         };
 
         let provenance = unix_peer_provenance(
-            running_process_identity,
+            running_identity,
             PeerExecutableIdentity::from_unix_stream(&stream),
         );
         let transport_event_tx = transport_event_tx.clone();
+        let owner_expiry = owner_expiry.clone();
+        let shutdown_token = shutdown_token.clone();
+        let pending_handshake = handshakes.token();
         tokio::spawn(async move {
             let mut shutdown_request = false;
+            let mut negotiated_compression = WebSocketCompression::Plain;
             let websocket_config = WebSocketConfig::default();
             let max_unfragmented_message_bytes = [
                 websocket_config.max_frame_size,
@@ -199,7 +244,7 @@ async fn run_control_socket_acceptor(
             .into_iter()
             .flatten()
             .min();
-            let websocket_stream = match accept_hdr_async_with_config(
+            let handshake = accept_hdr_async_with_config(
                 stream,
                 |request: &tokio_tungstenite::tungstenite::handshake::server::Request,
                  mut response: HandshakeResponse| {
@@ -210,6 +255,17 @@ async fn run_control_socket_acceptor(
                             return Err(rejection);
                         }
                         shutdown_request = true;
+                    } else if compression == WebSocketCompression::Zstd
+                        && request
+                            .headers()
+                            .get(WEBSOCKET_COMPRESSION_HEADER)
+                            .is_some_and(|value| value == ZSTD_STREAM_PROTOCOL)
+                    {
+                        negotiated_compression = WebSocketCompression::Zstd;
+                        response.headers_mut().insert(
+                            WEBSOCKET_COMPRESSION_HEADER,
+                            HeaderValue::from_static(ZSTD_STREAM_PROTOCOL),
+                        );
                     }
                     if let Some(max_bytes) = max_unfragmented_message_bytes {
                         response.headers_mut().insert(
@@ -220,17 +276,25 @@ async fn run_control_socket_acceptor(
                     Ok(response)
                 },
                 Some(websocket_config),
-            )
-            .await
-            {
+            );
+            // A raw peer has no processor connection yet. Retire its upgrade
+            // when admission closes, even if it never sends a WebSocket header.
+            let upgrade = tokio::select! {
+                biased;
+                () = shutdown_token.cancelled() => return,
+                () = owner_expiry.owner_released_wait() => return,
+                result = handshake => result,
+            };
+            let websocket_stream = match upgrade {
                 Ok(websocket_stream) => websocket_stream,
                 Err(err) => {
                     warn!("failed to upgrade control socket websocket connection: {err}");
                     return;
                 }
             };
+            drop(pending_handshake);
             if shutdown_request {
-                run_daemon_shutdown(websocket_stream, transport_event_tx).await;
+                run_daemon_shutdown(websocket_stream, transport_event_tx, owner_expiry).await;
                 return;
             }
             let (websocket_writer, websocket_reader) = websocket_stream.split();
@@ -238,51 +302,48 @@ async fn run_control_socket_acceptor(
                 websocket_writer,
                 websocket_reader,
                 transport_event_tx,
+                negotiated_compression,
                 provenance,
+                owner_expiry,
             )
             .await;
         });
     }
+    handshakes.close();
+    handshakes.wait().await;
     info!("control socket acceptor shutting down");
 }
 
 async fn run_daemon_shutdown(
     mut websocket: tokio_tungstenite::WebSocketStream<UnixStream>,
     transport_event_tx: mpsc::Sender<TransportEvent>,
+    owner_expiry: crate::OwnerExpiry,
 ) {
     let pid = std::process::id().to_string();
     if !matches!(websocket.next().await, Some(Ok(Message::Text(request))) if request == pid) {
         return;
     }
+    // An accepted daemon shutdown request is the first shutdown edge: record
+    // it here, at intake, before anything is queued toward the processor.
+    owner_expiry.mark_shutdown_edge();
     if websocket.send(Message::Text(pid.into())).await.is_err() {
         return;
     }
     // Let the manager receive the acknowledgment before the main loop closes connections.
     let _ = tokio::time::timeout(Duration::from_secs(2), websocket.next()).await;
-    let _ = transport_event_tx
-        .send(TransportEvent::DaemonShutdown)
-        .await;
-}
-
-/// Retains only an accept-time executable identity matching this server.
-fn unix_peer_provenance(
-    running_process_identity: Option<PeerExecutableIdentity>,
-    peer_identity: IoResult<Option<PeerExecutableIdentity>>,
-) -> ConnectionProvenance {
-    let Some(running_process_identity) = running_process_identity else {
-        return ConnectionProvenance::Unproven;
+    // Bounded by the latched owner deadline (the processor may be stuck).
+    let send = async move {
+        transport_event_tx
+            .send(TransportEvent::DaemonShutdown)
+            .await
+            .is_ok()
     };
-    let peer_identity = match peer_identity {
-        Ok(identity) => identity,
-        Err(err) => {
-            debug!("failed to establish Unix peer executable entitlement: {err}");
-            None
-        }
-    };
-    peer_identity
-        .filter(|identity| identities_match(running_process_identity, *identity))
-        .map(ConnectionProvenance::UnixPeerExecutable)
-        .unwrap_or(ConnectionProvenance::Unproven)
+    match owner_expiry.run("daemon_shutdown_request", send).await {
+        Ok(Some(true)) => {}
+        Ok(Some(false)) => warn!("daemon shutdown request not delivered: processor gone"),
+        Ok(None) => warn!("daemon shutdown request still queued at the owner deadline; retained"),
+        Err(refused) => warn!("daemon shutdown request not delivered: {refused}"),
+    }
 }
 
 // Unix callers hold the physical socket's startup lock through bind and publication.
@@ -339,6 +400,36 @@ async fn prepare_control_socket_path(socket_path: &Path) -> IoResult<()> {
     tokio::fs::remove_file(socket_path).await
 }
 
+/// Return a verified local socket endpoint, independent of the advertised Unix alias.
+/// A socket bound directly at the advertised path (e.g. SSH forwarding) is not ours on Unix.
+pub fn verified_local_daemon_socket(socket_path: &Path) -> IoResult<Option<AbsolutePathBuf>> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        let protected = protected_socket_path(socket_path)?;
+        if std::fs::read_link(socket_path).ok().as_deref() != Some(protected.as_path()) {
+            return Ok(None);
+        }
+        let directory = std::fs::symlink_metadata(codex_uds::shared_daemon_socket_directory()?)?;
+        // Match the daemon's bind-time check without creating or repairing the directory.
+        if directory.is_dir()
+            && directory.uid() == unsafe { libc::geteuid() }
+            && directory.mode() & 0o777 == 0o700
+        {
+            return AbsolutePathBuf::from_absolute_path(protected).map(Some);
+        }
+        Ok(None)
+    }
+    #[cfg(windows)]
+    {
+        // The TUI revalidates this directory and verifies the peer at connection time,
+        // using the same connect_local_daemon path as implicit startup.
+        let (path, _directory) = codex_uds::validate_private_socket_path(socket_path)?;
+        AbsolutePathBuf::from_absolute_path_checked(path).map(Some)
+    }
+}
+
 #[cfg(unix)]
 fn protected_socket_path(rendezvous_path: &Path) -> IoResult<std::path::PathBuf> {
     use sha2::Digest;
@@ -358,6 +449,10 @@ fn protected_socket_path(rendezvous_path: &Path) -> IoResult<std::path::PathBuf>
 
 pub struct AppServerStartupLock {
     _file: std::fs::File,
+    #[cfg(unix)]
+    removable_path: Option<AbsolutePathBuf>,
+    #[cfg(unix)]
+    remove_on_drop: bool,
 }
 
 pub async fn acquire_app_server_startup_lock(
@@ -374,10 +469,108 @@ pub async fn acquire_app_server_startup_lock(
             .write(true)
             .open(startup_lock_path.as_path())?;
         file.lock()?;
-        Ok(AppServerStartupLock { _file: file })
+        Ok(AppServerStartupLock {
+            _file: file,
+            #[cfg(unix)]
+            removable_path: None,
+            #[cfg(unix)]
+            remove_on_drop: false,
+        })
     })
     .await
     .map_err(|err| std::io::Error::other(format!("startup lock task failed: {err}")))?
+}
+
+#[cfg(unix)]
+pub(super) async fn acquire_removable_app_server_startup_lock(
+    startup_lock_path: AbsolutePathBuf,
+) -> IoResult<AppServerStartupLock> {
+    let parent = startup_lock_path.as_path().parent().ok_or_else(|| {
+        std::io::Error::new(ErrorKind::InvalidInput, "startup lock must have a parent")
+    })?;
+    codex_uds::prepare_private_socket_directory(parent).await?;
+    loop {
+        let startup_lock_path = startup_lock_path.clone();
+        let attempt = tokio::task::spawn_blocking(move || {
+            try_acquire_removable_app_server_startup_lock(startup_lock_path)
+        })
+        .await
+        .map_err(|err| std::io::Error::other(format!("startup lock task failed: {err}")))?;
+        match attempt {
+            Ok(lock) => return Ok(lock),
+            Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl AppServerStartupLock {
+    fn remove_file(&self) -> IoResult<()> {
+        let Some(path) = self.removable_path.as_ref() else {
+            return Ok(());
+        };
+        match self._file.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => return Ok(()),
+            Err(std::fs::TryLockError::Error(err)) => return Err(err),
+        }
+        startup_lock_file_matches_path(&self._file, path.as_path())?
+            .then(|| std::fs::remove_file(path.as_path()))
+            .transpose()
+            .map(|_| ())
+    }
+}
+
+#[cfg(unix)]
+pub(super) fn try_acquire_removable_app_server_startup_lock(
+    startup_lock_path: AbsolutePathBuf,
+) -> IoResult<AppServerStartupLock> {
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(startup_lock_path.as_path())?;
+    file.try_lock()?;
+    if !startup_lock_file_matches_path(&file, startup_lock_path.as_path())? {
+        return Err(ErrorKind::WouldBlock.into());
+    }
+    Ok(AppServerStartupLock {
+        _file: file,
+        removable_path: Some(startup_lock_path),
+        remove_on_drop: false,
+    })
+}
+
+#[cfg(unix)]
+impl Drop for AppServerStartupLock {
+    fn drop(&mut self) {
+        if self.remove_on_drop
+            && let Err(err) = self.remove_file()
+        {
+            warn!(
+                lock_path = ?self.removable_path,
+                %err,
+                "failed to remove app-server startup lock file"
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+fn startup_lock_file_matches_path(file: &std::fs::File, path: &Path) -> IoResult<bool> {
+    use std::os::unix::fs::MetadataExt;
+
+    let locked_metadata = file.metadata()?;
+    match std::fs::metadata(path) {
+        Ok(path_metadata) => Ok(locked_metadata.dev() == path_metadata.dev()
+            && locked_metadata.ino() == path_metadata.ino()),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err),
+    }
 }
 
 #[cfg(unix)]
@@ -396,16 +589,19 @@ async fn set_control_socket_permissions(_socket_path: &Path) -> IoResult<()> {
     Ok(())
 }
 
-struct ControlSocketFileGuard {
+/// Owns the socket files and startup lock until the listener is shut down.
+pub struct DaemonSocketFileGuard {
     socket_path: AbsolutePathBuf,
     #[cfg(unix)]
     rendezvous_path: AbsolutePathBuf,
+    #[cfg(unix)]
+    _startup_lock: AppServerStartupLock,
     // Keep the directory pinned until after the socket file is removed in Drop.
     #[cfg(windows)]
     _directory_guard: std::os::windows::io::OwnedHandle,
 }
 
-impl Drop for ControlSocketFileGuard {
+impl Drop for DaemonSocketFileGuard {
     fn drop(&mut self) {
         #[cfg(unix)]
         if std::fs::read_link(self.rendezvous_path.as_path())
@@ -427,52 +623,66 @@ impl Drop for ControlSocketFileGuard {
     }
 }
 
+/// Retains only an accept-time executable identity matching this server.
+fn unix_peer_provenance(
+    running_process_identity: Option<PeerExecutableIdentity>,
+    peer_identity: IoResult<Option<PeerExecutableIdentity>>,
+) -> ConnectionProvenance {
+    let Some(running_process_identity) = running_process_identity else {
+        return ConnectionProvenance::Unproven;
+    };
+    let peer_identity = match peer_identity {
+        Ok(identity) => identity,
+        Err(err) => {
+            tracing::debug!(error_kind = ?err.kind(), "Unix peer executable identity unavailable");
+            None
+        }
+    };
+    peer_identity
+        .filter(|identity| identities_match(running_process_identity, *identity))
+        .map(ConnectionProvenance::UnixPeerExecutable)
+        .unwrap_or(ConnectionProvenance::Unproven)
+}
+
 #[cfg(test)]
-mod tests {
-    use super::ConnectionProvenance;
-    use super::PeerExecutableIdentity;
-    use super::unix_peer_provenance;
-    use std::io;
-
+mod accepted_provenance_tests {
+    use super::*;
+    fn identity(inode: u64) -> PeerExecutableIdentity {
+        PeerExecutableIdentity::FileIdentity { device: 1, inode }
+    }
     #[test]
-    fn failed_or_missing_peer_identity_fails_closed() {
-        let running = PeerExecutableIdentity::current_process().expect("current executable");
+    fn missing_server_identity_never_mints_peer_proof() {
         assert_eq!(
-            unix_peer_provenance(Some(running), Ok(None)),
+            unix_peer_provenance(None, Ok(Some(identity(1)))),
+            ConnectionProvenance::Unproven
+        );
+    }
+    #[test]
+    fn missing_or_failed_peer_identity_remains_unproven() {
+        assert_eq!(
+            unix_peer_provenance(Some(identity(1)), Ok(None)),
             ConnectionProvenance::Unproven
         );
         assert_eq!(
             unix_peer_provenance(
-                Some(running),
-                Err(io::Error::other("peer identity unavailable")),
+                Some(identity(1)),
+                Err(std::io::Error::other("identity unavailable"))
             ),
             ConnectionProvenance::Unproven
         );
     }
-
     #[test]
-    fn established_peer_identity_is_retained_without_a_pid() {
-        let identity = PeerExecutableIdentity::current_process().expect("current executable");
+    fn a_different_image_does_not_get_same_image_provenance() {
         assert_eq!(
-            unix_peer_provenance(Some(identity), Ok(Some(identity))),
-            ConnectionProvenance::UnixPeerExecutable(identity)
+            unix_peer_provenance(Some(identity(1)), Ok(Some(identity(2)))),
+            ConnectionProvenance::Unproven
         );
     }
-
-    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
-    fn mismatched_peer_executable_fails_closed() {
-        let mismatch = ["/bin/sh", "/bin/ls"]
-            .into_iter()
-            .find_map(|path| std::fs::metadata(path).ok())
-            .and_then(|metadata| PeerExecutableIdentity::from_metadata(metadata).ok())
-            .expect("mismatched executable identity");
+    fn exact_accept_time_identity_is_carried_without_a_pid_or_path() {
         assert_eq!(
-            unix_peer_provenance(
-                Some(PeerExecutableIdentity::current_process().expect("current executable")),
-                Ok(Some(mismatch)),
-            ),
-            ConnectionProvenance::Unproven
+            unix_peer_provenance(Some(identity(1)), Ok(Some(identity(1)))),
+            ConnectionProvenance::UnixPeerExecutable(identity(1))
         );
     }
 }

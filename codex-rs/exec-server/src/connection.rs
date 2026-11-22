@@ -78,12 +78,16 @@ impl JsonRpcConnectionEvent {
                 "ignoring invalid inbound exec-server trace carrier"
             );
         }
+        // Select the parent before the managed layer eagerly fixes the span.
+        // Record phase offsets from receipt because detached work can keep the span open.
         let request_span = codex_otel::span_with_parent_context(parent, || {
             tracing::info_span!(
                 "codex.exec_server.request",
                 otel.kind = "server",
                 otel.name = "unknown",
                 method = request.method.as_str(),
+                rpc.dispatch_offset_ns = tracing::field::Empty,
+                rpc.response_enqueue_offset_ns = tracing::field::Empty,
                 result = tracing::field::Empty,
             )
         });
@@ -253,7 +257,7 @@ fn kill_direct_child(child_process: &mut Child, action: &str) {
 #[cfg(windows)]
 fn kill_windows_process_tree(pid: u32) -> bool {
     let pid = pid.to_string();
-    match std::process::Command::new("taskkill")
+    match codex_utils_process::background_command("taskkill")
         .args(["/PID", pid.as_str(), "/T", "/F"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -479,6 +483,22 @@ impl JsonRpcConnection {
             connection_label,
             /*ping_interval*/ None,
             Some(MAX_CLIENT_INBOUND_REQUEST_LEN),
+        )
+    }
+
+    /// Direct mode dials the WebSocket but serves executor requests from the
+    /// harness. Do not apply the harness client's inbound request limit here;
+    /// the WebSocket transport still enforces its message and frame limits.
+    pub(crate) fn from_direct_websocket<T, E>(stream: T, connection_label: String) -> Self
+    where
+        T: Sink<Message, Error = E> + Stream<Item = Result<Message, E>> + Unpin + Send + 'static,
+        E: std::fmt::Display + Send + 'static,
+    {
+        Self::from_websocket_stream(
+            stream,
+            connection_label,
+            /*ping_interval*/ None,
+            /*max_inbound_request_len*/ None,
         )
     }
 

@@ -1,3 +1,6 @@
+mod private_discovery;
+pub use private_discovery::AppDiscoveryRetirement;
+pub use private_discovery::AppDiscoveryTerminationReport;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::LazyLock;
@@ -22,7 +25,7 @@ use tracing::warn;
 use crate::config::Config;
 use crate::mcp::McpManager;
 use crate::plugins::list_tool_suggest_discoverable_plugins;
-use crate::plugins::plugins_manager_for_config;
+use crate::plugins::plugins_manager_for_config_with_runtime;
 use crate::session::INITIAL_SUBMIT_ID;
 use codex_config::types::ApprovalsReviewer;
 use codex_config::types::ToolSuggestDiscoverableType;
@@ -89,16 +92,13 @@ pub(crate) async fn list_tool_suggest_discoverable_tools_with_auth(
     loaded_plugin_app_connector_ids: &[String],
 ) -> anyhow::Result<Vec<DiscoverableTool>> {
     let connector_ids = tool_suggest_connector_ids(config, loaded_plugin_app_connector_ids);
-    let directory_connectors = codex_connectors::merge::merge_plugin_connectors(
-        cached_directory_connectors_for_tool_suggest_with_auth(config, auth).await,
-        connector_ids.iter().cloned(),
-    );
     let discoverable_connectors =
         codex_connectors::filter::filter_tool_suggest_discoverable_connectors(
-            directory_connectors,
+            cached_directory_connectors_for_tool_suggest_with_auth(config, auth),
             accessible_connectors,
-            &connector_ids,
+            connector_ids,
         )
+        .await
         .into_iter()
         .map(DiscoverableTool::from);
     let discoverable_plugins = list_tool_suggest_discoverable_plugins(
@@ -115,21 +115,17 @@ pub(crate) async fn list_tool_suggest_discoverable_tools_with_auth(
         .collect())
 }
 
-pub async fn list_cached_accessible_connectors_from_mcp_tools(
+pub fn list_cached_accessible_connectors_from_mcp_tools(
     config: &Config,
+    auth: Option<&CodexAuth>,
 ) -> Option<Vec<AppInfo>> {
-    let auth_manager =
-        AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ false)
-            .await
-            .ok()?;
-    let auth = auth_manager.auth().await;
     if !config
         .features
-        .apps_enabled_for_auth(auth.as_ref().is_some_and(CodexAuth::uses_codex_backend))
+        .apps_enabled_for_auth(auth.is_some_and(CodexAuth::uses_codex_backend))
     {
         return Some(Vec::new());
     }
-    let cache_key = accessible_connectors_cache_key(config, auth.as_ref());
+    let cache_key = accessible_connectors_cache_key(config, auth);
     read_cached_accessible_connectors(&cache_key)
 }
 
@@ -190,10 +186,8 @@ pub async fn list_accessible_connectors_from_mcp_tools_with_environment_manager(
 ) -> anyhow::Result<AccessibleConnectorsStatus> {
     let auth_manager =
         AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ false).await?;
-    let plugins_manager = Arc::new(plugins_manager_for_config(
-        config,
-        Arc::clone(&auth_manager),
-    ));
+    let plugins_manager =
+        Arc::new(plugins_manager_for_config_with_runtime(config, Arc::clone(&auth_manager)).await?);
     let mcp_manager = Arc::new(McpManager::new(plugins_manager));
     list_accessible_connectors_from_mcp_tools_with_mcp_manager(
         config,
@@ -228,7 +222,7 @@ pub async fn list_accessible_connectors_in_retirement(
     force_refetch: bool,
     environment_manager: Arc<EnvironmentManager>,
     mcp_manager: Arc<McpManager>,
-    retirement: codex_mcp::McpRuntimeRetirement,
+    retirement: AppDiscoveryRetirement,
 ) -> anyhow::Result<AccessibleConnectorsStatus> {
     list_accessible_connectors_with_authority(
         config,
@@ -248,11 +242,14 @@ pub async fn list_accessible_connectors_with_authority(
     force_refetch: bool,
     environment_manager: Arc<EnvironmentManager>,
     mcp_manager: Arc<McpManager>,
-    retirement: Option<codex_mcp::McpRuntimeRetirement>,
+    retirement: Option<AppDiscoveryRetirement>,
     access: codex_mcp::McpAttemptAccess<'_>,
 ) -> anyhow::Result<AccessibleConnectorsStatus> {
-    let auth_manager =
-        AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ false).await?;
+    let _discovery_scope = retirement
+        .as_ref()
+        .map(AppDiscoveryRetirement::scope)
+        .transpose()?;
+    let auth_manager = mcp_manager.auth_manager();
     let auth = auth_manager.auth().await;
     if !config
         .features
@@ -301,6 +298,8 @@ pub async fn list_accessible_connectors_with_authority(
             codex_mcp::McpAttemptAccess::Unscoped => None,
             codex_mcp::McpAttemptAccess::Admitted(work) => Some(work.derive_attempt()?),
         },
+        network_policy_metadata: None,
+        runtime_auth: mcp_manager.runtime_auth_for_config(config),
         startup_policy: McpStartupPolicy::Eager,
         config: Arc::clone(&mcp_config),
         plugins_available: false,
@@ -320,11 +319,13 @@ pub async fn list_accessible_connectors_with_authority(
         auth_manager: codex_apps_auth_manager,
         elicitation_reviewer: None,
         elicitation_lifecycle: None,
-        canonical_thread_id: None,
-        control_endpoint: None,
     };
     let mcp_runtime = match retirement {
-        Some(retirement) => McpRuntime::new_in_retirement(input, retirement).await,
+        Some(ref retirement) => {
+            let runtime = retirement.begin(input.config.prefix_mcp_tool_names)?;
+            runtime.replace(input).await;
+            runtime
+        }
         None => McpRuntime::new(input).await,
     };
 
@@ -402,6 +403,14 @@ pub async fn list_accessible_connectors_with_authority(
     let accessible_connectors =
         with_app_plugin_sources(accessible_connectors, &tool_plugin_context);
     mcp_runtime.shutdown().await;
+    if let Some(retirement) = retirement {
+        let report = retirement
+            .shutdown_until(
+                tokio::time::Instant::now() + codex_rmcp_client::DEFAULT_RETIREMENT_TIMEOUT,
+            )
+            .await;
+        anyhow::ensure!(report.is_complete(), "app discovery retirement incomplete");
+    }
     Ok(AccessibleConnectorsStatus {
         connectors: accessible_connectors,
         codex_apps_ready,
@@ -488,9 +497,9 @@ fn tool_suggest_connector_ids(
 async fn cached_directory_connectors_for_tool_suggest_with_auth(
     config: &Config,
     auth: Option<&CodexAuth>,
-) -> Vec<AppInfo> {
+) -> Arc<[AppInfo]> {
     if !config.features.enabled(Feature::Apps) {
-        return Vec::new();
+        return Arc::default();
     }
 
     let loaded_auth;
@@ -500,18 +509,18 @@ async fn cached_directory_connectors_for_tool_suggest_with_auth(
         let Ok(auth_manager) =
             AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ false).await
         else {
-            return Vec::new();
+            return Arc::default();
         };
         loaded_auth = auth_manager.auth().await;
         loaded_auth.as_ref()
     };
     let Some(auth) = auth.filter(|auth| auth.uses_codex_backend()) else {
-        return Vec::new();
+        return Arc::default();
     };
 
     let account_id = match auth.get_account_id() {
         Some(account_id) if !account_id.is_empty() => account_id,
-        _ => return Vec::new(),
+        _ => return Arc::default(),
     };
     let is_workspace_account = auth.is_workspace_account();
     let cache_context = ConnectorDirectoryCacheContext::new(

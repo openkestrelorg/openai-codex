@@ -2,6 +2,7 @@
 //! Publication tasks retain their lease on a live runtime even if their caller
 //! disappears. This is not a process-exit or cross-process write guarantee.
 
+use crate::refresh_task::CloudRefreshTask;
 use crate::service::CLOUD_CONFIG_BUNDLE_TIMEOUT;
 use codex_config::CloudConfigBundle;
 use codex_config::CloudConfigBundleLoadError;
@@ -16,34 +17,34 @@ use std::sync::OnceLock;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use tokio::sync::Notify;
-use tokio::task::JoinHandle;
 
 #[derive(Default)]
 pub(crate) struct HomeOwners {
-    pub(crate) tasks: Vec<JoinHandle<()>>,
+    pub(crate) tasks: Vec<CloudRefreshTask>,
     pub(crate) retiring: bool,
     pub(crate) failed_owner: bool,
     active_getters: usize,
 }
 
 impl HomeOwners {
-    pub(crate) fn reap_finished(&mut self) {
+    fn reap_finished(&mut self) -> Vec<CloudRefreshTask> {
         let mut context = std::task::Context::from_waker(std::task::Waker::noop());
-        self.tasks.retain_mut(|task| {
+        let mut retired = Vec::new();
+        for mut task in std::mem::take(&mut self.tasks) {
             if !task.is_finished() {
-                return true;
+                self.tasks.push(task);
+                continue;
             }
-            match std::pin::Pin::new(task).poll(&mut context) {
-                std::task::Poll::Ready(Ok(())) => false,
+            match std::pin::Pin::new(&mut task).poll(&mut context) {
+                std::task::Poll::Ready(Ok(())) => retired.push(task),
                 std::task::Poll::Ready(Err(error)) => {
-                    // Lifetime drop, global replacement and reset all cancel
-                    // refreshers. A panic, unlike cancellation, fails reset.
                     self.failed_owner |= !error.is_cancelled();
-                    false
+                    retired.push(task);
                 }
-                std::task::Poll::Pending => true,
+                std::task::Poll::Pending => self.tasks.push(task),
             }
-        });
+        }
+        retired
     }
 }
 
@@ -70,6 +71,20 @@ impl Drop for GetterGuard<'_> {
 }
 
 impl HomeLifecycle {
+    /// Poll joins under census custody; destroy opaque panic payloads only
+    /// after releasing that lock. An observation alias cannot retain them.
+    pub(crate) fn reap_finished(&self) -> Result<(), CloudConfigBundleLoadError> {
+        let retired = self
+            .owners
+            .lock()
+            .map_err(|_| lifecycle_error("cloud owner lock unavailable"))?
+            .reap_finished();
+        for task in retired {
+            drop(task.take_failure_payload());
+        }
+        Ok(())
+    }
+
     /// Admission happens when this future is first polled, never when a caller
     /// merely constructs a getter. The service future remains caller-polled.
     pub(crate) async fn load(
@@ -77,6 +92,32 @@ impl HomeLifecycle {
         expected_generation: u64,
         work: impl Future<Output = Result<Option<CloudConfigBundle>, CloudConfigBundleLoadError>>,
     ) -> Result<Option<CloudConfigBundle>, CloudConfigBundleLoadError> {
+        self.load_inner(expected_generation, work).await
+    }
+
+    pub(crate) async fn load_snapshot(
+        &self,
+        expected_generation: u64,
+        work: impl Future<Output = codex_config::CloudConfigBundleSnapshot>,
+    ) -> codex_config::CloudConfigBundleSnapshot {
+        match self
+            .load_inner(expected_generation, async { Ok(work.await) })
+            .await
+        {
+            Ok(snapshot) => snapshot,
+            Err(error) => codex_config::CloudConfigBundleSnapshot {
+                config_server: None,
+                bundle: Err(error),
+                binding: None,
+            },
+        }
+    }
+
+    pub(crate) async fn load_inner<T>(
+        &self,
+        expected_generation: u64,
+        work: impl Future<Output = Result<T, CloudConfigBundleLoadError>>,
+    ) -> Result<T, CloudConfigBundleLoadError> {
         let retired = self.retired.notified();
         tokio::pin!(retired);
         retired.as_mut().enable();
@@ -114,30 +155,32 @@ impl HomeLifecycle {
     /// Caller holds `reset` through this drain and fresh-loader installation.
     /// Failure leaves admission closed; a later managed retry can finish it.
     pub(crate) async fn retire_owners(&self) -> Result<(), CloudConfigBundleLoadError> {
-        {
+        let advanced = {
             let mut owners = self
                 .owners
                 .lock()
                 .map_err(|_| lifecycle_error("cloud owner lock unavailable"))?;
             owners.retiring = true;
-            self.generation
+            let advanced = self
+                .generation
                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
                     value.checked_add(1)
                 })
-                .map_err(|_| lifecycle_error("cloud generation exhausted"))?;
+                .is_ok();
             self.retired.notify_waiters();
             for task in &owners.tasks {
                 task.abort();
             }
-        }
+            advanced
+        };
         tokio::time::timeout(CLOUD_CONFIG_BUNDLE_TIMEOUT, async {
             loop {
+                self.reap_finished()?;
                 let done = {
-                    let mut owners = self
+                    let owners = self
                         .owners
                         .lock()
                         .map_err(|_| lifecycle_error("cloud owner lock unavailable"))?;
-                    owners.reap_finished();
                     owners.tasks.is_empty() && owners.active_getters == 0
                 };
                 if done {
@@ -160,6 +203,9 @@ impl HomeLifecycle {
             return Err(lifecycle_error(
                 "cloud prior owner failed during retirement",
             ));
+        }
+        if !advanced {
+            return Err(lifecycle_error("cloud generation exhausted"));
         }
         Ok(())
     }

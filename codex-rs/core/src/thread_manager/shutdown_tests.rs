@@ -43,6 +43,10 @@ fn runtime_retirement_requires_all_three_positive_receipts() {
                 ThreadCleanupOutcome::TaskJoinFailed,
                 ThreadCleanupOutcome::ConversationShutdownFailed,
                 ThreadCleanupOutcome::CodeModeShutdownFailed,
+                // Unproven or timed-out sandbox cleanup never makes the
+                // manager's retirement report complete.
+                ThreadCleanupOutcome::SandboxCleanupUnproven { timed_out: false },
+                ThreadCleanupOutcome::SandboxCleanupUnproven { timed_out: true },
             ] {
                 let outcome = RuntimeOutcome::Retirement(ThreadRetirementReport {
                     ordinary,
@@ -185,17 +189,37 @@ async fn manager_shutdown_expired_observer_never_restarts_original_work() {
     assert!(started.thread.is_running());
     assert!(started.thread.observed_terminal_cleanup().is_none());
     assert_eq!(manager.constructions.published().len(), 1);
-    // Explicit fixture teardown is not a retry of the expired manager ticket.
-    let cleanup = started
+    // The permanent manager shutdown edge bound this runtime to the original
+    // (already expired) deadline. A later retirement is not a retry: it can
+    // only tighten, never grant a fresh budget, so the original deadline
+    // stays the effective one.
+    let expired = ThreadRetirementReport {
+        ordinary: ThreadShutdownOutcome::TimedOut,
+        session_loop: ThreadLoopOutcome::TimedOut,
+        cleanup: ThreadCleanupOutcome::TimedOut,
+    };
+    let later = started
         .thread
         .begin_retirement(Instant::now() + Duration::from_secs(20))
         .unwrap();
-    assert_eq!(
-        cleanup.wait().await.cleanup,
-        ThreadCleanupOutcome::Finished {
-            persistence_failed: false
-        }
-    );
+    assert_eq!(later.deadline(), deadline, "no fresh budget");
+    assert_eq!(later.wait().await, expired);
+    // Sticky: replaying it, or asking again with a looser deadline, keeps the
+    // original deadline and the same timed-out report.
+    assert_eq!(later.wait().await, expired);
+    let again = started
+        .thread
+        .begin_retirement(Instant::now() + Duration::from_secs(60))
+        .unwrap();
+    assert_eq!(again.deadline(), deadline, "no fresh budget");
+    assert_eq!(again.wait().await, expired);
+    // Nothing ran after expiry: no Shutdown was submitted (the loop still
+    // runs), the cleanup sequence never started (no receipt), and there is no
+    // physical terminal proof.
+    assert!(started.thread.is_running());
+    assert_eq!(started.thread.session.cleanup_owner().completed(), None);
+    assert!(started.thread.observed_terminal_cleanup().is_none());
+    assert_eq!(manager.constructions.published().len(), 1);
     assert_eq!(
         ticket.wait().await,
         Err(ThreadManagerRetirementError::TimedOut)
@@ -279,12 +303,18 @@ async fn manager_incomplete_report_keeps_failed_start_custody_after_future_retur
     assert!(state.upgrade().is_none());
 }
 
+/// Cancelling an admitted constructor before Session birth must still finish
+/// it and positively settle its actual early scope without inventing Session/MCP birth.
 #[tokio::test]
-async fn manager_shutdown_drives_admitted_constructor_after_its_observer_is_cancelled() {
-    struct HeldInstructions(Mutex<Option<tokio::sync::oneshot::Receiver<()>>>);
+async fn manager_shutdown_completes_cancelled_admitted_constructor_without_a_session() {
+    struct HeldInstructions {
+        held: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+        entered: Arc<tokio::sync::Notify>,
+    }
     impl codex_extension_api::UserInstructionsProvider for HeldInstructions {
         fn load_user_instructions(&self) -> codex_extension_api::LoadInstructionsFuture<'_> {
-            let held = self.0.lock().unwrap().take().unwrap();
+            let held = self.held.lock().unwrap().take().unwrap();
+            self.entered.notify_one();
             Box::pin(async move {
                 held.await.unwrap();
                 codex_extension_api::LoadedUserInstructions::default()
@@ -293,25 +323,59 @@ async fn manager_shutdown_drives_admitted_constructor_after_its_observer_is_canc
     }
     let (_home, mut manager, config) = manager().await;
     let (release, held) = tokio::sync::oneshot::channel();
+    let entered = Arc::new(tokio::sync::Notify::new());
     Arc::get_mut(&mut manager.state)
         .unwrap()
-        .user_instructions_provider = Arc::new(HeldInstructions(Mutex::new(Some(held))));
+        .user_instructions_provider = Arc::new(HeldInstructions {
+        held: Mutex::new(Some(held)),
+        entered: Arc::clone(&entered),
+    });
     let mut constructor = Box::pin(manager.start_thread(StartThreadOptions::new(config, None)));
-    assert!(futures::poll!(constructor.as_mut()).is_pending());
+    tokio::time::timeout(Duration::from_secs(20), async {
+        tokio::select! {
+            _ = entered.notified() => {},
+            _ = constructor.as_mut() => panic!("constructor escaped held instructions"),
+        }
+    })
+    .await
+    .expect("real constructor reaches held instruction refresh");
+    let startup = manager.constructions.first_startup_for_test();
+    assert_eq!(
+        startup.constructor_stage_for_test(),
+        Some((false, false, false)),
+        "early resource scope exists, but Session/MCP runtime have not been born"
+    );
     let deadline = Instant::now() + Duration::from_secs(20);
     let ticket = manager.begin_shutdown(deadline).unwrap();
     let mut observer = Box::pin(ticket.wait());
     assert!(futures::poll!(observer.as_mut()).is_pending());
     // Both caller cancellations leave the manager's admitted construction and
-    // original aggregate intact. Release must still reach real session cleanup.
+    // original aggregate intact. Semantic correction (startup decision #1):
+    // the constructor's departing observer now requests cancellation even
+    // though admission is closed, so the drain delivers the start to its
+    // cancellation arm before the released instructions are consumed and no
+    // Session is born. The actual early scope still requires its positive receipt.
     drop(observer);
     drop(constructor);
     release.send(()).unwrap();
     let report = ticket.wait().await.unwrap();
     assert!(report.is_complete(), "{report:?}");
+    assert!(report.constructors.finished);
     assert_eq!(report.constructors.unpublished, 0);
-    assert_eq!(report.constructors.sessions.len(), 1);
-    assert!(report.constructors.sessions[0].is_complete());
+    assert_eq!(
+        report.constructors.sessions,
+        vec![crate::session::startup_custody::StartupCleanup::BeforeLoop(
+            crate::session::retirement::CleanupExecution::Finished {
+                persistence_failed: false
+            }
+        )],
+        "cancelled before Session birth: the actual early scope was positively cleaned"
+    );
+    assert_eq!(
+        startup.constructor_stage_for_test(),
+        Some((false, false, true))
+    );
+    assert!(startup.is_empty());
     assert!(
         report.runtimes.is_empty(),
         "post-close publication is forbidden"

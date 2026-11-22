@@ -166,32 +166,35 @@ where
         let mut old_logger = None;
         let mut old_trace = None;
         let mut result = Err(OtelShutdownError::StateUnavailable);
-        self.logger
-            .modify(|logger| {
-                result = (|| {
-                    let mut metrics = crate::metrics::publication_guard()
-                        .map_err(|_| OtelShutdownError::StateUnavailable)?;
-                    let mut trace = self.trace.publication_guard()?;
-                    let mut propagation = crate::trace_context::tracestate_publication_guard()
-                        .map_err(|_| OtelShutdownError::StateUnavailable)?;
-                    let mut disabled_metrics = None;
-                    let next_metrics = prepared
-                        .provider
-                        .as_mut()
-                        .map_or(&mut disabled_metrics, |provider| &mut provider.metrics);
-                    metrics
-                        .publish_with(next_metrics, prepared.statsig.clone(), || {
-                            old_trace = Some(trace.replace(next_trace.take()));
-                            *propagation = std::mem::take(&mut prepared.tracestate);
-                            old_logger = std::mem::replace(logger, next_logger.take());
-                        })
-                        .map_err(|_| OtelShutdownError::StateUnavailable)?;
-                    // All guards leave scope before reload rebuilds interest caches.
-                    Ok(())
-                })();
-            })
-            .map_err(|_| OtelShutdownError::StateUnavailable)?;
-        result?;
+        let modified = self.logger.modify(|logger| {
+            result = (|| {
+                let mut metrics = crate::metrics::publication_guard()
+                    .map_err(|_| OtelShutdownError::StateUnavailable)?;
+                let mut trace = self.trace.publication_guard()?;
+                let mut propagation = crate::trace_context::tracestate_publication_guard()
+                    .map_err(|_| OtelShutdownError::StateUnavailable)?;
+                let mut disabled_metrics = None;
+                let next_metrics = prepared
+                    .provider
+                    .as_mut()
+                    .map_or(&mut disabled_metrics, |provider| &mut provider.metrics);
+                let buffered = metrics
+                    .publish_with(next_metrics, prepared.statsig.clone(), || {
+                        old_trace = Some(trace.replace(next_trace.take()));
+                        *propagation = std::mem::take(&mut prepared.tracestate);
+                        old_logger = std::mem::replace(logger, next_logger.take());
+                    })
+                    .map_err(|_| OtelShutdownError::StateUnavailable)?;
+                // All guards leave scope before reload rebuilds interest caches.
+                Ok(buffered)
+            })();
+        });
+        // Every publication guard and the logger write fence are released.
+        // Bind buffered operation metrics to the committed generation now; an
+        // older publication's late receipt can never override this one.
+        let committed = result.map(crate::metrics::buffered::BufferedReceipt::apply);
+        modified.map_err(|_| OtelShutdownError::StateUnavailable)?;
+        committed?;
         // SDK-containing values are released only outside every route guard.
         drop(old_logger);
         let trace = old_trace

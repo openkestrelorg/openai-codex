@@ -14,6 +14,7 @@ use codex_core::config::Config;
 use codex_core::content_items_to_text;
 use codex_core::detached_memory_responses_metadata;
 use codex_core::resolve_installation_id;
+use codex_extension_api::HostOperationWork;
 use codex_features::Feature;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
@@ -21,8 +22,8 @@ use codex_login::auth::AgentIdentityAuthPolicy;
 use codex_login::auth_env_telemetry::collect_auth_env_telemetry;
 use codex_login::default_client::originator;
 use codex_model_provider::ModelProvider;
+use codex_model_provider::ProviderAuthContext;
 use codex_model_provider::SharedModelProvider;
-use codex_model_provider::create_model_provider;
 use codex_otel::SessionTelemetry;
 use codex_otel::TelemetryAuthMode;
 use codex_protocol::MemoryVersion;
@@ -78,15 +79,13 @@ impl StageOneRequestContext {
 }
 
 pub(crate) struct MemoryStartupContext {
-    // Finite pipeline plus its detached consolidation monitor, not an idle
-    // service or a turn entry. The triggering turn may already have ended.
-    account_work: Option<Arc<dyn codex_core::HostOperationWork>>,
     version: MemoryVersion,
     thread_id: ThreadId,
     thread: Arc<CodexThread>,
     thread_manager: Arc<ThreadManager>,
     auth_manager: Arc<AuthManager>,
     provider: SharedModelProvider,
+    account_work: Option<Arc<dyn HostOperationWork>>,
     session_telemetry: SessionTelemetry,
 }
 
@@ -122,7 +121,7 @@ fn build_session_telemetry(
         &config.model_provider,
         auth_manager.codex_api_key_env_enabled(),
     );
-    SessionTelemetry::new(
+    let mut session_telemetry = SessionTelemetry::new(
         thread_id,
         model,
         model,
@@ -134,33 +133,39 @@ fn build_session_telemetry(
         user_agent(),
         source,
     )
-    .with_auth_env(auth_env_telemetry.to_otel_metadata())
+    .with_auth_env(auth_env_telemetry.to_otel_metadata());
+    if !config.otel.log_sse_deltas {
+        session_telemetry = session_telemetry.without_sse_delta_logs();
+    }
+    session_telemetry
 }
 
 impl MemoryStartupContext {
+    pub(crate) fn item_id_generator(&self) -> &codex_protocol::ItemIdGenerator {
+        self.thread.item_id_generator()
+    }
+
     pub(crate) fn new(
         thread_manager: Arc<ThreadManager>,
-        auth_manager: Arc<AuthManager>,
+        auth: Arc<ProviderAuthContext>,
         thread_id: ThreadId,
         thread: Arc<CodexThread>,
         config: &Config,
         source: SessionSource,
-        account_work: Option<Arc<dyn codex_core::HostOperationWork>>,
+        account_work: Option<Arc<dyn HostOperationWork>>,
     ) -> Self {
-        let provider = create_model_provider(
-            config.model_provider.clone(),
-            Some(Arc::clone(&auth_manager)),
-        );
-        Self::new_with_provider(
+        let provider = auth.model_provider(config.model_provider.clone());
+        let mut context = Self::new_with_provider(
             thread_manager,
-            auth_manager,
+            Arc::clone(&auth.credentials),
             thread_id,
             thread,
             config,
             source,
             provider,
-            account_work,
-        )
+        );
+        context.account_work = account_work;
+        context
     }
 
     #[cfg(test)]
@@ -181,11 +186,9 @@ impl MemoryStartupContext {
             config,
             source,
             provider,
-            /*account_work*/ None,
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn new_with_provider(
         thread_manager: Arc<ThreadManager>,
         auth_manager: Arc<AuthManager>,
@@ -194,7 +197,6 @@ impl MemoryStartupContext {
         config: &Config,
         source: SessionSource,
         provider: SharedModelProvider,
-        account_work: Option<Arc<dyn codex_core::HostOperationWork>>,
     ) -> Self {
         let model = config.model.as_deref().unwrap_or("unknown");
         let session_telemetry = build_session_telemetry(
@@ -207,13 +209,13 @@ impl MemoryStartupContext {
         );
 
         Self {
-            account_work,
             version: config.memories.version,
             thread_id,
             thread,
             thread_manager,
             auth_manager,
             provider,
+            account_work: None,
             session_telemetry,
         }
     }
@@ -305,7 +307,7 @@ impl MemoryStartupContext {
 
         StageOneRequestContext {
             version: self.version,
-            model_info,
+            model_info: Arc::unwrap_or_clone(model_info.model),
             session_telemetry: build_session_telemetry(
                 &self.auth_manager,
                 self.thread_id,
@@ -332,10 +334,10 @@ impl MemoryStartupContext {
         let session_id = SessionId::from(self.thread_id);
         let session_id_string = session_id.to_string();
         let model_client = ModelClient::new(
-            Some(Arc::clone(&self.auth_manager)),
+            Arc::clone(&self.provider),
             AgentIdentityAuthPolicy::JwtOnly,
             self.thread_id,
-            config.model_provider.clone(),
+            Arc::clone(self.item_id_generator()),
             session_source.clone(),
             config_snapshot.originator,
             config.model_verbosity,
@@ -345,6 +347,7 @@ impl MemoryStartupContext {
             config.features.enabled(Feature::RuntimeMetrics),
             /*beta_features_header*/ None,
             /*concurrent_reasoning_summaries_enabled*/ false,
+            /*output_token_replay_enabled*/ false,
             /*attestation_provider*/ None,
             config.http_client_factory(),
             config.workspace_routing_context(),
@@ -408,6 +411,7 @@ impl MemoryStartupContext {
         &self,
         config: Config,
         prompt: Vec<UserInput>,
+        workspace_lock: Arc<crate::MemoryWorkspaceLock>,
     ) -> anyhow::Result<SpawnedConsolidationAgent> {
         let NewThread {
             thread_id, thread, ..
@@ -426,9 +430,18 @@ impl MemoryStartupContext {
                     InternalSessionSource::MemoryConsolidation,
                 )),
                 thread_source: Some(ThreadSource::MemoryConsolidation),
-                ..StartThreadOptions::new(config, None)
+                ..StartThreadOptions::new(config, /*control_endpoint*/ None)
             })
             .await?;
+
+        // Cancellation or a shutdown timeout must not release workspace ownership
+        // while the agent can still write. The phase-2 handler keeps another owner
+        // through the final baseline reset after this thread has terminated.
+        let running_thread = Arc::clone(&thread);
+        tokio::spawn(async move {
+            running_thread.wait_until_terminated().await;
+            drop(workspace_lock);
+        });
 
         let agent = SpawnedConsolidationAgent { thread_id, thread };
         let request = TurnInputRequest::user_input(prompt).on_start(TurnStartOptions {
@@ -468,28 +481,22 @@ impl MemoryStartupContext {
         agent: SpawnedConsolidationAgent,
     ) -> anyhow::Result<()> {
         let SpawnedConsolidationAgent { thread_id, thread } = agent;
-        let cleanup = thread.shutdown_and_wait_with_cleanup();
-        tokio::pin!(cleanup);
-        let (report, timed_out) = match tokio::time::timeout(Duration::from_secs(10), &mut cleanup)
-            .await
-        {
-            Ok(report) => (report, false),
-            Err(_) => {
-                tracing::warn!(
-                    "memory consolidation agent {thread_id} shutdown timed out; retaining account custody until cleanup observation completes"
-                );
-                // Keep the finite job's authority while driving the SAME
-                // retained cleanup. The timeout still means job failure.
-                (cleanup.await, true)
-            }
-        };
+        let shutdown = thread.shutdown_and_wait_with_cleanup();
+        tokio::pin!(shutdown);
+        let (report, timed_out) =
+            match tokio::time::timeout(Duration::from_secs(10), &mut shutdown).await {
+                Ok(report) => (report, false),
+                // Retain this operation and the exact cleanup observation after its
+                // budget expires; timeout is not proof that the writer stopped.
+                Err(_) => (shutdown.await, true),
+            };
         if report.cleanup
             == (codex_core::ThreadCleanupOutcome::Finished {
                 persistence_failed: false,
             })
         {
-            // The owner may remove a dead child after positive cleanup even
-            // when its loop panicked. Incomplete cleanup stays in the inventory.
+            // Positive cleanup permits removing the exact dead child even if its
+            // loop failed. The full report below still makes that job fail.
             self.thread_manager
                 .remove_thread_if_same(&thread_id, &thread)
                 .await;
@@ -500,7 +507,7 @@ impl MemoryStartupContext {
         );
         anyhow::ensure!(
             report.is_complete(),
-            "memory consolidation agent {thread_id} shutdown incomplete: {report:?}"
+            "memory consolidation agent {thread_id} retirement incomplete: {report:?}"
         );
         Ok(())
     }

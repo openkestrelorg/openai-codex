@@ -408,7 +408,7 @@ async fn ephemeral_system_thread_prewarm_skips_and_turn_observes_fresh_state(
         .and_then(|connection| connection.get(2))
         .context("system turn follow-up request")?
         .body_json();
-    let codex_core::TurnInputSubmission::Started { turn_id } = submission else {
+    let codex_core::TurnInputSubmission::Started { turn_id, .. } = submission else {
         panic!("background input should start a turn");
     };
     assert_root_turn(&turn, Some(&turn_id))?;
@@ -504,7 +504,7 @@ async fn concurrent_turns_keep_distinct_worktree_and_repository_metadata() -> Re
         .thread_manager
         .start_thread(StartThreadOptions {
             thread_source: Some(ThreadSource::User),
-            ..StartThreadOptions::new(worktree_config, None)
+            ..StartThreadOptions::new(worktree_config, /*control_endpoint*/ None)
         })
         .await?;
 
@@ -514,7 +514,7 @@ async fn concurrent_turns_keep_distinct_worktree_and_repository_metadata() -> Re
         .thread_manager
         .start_thread(StartThreadOptions {
             thread_source: Some(ThreadSource::User),
-            ..StartThreadOptions::new(other_config, None)
+            ..StartThreadOptions::new(other_config, /*control_endpoint*/ None)
         })
         .await?;
 

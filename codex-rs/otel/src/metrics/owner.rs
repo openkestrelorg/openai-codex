@@ -3,6 +3,8 @@ use std::sync::Arc;
 use std::sync::Condvar;
 use std::sync::Mutex;
 use std::sync::Weak;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum MetricsOwnerError {
@@ -37,6 +39,9 @@ struct OwnerState {
 /// must first close and drain the corresponding route generation.
 pub(super) struct MetricsOwner {
     state: Mutex<OwnerState>,
+    // Buffered-metrics publication generation; 0 while unpublished. Written
+    // once, lock-free, by the publication that creates this owner.
+    publication_generation: AtomicU64,
 }
 
 impl std::fmt::Debug for MetricsOwner {
@@ -64,7 +69,22 @@ impl MetricsOwner {
                     completed: Condvar::new(),
                 }),
             }),
+            publication_generation: AtomicU64::new(0),
         })
+    }
+
+    /// Record the publication generation this owner was installed under.
+    /// Infallible and lock-free so it may run under publication guards.
+    pub(super) fn bind_publication_generation(&self, generation: u64) {
+        self.publication_generation
+            .store(generation, Ordering::Release);
+    }
+
+    pub(super) fn publication_generation(&self) -> Option<u64> {
+        match self.publication_generation.load(Ordering::Acquire) {
+            0 => None,
+            generation => Some(generation),
+        }
     }
 
     /// Re-observe the sole SDK attempt. A returned failure or panic is sticky:

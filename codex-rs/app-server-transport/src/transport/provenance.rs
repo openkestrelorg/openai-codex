@@ -47,7 +47,7 @@ impl PeerExecutableIdentity {
     /// later socket. Reconnect callers must invoke it on each new connection.
     pub fn verify_same_image_peer(stream: &UnixStream) -> io::Result<()> {
         let running = Self::capture_running_process()?;
-        if Self::from_unix_stream(stream)? != Some(running) {
+        if !Self::from_unix_stream(stream)?.is_some_and(|peer| identities_match(running, peer)) {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "Unix peer code identity differs",
@@ -109,7 +109,6 @@ pub(crate) fn identities_match(
 mod platform {
     use super::PeerExecutableIdentity;
     use codex_uds::UnixStream;
-    use std::fs::Metadata;
     use std::io;
     use std::os::fd::AsRawFd;
 
@@ -447,10 +446,21 @@ mod platform {
 mod tests {
     use super::PeerExecutableIdentity;
 
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
     #[test]
     fn current_process_identity_is_available_on_supported_unix() {
-        #[cfg(unix)]
         assert!(PeerExecutableIdentity::current_process().is_ok());
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+    #[test]
+    fn unsupported_platform_cannot_claim_running_image_proof() {
+        assert_eq!(
+            PeerExecutableIdentity::capture_running_process()
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::Unsupported
+        );
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -464,5 +474,64 @@ mod tests {
             .and_then(|metadata| PeerExecutableIdentity::from_metadata(metadata).ok())
             .expect("shell executable identity");
         assert_ne!(current, other);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn exact_static_code_hash_rejects_same_designated_requirement_different_build() {
+        use super::identities_match;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Stdio;
+
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let daemon_build = temp_dir.path().join("daemon-build");
+        let peer_build = temp_dir.path().join("peer-build");
+        tokio::fs::copy("/usr/bin/true", &daemon_build)
+            .await
+            .expect("true fixture should copy");
+        tokio::fs::copy("/usr/bin/false", &peer_build)
+            .await
+            .expect("false fixture should copy");
+        for path in [&daemon_build, &peer_build] {
+            tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+                .await
+                .expect("fixture should be executable");
+            let mut command = tokio::process::Command::new("/usr/bin/codesign");
+            command
+            .args([
+                "--force",
+                "--sign",
+                "-",
+                "--identifier",
+                "com.openai.codex.kcf007.shared-designated-requirement",
+                "--requirements",
+                "=designated => identifier \"com.openai.codex.kcf007.shared-designated-requirement\"",
+            ])
+            .arg(path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+            let status = tokio::time::timeout(std::time::Duration::from_secs(10), command.status())
+                .await
+                .expect("bounded ad-hoc fixture signing")
+                .expect("codesign should run");
+            assert!(status.success(), "codesign should succeed: {status}");
+        }
+
+        assert!(
+            PeerExecutableIdentity::shares_designated_requirement_with(&daemon_build, &peer_build)
+                .expect("fixtures should have inspectable designated requirements"),
+            "the superseded designated-requirement comparator would authorize this pair"
+        );
+        let daemon_identity = PeerExecutableIdentity::static_code_identity_from_path(&daemon_build)
+            .expect("daemon fixture should have static-code identity");
+        let peer_identity = PeerExecutableIdentity::static_code_identity_from_path(&peer_build)
+            .expect("peer fixture should have static-code identity");
+        assert_ne!(daemon_identity, peer_identity);
+        assert!(
+            !identities_match(daemon_identity, peer_identity),
+            "the exact static-code comparison must reject the old comparator's accepted pair"
+        );
     }
 }

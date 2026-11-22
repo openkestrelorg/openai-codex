@@ -16,7 +16,7 @@ impl LocalAgentControl {
         config: Config,
         thread_id: ThreadId,
         source: SessionSource,
-        parent_authority: &crate::ParentTurnAuthority,
+        parent_authority: Option<&crate::ParentTurnAuthority>,
     ) -> CodexResult<(LiveAgent, ThreadConfigSnapshot)> {
         let manager = self.runtime.upgrade()?;
         let thread = match manager.get_thread(thread_id).await {
@@ -26,7 +26,7 @@ impl LocalAgentControl {
                     config,
                     thread_id,
                     source,
-                    Some(parent_authority),
+                    parent_authority,
                 ))
                 .await?;
                 manager.get_thread(thread_id).await?

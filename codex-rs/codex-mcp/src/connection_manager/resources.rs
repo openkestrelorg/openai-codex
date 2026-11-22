@@ -1,10 +1,18 @@
+use super::McpServerConnection;
+use crate::CODEX_APPS_MCP_SERVER_NAME;
+use crate::McpRuntime;
+use codex_rmcp_client::RmcpClient;
+use rmcp::model::ServerResult;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::Weak;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
+use codex_rmcp_client::McpRequestTrace;
 use rmcp::model::ListResourceTemplatesResult;
 use rmcp::model::ListResourcesResult;
 use rmcp::model::PaginatedRequestParams;
@@ -34,7 +42,7 @@ impl McpConnectionSet {
             })
     }
 
-    pub(crate) async fn list_all_resources_with_authority(
+    pub async fn list_all_resources_with_authority(
         &self,
         include_server: impl Fn(&str) -> bool,
         access: crate::McpAttemptAccess<'_>,
@@ -46,21 +54,18 @@ impl McpConnectionSet {
             .filter(|(server_name, _)| include_server(server_name))
         {
             let server_name = server_name.clone();
-            let Ok(managed_client) = view.connection.client_with_authority(access).await else {
+            let Ok(work) = self.attempt_requirement.derive(access) else {
+                continue;
+            };
+            let child_access = crate::McpAttemptAccess::from_work(work.as_deref());
+            let Ok(client) = view.connection.client_with_authority(child_access).await else {
                 continue;
             };
             let timeout = view.tool_timeout;
-            let client = managed_client.client;
-            let Ok(work) = view.connection.client.client.requirement.derive(access) else {
-                warn!("MCP resource listing account work is unavailable for '{server_name}'");
-                continue;
-            };
-            join_set.spawn(async move {
-                // JoinSet drop requests abort; the task itself retains work
-                // until that abort has actually destroyed its future.
+            let task = async move {
                 let _work = work;
                 let resources = collect_paginated("resources/list", timeout, |params| {
-                    let client = Arc::clone(&client);
+                    let client = client.clone();
                     async move {
                         let response = client.list_resources(params, timeout).await?;
                         Ok((response.resources, response.next_cursor))
@@ -68,7 +73,8 @@ impl McpConnectionSet {
                 })
                 .await;
                 (server_name, resources)
-            });
+            };
+            join_set.spawn(McpRequestTrace::current().scope(task));
         }
 
         let mut resources = HashMap::new();
@@ -88,33 +94,28 @@ impl McpConnectionSet {
         resources
     }
 
-    pub(crate) async fn list_all_resource_templates_with_authority(
+    pub async fn list_all_resource_templates_with_authority(
         &self,
         include_server: impl Fn(&str) -> bool,
         access: crate::McpAttemptAccess<'_>,
     ) -> HashMap<String, Vec<ResourceTemplate>> {
         let mut join_set = JoinSet::new();
-        for (server_name, view) in self
-            .servers
-            .iter()
-            .filter(|(server_name, _)| include_server(server_name))
-        {
+        for (server_name, view) in self.servers.iter().filter(|(server_name, _)| {
+            include_server(server_name) && !self.skips_resource_template_listing(server_name)
+        }) {
             let server_name = server_name.clone();
-            let Ok(managed_client) = view.connection.client_with_authority(access).await else {
+            let Ok(work) = self.attempt_requirement.derive(access) else {
+                continue;
+            };
+            let child_access = crate::McpAttemptAccess::from_work(work.as_deref());
+            let Ok(client) = view.connection.client_with_authority(child_access).await else {
                 continue;
             };
             let timeout = view.tool_timeout;
-            let client = managed_client.client;
-            let Ok(work) = view.connection.client.client.requirement.derive(access) else {
-                warn!(
-                    "MCP resource template listing account work is unavailable for '{server_name}'"
-                );
-                continue;
-            };
-            join_set.spawn(async move {
+            let task = async move {
                 let _work = work;
                 let templates = collect_paginated("resources/templates/list", timeout, |params| {
-                    let client = Arc::clone(&client);
+                    let client = client.clone();
                     async move {
                         let response = client.list_resource_templates(params, timeout).await?;
                         Ok((response.resource_templates, response.next_cursor))
@@ -122,7 +123,8 @@ impl McpConnectionSet {
                 })
                 .await;
                 (server_name, templates)
-            });
+            };
+            join_set.spawn(McpRequestTrace::current().scope(task));
         }
 
         let mut templates = HashMap::new();
@@ -144,47 +146,97 @@ impl McpConnectionSet {
         templates
     }
 
-    pub(crate) async fn list_resources_with_authority(
+    pub async fn list_resources_with_authority(
         &self,
         server: &str,
         params: Option<PaginatedRequestParams>,
         access: crate::McpAttemptAccess<'_>,
     ) -> Result<ListResourcesResult> {
+        let work = self.attempt_requirement.derive(access)?;
+        let access = crate::McpAttemptAccess::from_work(work.as_deref());
         let (managed, timeout) = self.client_by_name_with_authority(server, access).await?;
         managed
-            .client
             .list_resources(params, timeout)
             .await
             .with_context(|| format!("resources/list failed for `{server}`"))
     }
 
-    pub(crate) async fn list_resource_templates_with_authority(
+    pub async fn list_resource_templates_with_authority(
         &self,
         server: &str,
         params: Option<PaginatedRequestParams>,
         access: crate::McpAttemptAccess<'_>,
     ) -> Result<ListResourceTemplatesResult> {
+        let work = self.attempt_requirement.derive(access)?;
+        let access = crate::McpAttemptAccess::from_work(work.as_deref());
         let (managed, timeout) = self.client_by_name_with_authority(server, access).await?;
         managed
-            .client
             .list_resource_templates(params, timeout)
             .await
             .with_context(|| format!("resources/templates/list failed for `{server}`"))
     }
 
-    pub(crate) async fn read_resource_with_authority(
+    // Hosted Apps always returns an empty list. Resume discovery if it gains templates.
+    pub(crate) fn skips_resource_template_listing(&self, server: &str) -> bool {
+        self.contains_server(server)
+            && self
+                .config
+                .as_ref()
+                .and_then(|config| config.mcp_server_catalog.server(server))
+                .is_some_and(|registration| {
+                    registration
+                        .source()
+                        .is_host_owned_apps(server, registration.config())
+                })
+    }
+
+    pub async fn read_resource(
+        &self,
+        server: &str,
+        params: ReadResourceRequestParams,
+    ) -> Result<ReadResourceResult> {
+        self.read_resource_with_authority(server, params, crate::McpAttemptAccess::Unscoped)
+            .await
+    }
+
+    pub async fn read_resource_with_authority(
         &self,
         server: &str,
         params: ReadResourceRequestParams,
         access: crate::McpAttemptAccess<'_>,
     ) -> Result<ReadResourceResult> {
+        let work = self.attempt_requirement.derive(access)?;
+        let access = crate::McpAttemptAccess::from_work(work.as_deref());
         let (managed, timeout) = self.client_by_name_with_authority(server, access).await?;
         let uri = params.uri.clone();
         managed
-            .client
             .read_resource(params, timeout)
             .await
             .with_context(|| format!("resources/read failed for `{server}` ({uri})"))
+    }
+
+    pub(crate) fn server_environment_id(&self, server: &str) -> Option<&str> {
+        self.servers
+            .get(server)
+            .map(|view| view.metadata.environment_id.as_str())
+    }
+
+    /// Returns the first Apps startup attempt only while its inventory is pending.
+    pub(crate) fn early_apps_discovery(
+        &self,
+    ) -> Option<(&Arc<McpServerConnection>, Option<Duration>)> {
+        if !self.config.as_ref()?.apps_early_resource_discovery {
+            return None;
+        }
+        let view = self.servers.get(CODEX_APPS_MCP_SERVER_NAME)?;
+        let connection = &view.connection;
+        if connection.initialized_apps.is_some()
+            && !connection.client.startup_complete.load(Ordering::Acquire)
+        {
+            Some((connection, view.tool_timeout))
+        } else {
+            None
+        }
     }
 
     pub(crate) async fn client_by_name_with_authority(
@@ -200,13 +252,74 @@ impl McpConnectionSet {
             .connection
             .client_with_authority(access)
             .await
-            .map_err(|error| match error {
-                crate::rmcp_client::StartupOutcomeError::Refused(refused) => {
-                    anyhow::Error::new(refused)
-                }
-                error => anyhow::Error::new(error),
-            })
             .context("failed to get client")?;
         Ok((client, view.tool_timeout))
+    }
+}
+
+impl McpServerConnection {
+    /// Borrows the authenticated transport while startup owns its inventory. Discard the page
+    /// if startup fails or the runtime replaces its connection, auth scope, or resource generation.
+    pub(crate) async fn with_early_apps_client_with_authority(
+        self: &Arc<Self>,
+        runtime: &McpRuntime,
+        timeout: Option<Duration>,
+        request: impl AsyncFnOnce(Arc<RmcpClient>, Option<Duration>) -> Result<ServerResult>,
+        access: crate::McpAttemptAccess<'_>,
+    ) -> Result<ServerResult> {
+        let auth = runtime.auth_cache_key_for_server(CODEX_APPS_MCP_SERVER_NAME);
+        let key = runtime
+            .resource_cache_key(CODEX_APPS_MCP_SERVER_NAME)
+            .context("Apps registration was removed")?;
+        anyhow::ensure!(
+            key.connection.ptr_eq(&Arc::downgrade(self)),
+            "Apps connection was replaced"
+        );
+        let client = self.initialized_apps_client_with_authority(access).await?;
+        let response = tokio::select! {
+            biased;
+            _ = self.client.cancel_token.cancelled() => anyhow::bail!("Apps startup cancelled"),
+            Err(error) = self.client.client.observe(access) => return Err(error.into()),
+            response = request(client, timeout) => response?,
+        };
+        anyhow::ensure!(
+            Some(key) == runtime.resource_cache_key(CODEX_APPS_MCP_SERVER_NAME)
+                && auth == runtime.auth_cache_key_for_server(CODEX_APPS_MCP_SERVER_NAME),
+            "Apps connection changed during catalog discovery"
+        );
+        Ok(response)
+    }
+
+    #[cfg(test)]
+    pub(super) async fn initialized_apps_client(&self) -> Result<Arc<RmcpClient>> {
+        self.initialized_apps_client_with_authority(crate::McpAttemptAccess::Unscoped)
+            .await
+    }
+
+    pub(super) async fn initialized_apps_client_with_authority(
+        &self,
+        access: crate::McpAttemptAccess<'_>,
+    ) -> Result<Arc<RmcpClient>> {
+        let mut initialized = self
+            .initialized_apps
+            .clone()
+            .context("Apps discovery is disabled")?;
+        let initialized_transport = async {
+            initialized
+                .wait_for(Option::is_some)
+                .await
+                .ok()
+                .and_then(|value| value.as_ref().and_then(Weak::upgrade))
+        };
+        let acquire = async {
+            tokio::select! {
+                biased;
+                ready = self.client.client.observe(access) => Ok(ready?.client),
+                Some(client) = initialized_transport => Ok(client),
+            }
+        };
+        tokio::time::timeout(self.startup_timeout, acquire)
+            .await
+            .context("timed out waiting for the initialized Apps client")?
     }
 }

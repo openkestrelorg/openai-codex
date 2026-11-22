@@ -16,7 +16,6 @@ use std::io::Write;
 use std::io::{self};
 use std::net::SocketAddr;
 use std::net::TcpStream;
-use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::LazyLock;
@@ -29,6 +28,7 @@ use std::time::Duration;
 
 use crate::auth::AuthDotJson;
 use crate::auth::AuthKeyringBackendKind;
+use crate::auth::WorkspaceLogin;
 use crate::auth::save_auth;
 use crate::callback_params::LIFE_SCIENCES_OAUTH_STATE_SUFFIX;
 use crate::callback_params::LoginCallbackResult;
@@ -53,6 +53,7 @@ use crate::success_page::LoginSuccessPage;
 use crate::success_page::LoginSuccessRedirect;
 use crate::success_page::compose_success_url;
 use crate::success_page::jwt_auth_claims;
+use crate::token_data::AccountOAuthProvenance;
 use crate::token_data::TokenData;
 use crate::token_data::parse_chatgpt_jwt_claims;
 use chrono::Utc;
@@ -62,6 +63,7 @@ use codex_http_client::HttpClient;
 use codex_http_client::HttpClientBuilder;
 use codex_http_client::HttpClientFactory;
 use codex_http_client::OutboundProxyPolicy;
+use codex_otel::auth_storage::AuthStorageOriginator;
 use codex_protocol::auth::AuthMode;
 use codex_utils_template::Template;
 use futures::FutureExt;
@@ -169,6 +171,7 @@ pub struct ServerOptions {
     pub port: u16,
     pub open_browser: bool,
     pub force_state: Option<String>,
+    pub workspace_login: Option<WorkspaceLogin>,
     pub forced_chatgpt_workspace_id: Option<Vec<String>>,
     pub codex_streamlined_login: bool,
     pub login_success_page: LoginSuccessPage,
@@ -194,6 +197,7 @@ impl ServerOptions {
             port: DEFAULT_PORT,
             open_browser: true,
             force_state: None,
+            workspace_login: None,
             forced_chatgpt_workspace_id,
             codex_streamlined_login: false,
             login_success_page: LoginSuccessPage::default(),
@@ -282,6 +286,7 @@ pub fn run_login_server(opts: ServerOptions) -> io::Result<LoginServer> {
         &pkce,
         &state,
         opts.forced_chatgpt_workspace_id.as_deref(),
+        opts.workspace_login.as_ref(),
     )?;
 
     if opts.open_browser {
@@ -293,7 +298,7 @@ pub fn run_login_server(opts: ServerOptions) -> io::Result<LoginServer> {
         let shutdown_notify = shutdown_notify.clone();
         let http = Arc::clone(&http);
         let persistence = Arc::downgrade(&persistence);
-        tokio::spawn(async move {
+        let task = async move {
             let mut callback_result = LoginCallbackResult::default();
             let result = loop {
                 tokio::select! {
@@ -365,7 +370,8 @@ pub fn run_login_server(opts: ServerOptions) -> io::Result<LoginServer> {
                 persistence.close();
             }
             result
-        })
+        };
+        tokio::spawn(AuthStorageOriginator::current().scope(task))
     };
 
     Ok(LoginServer {
@@ -505,17 +511,8 @@ async fn process_request(
                         obtain_api_key(&client, &opts.issuer, &opts.client_id, &tokens.id_token)
                             .await
                             .ok();
-                    if let Err(err) = persist_tokens_for_login(
-                        &opts.codex_home,
-                        api_key.clone(),
-                        tokens.id_token.clone(),
-                        tokens.access_token.clone(),
-                        tokens.refresh_token.clone(),
-                        opts.cli_auth_credentials_store_mode,
-                        opts.auth_keyring_backend_kind,
-                        persistence,
-                    )
-                    .await
+                    if let Err(err) =
+                        persist_tokens_for_login(opts, api_key.clone(), &tokens, persistence).await
                     {
                         eprintln!("Persist error: {err}");
                         return login_error_response(
@@ -626,6 +623,7 @@ fn build_authorize_url(
     pkce: &PkceCodes,
     state: &str,
     forced_chatgpt_workspace_ids: Option<&[String]>,
+    workspace_login: Option<&WorkspaceLogin>,
 ) -> io::Result<String> {
     let originator = originator().value;
     let workspace_ids = forced_chatgpt_workspace_ids.map(|ids| ids.join(","));
@@ -636,6 +634,15 @@ fn build_authorize_url(
     ];
     if let Some(workspace_ids) = workspace_ids.as_deref() {
         extra_parameters.push(("allowed_workspace_id", workspace_ids));
+    }
+    if let Some(login) = workspace_login {
+        extra_parameters.push(("current_workspace_id", &login.workspace_id));
+        if let Some(email) = &login.email {
+            extra_parameters.push(("login_hint", email));
+        }
+        if let Some(connection) = &login.connection {
+            extra_parameters.push(("connection", connection));
+        }
     }
     build_authorization_url(AuthorizationRequest {
         endpoint: &format!("{issuer}/oauth/authorize"),
@@ -738,9 +745,8 @@ pub(crate) struct ExchangedTokens {
 /// Exchanges an authorization code for tokens and returns the client for further token exchanges.
 ///
 /// The returned error remains suitable for user-facing CLI/browser surfaces, so backend-provided
-/// non-JSON error text is preserved there. Structured logging stays narrower: it logs reviewed
-/// fields from parsed token responses and redacted transport errors, but does not log the final
-/// callback-layer `%err` string.
+/// non-JSON error text is preserved there. Structured logs only report status and redacted
+/// transport errors, and do not log the final callback-layer `%err` string.
 pub(crate) async fn exchange_code_for_tokens(
     issuer: &str,
     client_id: &str,
@@ -808,7 +814,6 @@ pub(crate) async fn exchange_code_for_tokens(
             }
             warn!(
                 status = %rejection.status,
-                detail = ?rejection.detail,
                 "oauth token exchange returned non-success status"
             );
             Err(io::Error::other(rejection.to_string()))
@@ -864,58 +869,25 @@ async fn send_code_exchange_request(
 
 /// Persists exchanged credentials using the configured local auth store.
 pub(crate) async fn persist_tokens_async(
-    codex_home: &Path,
+    opts: &ServerOptions,
     api_key: Option<String>,
-    id_token: String,
-    access_token: String,
-    refresh_token: String,
-    auth_credentials_store_mode: AuthCredentialsStoreMode,
-    keyring_backend_kind: AuthKeyringBackendKind,
+    exchanged: &ExchangedTokens,
 ) -> io::Result<()> {
-    let codex_home = codex_home.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        persist_tokens_blocking(
-            &codex_home,
-            api_key,
-            id_token,
-            access_token,
-            refresh_token,
-            auth_credentials_store_mode,
-            keyring_backend_kind,
-        )
-    })
-    .await
-    .map_err(|e| io::Error::other(format!("persist task failed: {e}")))?
+    tokio::task::spawn_blocking(credential_persistence(opts, api_key, exchanged))
+        .await
+        .map_err(|error| io::Error::other(format!("persist task failed: {error}")))?
 }
 
-// Keep the existing credential fields explicit while adding the login-owned
-// persistence registry that must outlive the blocking write.
-#[allow(clippy::too_many_arguments)]
 async fn persist_tokens_for_login(
-    codex_home: &Path,
+    opts: &ServerOptions,
     api_key: Option<String>,
-    id_token: String,
-    access_token: String,
-    refresh_token: String,
-    auth_credentials_store_mode: AuthCredentialsStoreMode,
-    keyring_backend_kind: AuthKeyringBackendKind,
+    exchanged: &ExchangedTokens,
     registry: &Weak<PersistenceRegistry>,
 ) -> io::Result<()> {
     let registry = registry
         .upgrade()
         .ok_or_else(|| io::Error::other("login persistence custody unavailable"))?;
-    let codex_home = codex_home.to_path_buf();
-    let work = registry.spawn(move || {
-        persist_tokens_blocking(
-            &codex_home,
-            api_key,
-            id_token,
-            access_token,
-            refresh_token,
-            auth_credentials_store_mode,
-            keyring_backend_kind,
-        )
-    })?;
+    let work = registry.spawn(credential_persistence(opts, api_key, exchanged))?;
     match work.await {
         PersistenceOutcome::Joined => Ok(()),
         PersistenceOutcome::Failed => Err(io::Error::other("credential persistence failed")),
@@ -927,43 +899,66 @@ async fn persist_tokens_for_login(
     }
 }
 
-fn persist_tokens_blocking(
-    codex_home: &Path,
+/// Both ordinary and retained callback writes use the unchanged 0.169 save
+/// policy, including workspace conditional-save and OAuth owner/provenance.
+fn credential_persistence(
+    opts: &ServerOptions,
     api_key: Option<String>,
-    id_token: String,
-    access_token: String,
-    refresh_token: String,
-    auth_credentials_store_mode: AuthCredentialsStoreMode,
-    keyring_backend_kind: AuthKeyringBackendKind,
-) -> io::Result<()> {
-    let mut tokens = TokenData {
-        id_token: parse_chatgpt_jwt_claims(&id_token).map_err(io::Error::other)?,
-        access_token,
-        refresh_token,
-        account_id: None,
+    exchanged: &ExchangedTokens,
+) -> impl FnOnce() -> io::Result<()> + Send + 'static {
+    // Reuse existing synchronous logic but run it off the async runtime.
+    let codex_home = opts.codex_home.clone();
+    let auth_credentials_store_mode = opts.cli_auth_credentials_store_mode;
+    let keyring_backend_kind = opts.auth_keyring_backend_kind;
+    let id_token = exchanged.id_token.clone();
+    let access_token = exchanged.access_token.clone();
+    let refresh_token = exchanged.refresh_token.clone();
+    let workspace_login = opts.workspace_login.clone();
+    let provenance = AccountOAuthProvenance {
+        issuer: opts.issuer.clone(),
+        client_id: opts.client_id.clone(),
     };
-    if let Some(acc) = jwt_auth_claims(&id_token)
-        .get("chatgpt_account_id")
-        .and_then(|v| v.as_str())
-    {
-        tokens.account_id = Some(acc.to_string());
+    // Blocking tasks don't inherit task-local context.
+    // Preserve the initiating client for credential-storage metrics.
+    let originator = AuthStorageOriginator::current();
+
+    move || {
+        originator.sync_scope(|| {
+            let mut tokens = TokenData {
+                id_token: parse_chatgpt_jwt_claims(&id_token).map_err(io::Error::other)?,
+                access_token,
+                refresh_token,
+                oauth_provenance: Some(provenance),
+                login_owner_id: Some(generate_state()),
+                account_id: None,
+            };
+            if let Some(acc) = jwt_auth_claims(&id_token)
+                .get("chatgpt_account_id")
+                .and_then(|v| v.as_str())
+            {
+                tokens.account_id = Some(acc.to_string());
+            }
+            let auth = AuthDotJson {
+                auth_mode: Some(AuthMode::Chatgpt),
+                openai_api_key: api_key,
+                tokens: Some(tokens),
+                last_refresh: Some(Utc::now()),
+                agent_identity: None,
+                personal_access_token: None,
+                bedrock_api_key: None,
+                bedrock_access_keys: None,
+            };
+            if let Some(login) = workspace_login {
+                return login.save(auth);
+            }
+            save_auth(
+                &codex_home,
+                &auth,
+                auth_credentials_store_mode,
+                keyring_backend_kind,
+            )
+        })
     }
-    let auth = AuthDotJson {
-        auth_mode: Some(AuthMode::Chatgpt),
-        openai_api_key: api_key,
-        tokens: Some(tokens),
-        last_refresh: Some(Utc::now()),
-        agent_identity: None,
-        personal_access_token: None,
-        bedrock_api_key: None,
-        bedrock_access_keys: None,
-    };
-    save_auth(
-        codex_home,
-        &auth,
-        auth_credentials_store_mode,
-        keyring_backend_kind,
-    )
 }
 
 /// Validates the ID token against an optional workspace restriction.

@@ -1,4 +1,4 @@
-//! Process-selected ChatGPT command source. Credentials travel over private IPC.
+//! Command-source component. Production manager selection remains a required port.
 use super::AuthConfig;
 use super::CodexAuth;
 use super::ExternalAuth;
@@ -6,6 +6,7 @@ use super::ExternalAuthFuture;
 use super::ExternalAuthRefreshContext;
 use super::command_store;
 use codex_config::types::AuthCredentialsStoreMode;
+use codex_protocol::auth::AuthMode;
 use serde::Deserialize;
 use serde::Serialize;
 use sha2::Digest;
@@ -41,12 +42,14 @@ impl Envelope {
         self.expires_at > chrono::Utc::now().timestamp()
     }
 
-    fn auth(&self) -> io::Result<CodexAuth> {
+    fn validate(&self) -> io::Result<()> {
         let fingerprint = format!("{:x}", sha2::Sha256::digest(self.access_token.as_bytes()));
         if self.version != 1
             || self.generation == 0
+            || [&self.source, &self.binding, &self.account, &self.principal]
+                .iter()
+                .any(|value| value.trim().is_empty())
             || self.fingerprint != fingerprint
-            || !self.usable()
         {
             return Err(io::Error::other("invalid or expired command credentials"));
         }
@@ -61,6 +64,14 @@ impl Envelope {
             || claims.chatgpt_user_id.as_deref() != Some(self.principal.as_str())
         {
             return Err(io::Error::other("command principal mismatch"));
+        }
+        Ok(())
+    }
+
+    pub(super) fn auth(&self) -> io::Result<CodexAuth> {
+        self.validate()?;
+        if !self.usable() {
+            return Err(io::Error::other("invalid or expired command credentials"));
         }
         CodexAuth::from_external_chatgpt_tokens(
             &self.access_token,
@@ -90,17 +101,33 @@ pub(super) struct CommandSource {
     pub managers: Mutex<Vec<Weak<super::AuthManager>>>,
 }
 
+/// Acquired source state -> native writer lock; callers acquire the cache last.
+/// Field order releases the disk lock before the state guard.
+pub(super) struct CommandRecordGuard<'a> {
+    disk: super::storage::CommandAuthSourceGuard,
+    _state: std::sync::MutexGuard<'a, Option<Envelope>>,
+}
+impl CommandRecordGuard<'_> {
+    pub(super) fn require_current_domain(&self) -> io::Result<()> {
+        self.disk.require_current_domain().map_err(io::Error::other)
+    }
+}
+
 type Sessions = HashMap<PathBuf, Weak<CommandSource>>;
 static SESSIONS: OnceLock<Mutex<Sessions>> = OnceLock::new();
 
 impl CommandSource {
-    pub fn selected(config: &AuthConfig) -> io::Result<Option<Arc<Self>>> {
+    pub fn selected(
+        config: &AuthConfig,
+        allowed_auth_modes: Option<&[AuthMode]>,
+    ) -> io::Result<Option<Arc<Self>>> {
         let Some(command) =
             std::env::var_os("CODEX_CHATGPT_AUTH_COMMAND").filter(|value| !value.is_empty())
         else {
             return Ok(None);
         };
-        if !cfg!(target_os = "macos")
+        Self::require_allowed_mode(allowed_auth_modes)?;
+        if !crate::COMMAND_AUTH_COMPILED_SUPPORTED
             || config.auth_credentials_store_mode != AuthCredentialsStoreMode::File
         {
             return Err(io::Error::other("command auth requires macOS File storage"));
@@ -108,7 +135,7 @@ impl CommandSource {
         let required = |key| {
             std::env::var(key)
                 .ok()
-                .filter(|v| !v.is_empty())
+                .filter(|v| !v.trim().is_empty())
                 .ok_or_else(|| io::Error::other("incomplete command auth selection"))
         };
         let selection = Selection {
@@ -142,6 +169,9 @@ impl CommandSource {
             return Ok(Some(session));
         }
         let current = command_store::read(&selection.home)?;
+        if let Some(record) = &current {
+            record.validate()?;
+        }
         if current.is_some() && !command_store::is_protected(&selection.home.join("auth.json")) {
             return Err(io::Error::other("owned auth protection unsupported"));
         }
@@ -168,6 +198,37 @@ impl CommandSource {
         Ok(Some(session))
     }
 
+    fn require_allowed_mode(allowed: Option<&[AuthMode]>) -> io::Result<()> {
+        if allowed.is_some_and(|modes| !modes.contains(&AuthMode::ChatgptAuthTokens)) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "command auth mode forbidden",
+            ));
+        }
+        Ok(())
+    }
+
+    /// A source selected for `record`'s identity that never runs its command
+    /// (retry deferred), for owner-bound renewal tests.
+    #[cfg(test)]
+    pub(super) fn for_owner_tests(home: &std::path::Path, record: Envelope) -> Self {
+        Self {
+            selection: Selection {
+                home: home.to_path_buf(),
+                command: home.join("unused-command"),
+                binding: record.binding.clone(),
+                source: record.source.clone(),
+                account: record.account.clone(),
+                principal: record.principal.clone(),
+            },
+            gate: Semaphore::new(1),
+            state: Mutex::new(Some(record)),
+            rejected: Mutex::new(HashSet::new()),
+            retry_after: AtomicI64::new(chrono::Utc::now().timestamp() + 60),
+            managers: Mutex::new(Vec::new()),
+        }
+    }
+
     pub fn matches(&self, envelope: &Envelope) -> bool {
         envelope.source == self.selection.source
             && envelope.binding == self.selection.binding
@@ -177,9 +238,83 @@ impl CommandSource {
 
     pub fn accepts(&self, auth: Option<&CodexAuth>, state: &Option<Envelope>) -> bool {
         state.as_ref().is_some_and(|record| {
-            auth.and_then(|auth| auth.get_token_data().ok())
-                .is_some_and(|tokens| tokens.access_token == record.access_token)
+            self.matches(record)
+                && auth.is_some_and(|auth| auth.api_auth_mode() == AuthMode::ChatgptAuthTokens)
+                && auth
+                    .and_then(super::FixedPrincipal::carried_by)
+                    .is_some_and(|principal| {
+                        principal.chatgpt_user_id == record.principal
+                            && principal.account_id == record.account
+                    })
+                && auth
+                    .and_then(|auth| auth.get_token_data().ok())
+                    .is_some_and(|tokens| tokens.access_token == record.access_token)
         })
+    }
+
+    fn guard_state<'a>(
+        &'a self,
+        state: std::sync::MutexGuard<'a, Option<Envelope>>,
+    ) -> io::Result<CommandRecordGuard<'a>> {
+        let record = state
+            .as_ref()
+            .ok_or_else(|| io::Error::other("command state missing"))?;
+        record.validate()?;
+        if !self.matches(record) {
+            return Err(io::Error::other("command account conflict"));
+        }
+        let disk = command_store::locked_current(&self.selection.home, record)?;
+        if !command_store::is_protected(&self.selection.home.join("auth.json")) {
+            return Err(io::Error::other("owned auth protection unavailable"));
+        }
+        disk.require_current_domain().map_err(io::Error::other)?;
+        Ok(CommandRecordGuard {
+            disk,
+            _state: state,
+        })
+    }
+
+    pub(super) fn cache_guard<'a>(
+        &'a self,
+        auth: Option<&CodexAuth>,
+    ) -> io::Result<CommandRecordGuard<'a>> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| io::Error::other("command state unavailable"))?;
+        let record = state
+            .as_ref()
+            .ok_or_else(|| io::Error::other("command state missing"))?;
+        if !record.usable() || !self.accepts(auth, &state) {
+            return Err(io::Error::other("command cache publication rejected"));
+        }
+        if self
+            .rejected
+            .lock()
+            .map_err(|_| io::Error::other("rejection state unavailable"))?
+            .contains(&record.fingerprint)
+        {
+            return Err(io::Error::other("command credential was rejected"));
+        }
+        self.guard_state(state)
+    }
+
+    fn ownership_guard<'a>(&'a self, expected: &Envelope) -> io::Result<CommandRecordGuard<'a>> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| io::Error::other("command state unavailable"))?;
+        if state.as_ref() != Some(expected) {
+            return Err(io::Error::other("command generation changed"));
+        }
+        self.guard_state(state)
+    }
+
+    fn validated_cached_auth(&self, record: &Envelope) -> io::Result<CodexAuth> {
+        let auth = record.auth()?;
+        let guard = self.cache_guard(Some(&auth))?;
+        guard.require_current_domain()?;
+        Ok(auth)
     }
 
     pub fn usable_auth(&self, auth: Option<&CodexAuth>) -> bool {
@@ -190,7 +325,8 @@ impl CommandSource {
             return false;
         };
         state.as_ref().is_some_and(|record| {
-            record.usable()
+            record.validate().is_ok()
+                && record.usable()
                 && !rejected.contains(&record.fingerprint)
                 && self.accepts(auth, &state)
                 && command_store::is_protected(&self.selection.home.join("auth.json"))
@@ -223,6 +359,7 @@ impl CommandSource {
             .is_ok_and(|rejected| !rejected.contains(&current.fingerprint));
         let coherent = mode_valid
             && not_rejected
+            && current.validate().is_ok()
             && current.usable()
             && managers_coherent
             && self.accepts(auth, &state)
@@ -232,19 +369,23 @@ impl CommandSource {
         serde_json::json!({"source":current.source,"generation":current.generation,"expiresAt":current.expires_at,"coherent":coherent,"protectionMode":if mode_valid { "0400" } else { "unknown" }})
     }
 
-    fn publish(&self, record: Envelope) -> io::Result<CodexAuth> {
-        let auth = record.auth()?;
-        let replaced = self
-            .state
-            .lock()
-            .map_err(|_| io::Error::other("command state unavailable"))?
-            .as_ref()
-            .is_some_and(|old| old.fingerprint != record.fingerprint);
+    fn adopt_record(&self, record: Envelope) -> io::Result<()> {
+        record.validate()?;
+        if !self.matches(&record) {
+            return Err(io::Error::other("command account conflict"));
+        }
         let fingerprint = record.fingerprint.clone();
-        *self
-            .state
-            .lock()
-            .map_err(|_| io::Error::other("command state unavailable"))? = Some(record);
+        let replaced = {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| io::Error::other("command state unavailable"))?;
+            let replaced = state
+                .as_ref()
+                .is_some_and(|old| old.fingerprint != fingerprint);
+            *state = Some(record);
+            replaced
+        };
         if replaced {
             // Another process may have published the credential rejected by
             // this request. Importing it must preserve that exact rejection.
@@ -253,6 +394,13 @@ impl CommandSource {
                 .map_err(|_| io::Error::other("rejection state unavailable"))?
                 .retain(|rejected| rejected == &fingerprint);
         }
+        Ok(())
+    }
+
+    fn publish(&self, record: Envelope) -> io::Result<CodexAuth> {
+        record.auth()?;
+        self.adopt_record(record.clone())?;
+        let auth = self.validated_cached_auth(&record)?;
         let managers: Vec<_> = self
             .managers
             .lock()
@@ -261,9 +409,9 @@ impl CommandSource {
             .filter_map(Weak::upgrade)
             .collect();
         for manager in managers {
-            manager.set_cached_auth(Some(auth.clone()));
+            manager.try_set_cached_auth(Some(auth.clone()))?;
         }
-        Ok(auth)
+        self.validated_cached_auth(&record)
     }
 
     pub(super) async fn obtain(&self, failed: Option<String>) -> io::Result<CodexAuth> {
@@ -302,8 +450,14 @@ impl CommandSource {
                 .map_err(|_| io::Error::other("command state unavailable"))?
                 .as_ref()
                 .is_none_or(|current| durable.generation > current.generation);
-            if newer && durable.usable() {
-                self.publish(durable)?;
+            if newer {
+                if durable.usable() {
+                    self.publish(durable)?;
+                } else {
+                    // Import valid ownership even when expired, solely to renew
+                    // the latest generation. Never publish it as usable auth.
+                    self.adopt_record(durable)?;
+                }
             }
         }
         let current = self
@@ -311,6 +465,11 @@ impl CommandSource {
             .lock()
             .map_err(|_| io::Error::other("command state unavailable"))?
             .clone();
+        if let Some(record) = &current {
+            // Also check expired ownership before renewal: losing both files
+            // must not look like a fresh, unenrolled home to this live source.
+            self.ownership_guard(record)?.require_current_domain()?;
+        }
         // Determine rejection against the adopted record, after any disk import.
         let failed = {
             let rejected = self
@@ -326,7 +485,7 @@ impl CommandSource {
             && record.expires_at > chrono::Utc::now().timestamp() + 300
             && failed.as_deref() != Some(record.fingerprint.as_str())
         {
-            return record.auth();
+            return self.validated_cached_auth(record);
         }
         let result = if self.retry_after.load(Ordering::Acquire) > chrono::Utc::now().timestamp() {
             Err(io::Error::other("provider retry pending"))
@@ -345,7 +504,7 @@ impl CommandSource {
                     && record.usable()
                     && failed.as_deref() != Some(record.fingerprint.as_str())
                 {
-                    return record.auth();
+                    return self.validated_cached_auth(&record);
                 }
                 return Err(error);
             }
@@ -358,7 +517,7 @@ impl CommandSource {
         let home = self.selection.home.clone();
         let durable_record = record.clone();
         let durable_auth = auth.clone();
-        tokio::task::spawn_blocking(move || {
+        codex_protocol::host_auth_task::run_blocking_call(move || {
             command_store::commit(&home, &durable_record, &durable_auth)
         })
         .await
@@ -493,6 +652,16 @@ impl ExternalAuth for Arc<CommandSource> {
     fn resolve(&self) -> ExternalAuthFuture<'_, CodexAuth> {
         Box::pin(self.obtain(None))
     }
+    /// The selection's account and principal are fixed for the source's
+    /// lifetime (from `CODEX_CHATGPT_AUTH_ACCOUNT`/`_PRINCIPAL`). `matches` and
+    /// `Envelope::auth` require them of every credential it publishes.
+    fn fixed_principal(&self) -> Option<super::FixedPrincipal> {
+        Some(super::FixedPrincipal {
+            chatgpt_user_id: self.selection.principal.clone(),
+            account_id: self.selection.account.clone(),
+        })
+    }
+
     fn refresh(&self, _context: ExternalAuthRefreshContext) -> ExternalAuthFuture<'_, CodexAuth> {
         Box::pin(async move {
             let failed = self

@@ -1,5 +1,6 @@
 //! Core-owned queue metadata; forwarding transfers the residency guard with the operation.
 
+use codex_extension_api::ExtensionDataInit;
 use std::collections::VecDeque;
 use std::future::Future;
 use std::sync::Arc;
@@ -17,16 +18,19 @@ use tokio_util::sync::CancellationToken;
 mod tests;
 
 #[derive(Debug)]
-#[allow(dead_code, reason = "Turn ancestry is retained in Debug diagnostics.")]
 pub(crate) struct Submission {
     pub id: String,
     pub op: Op,
+    /// Accepted with settings, never separately from the request that supplied them.
+    pub turn_extension_init: Option<ExtensionDataInit>,
     /// Optional W3C trace carrier propagated across async submission handoffs.
     pub trace: Option<W3cTraceContext>,
     pub parent_turn_id: Option<String>,
     pub root_turn_id: Option<String>,
     /// Keeps a V2 recipient resident until this submission is handled or dropped.
     pub residency_guard: Option<OwnedRwLockReadGuard<()>>,
+    /// Owns delivery until dispatch; failed or abandoned submissions discard it.
+    pub message_delivery: Option<crate::agent_communication::MessageDelivery>,
 }
 
 #[derive(Clone)]
@@ -69,6 +73,20 @@ pub(crate) struct DispatchGuard {
 }
 
 impl SubmissionDispatch {
+    /// Internal catalog/mailbox dispatch is work even without a public queue entry.
+    /// Use the same admission mutex so an idle claim cannot interleave its effects.
+    pub(crate) fn begin_work(&self) -> Option<DispatchGuard> {
+        let mut admission = self.0.lock().ok()?;
+        if admission.closed || admission.failed {
+            return None;
+        }
+        admission.outstanding += 1;
+        Some(DispatchGuard {
+            admission: Arc::clone(&self.0),
+            kind: Some(SubmissionKind::Public),
+        })
+    }
+
     pub(crate) fn begin(&self) -> DispatchGuard {
         let kind = self.0.lock().ok().and_then(|mut admission| {
             let kind = admission.queued.pop_front();
@@ -149,6 +167,11 @@ impl SubmissionSender {
 
     pub(crate) fn is_closed(&self) -> bool {
         self.wake.is_cancelled() || self.sender.is_closed()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.sender.is_empty()
     }
 
     #[cfg(test)]

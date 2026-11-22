@@ -32,6 +32,8 @@ pub use pipe::spawn_process_no_stdin as spawn_pipe_process_no_stdin;
 pub use process::ProcessDriver;
 /// Handle for interacting with a spawned process (PTY or pipe).
 pub use process::ProcessHandle;
+/// Spawn-time child identity pin, never a post-reap numeric PID lookup.
+pub use process::ProcessPin;
 /// Process signal supported by spawned-process handles.
 pub use process::ProcessSignal;
 /// Bundle of process handles plus split output and exit receivers returned by spawn helpers.
@@ -65,6 +67,9 @@ mod spawn_helper;
 mod spawn_helper_main;
 #[cfg(target_os = "linux")]
 pub use spawn_helper::init_spawn_helper;
+
 #[cfg(all(test, target_os = "linux"))]
-#[path = "spawn_helper_tests.rs"]
-mod spawn_helper_tests;
+use tests::spawn_helper_tests;
+
+#[cfg(test)]
+mod process_pin_tests;

@@ -6,6 +6,7 @@
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use futures::future::Shared;
+use std::cell::RefCell;
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -17,6 +18,7 @@ pub(crate) enum JoinOutcome {
     Joined,
     Cancelled,
     Panicked,
+    Unavailable,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -38,27 +40,33 @@ pub(crate) type Receipt = Shared<BoxFuture<'static, JoinOutcome>>;
 #[derive(Default)]
 struct State {
     closed: bool,
+    stop_requested: bool,
     deadline: Option<Instant>,
     tasks: Vec<Receipt>,
     cancelled: bool,
     panicked: bool,
+    unavailable: bool,
+    shutdown_changed: Arc<tokio::sync::Notify>,
 }
 
 impl State {
     fn compact(&mut self) {
-        self.tasks
-            .retain(|receipt| match receipt.clone().now_or_never() {
-                Some(JoinOutcome::Joined) => false,
-                Some(JoinOutcome::Cancelled) => {
-                    self.cancelled = true;
-                    false
-                }
-                Some(JoinOutcome::Panicked) => {
-                    self.panicked = true;
-                    false
-                }
-                None => true,
-            });
+        self.tasks.retain(|receipt| match receipt.peek().copied() {
+            Some(JoinOutcome::Joined) => false,
+            Some(JoinOutcome::Cancelled) => {
+                self.cancelled = true;
+                false
+            }
+            Some(JoinOutcome::Panicked) => {
+                self.panicked = true;
+                false
+            }
+            Some(JoinOutcome::Unavailable) => {
+                self.unavailable = true;
+                false
+            }
+            None => true,
+        });
     }
 }
 
@@ -67,10 +75,371 @@ pub struct PluginTaskRegistry {
     state: Arc<Mutex<State>>,
 }
 
+/// Cooperative stop for an OS-thread plugin worker, derived from the
+/// registry's shutdown request. Workers stop taking new steps immediately;
+/// the separately latched deadline bounds observation of their original joins.
+/// An interrupted step must release its owned resources before the worker
+/// returns, so a clean drain still requires the physical original to finish.
+#[derive(Clone, Default)]
+pub struct WorkerStop {
+    state: Option<Arc<Mutex<State>>>,
+}
+
+impl WorkerStop {
+    pub(crate) fn ensure_running(&self, context: &str) -> Result<(), String> {
+        let unavailable = self.state.as_ref().is_some_and(|state| {
+            state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .unavailable
+        });
+        if self.is_stopped() || unavailable {
+            return Err(format!(
+                "plugin worker stopped after shutdown request, shutdown deadline, or unavailable custody before {context}"
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn is_managed(&self) -> bool {
+        self.state.is_some()
+    }
+
+    /// A joined worker cannot hide an IO/identity/pipe custody failure even if
+    /// an intermediate caller logs its ordinary Result and continues.
+    pub(crate) fn mark_unavailable(&self) {
+        if let Some(state) = &self.state {
+            state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .unavailable = true;
+        }
+    }
+
+    /// Interrupt an owned read step when shutdown is requested, including
+    /// after IO begins. The original join remains owned by the registry.
+    pub(crate) async fn run_until<T>(
+        &self,
+        cap: std::time::Duration,
+        future: impl Future<Output = T>,
+    ) -> Option<T> {
+        let cap_deadline = Instant::now() + cap;
+        let Some(state) = self.state.as_ref() else {
+            return tokio::time::timeout_at(cap_deadline, future).await.ok();
+        };
+        let changed = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .shutdown_changed
+            .clone();
+        tokio::pin!(future);
+        loop {
+            let notification = changed.notified();
+            tokio::pin!(notification);
+            notification.as_mut().enable();
+            let deadline = self
+                .deadline()
+                .map_or(cap_deadline, |owner| owner.min(cap_deadline));
+            if self.is_stopped() || Instant::now() >= deadline {
+                return None;
+            }
+            tokio::select! {
+                biased;
+                _ = tokio::time::sleep_until(deadline) => return None,
+                _ = &mut notification => {},
+                result = &mut future => return Some(result),
+            }
+        }
+    }
+
+    /// Interrupt only an owned, cancellation-safe read. Do not wrap a blocking
+    /// commit or its observer: those must remain awaited through physical completion.
+    /// The read retains its own timeout; this adds only the shutdown request.
+    pub(crate) async fn run_read_until_shutdown<T>(
+        &self,
+        future: impl Future<Output = T>,
+    ) -> Option<T> {
+        let Some(state) = self.state.as_ref() else {
+            return Some(future.await);
+        };
+        let changed = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .shutdown_changed
+            .clone();
+        tokio::pin!(future);
+        loop {
+            let notification = changed.notified();
+            tokio::pin!(notification);
+            notification.as_mut().enable();
+            if self.is_stopped() {
+                return None;
+            }
+            tokio::select! {
+                biased;
+                _ = &mut notification => {},
+                result = &mut future => return Some(result),
+            }
+        }
+    }
+
+    /// No owner: never stops (tests and callers without a registry).
+    pub fn never() -> Self {
+        Self::default()
+    }
+
+    fn deadline(&self) -> Option<Instant> {
+        let state = self.state.as_ref()?;
+        // A poisoned registry still records its deadline.
+        let state = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.deadline
+    }
+
+    /// True once shutdown requests a stop, or its latched deadline expires.
+    pub fn is_stopped(&self) -> bool {
+        self.state.as_ref().is_some_and(|state| {
+            let state = state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.stop_requested
+                || state
+                    .deadline
+                    .is_some_and(|deadline| Instant::now() >= deadline)
+        })
+    }
+
+    /// `min(cap, remaining)`; zero once stopped. Never extends the deadline.
+    pub fn step_timeout(&self, cap: std::time::Duration) -> std::time::Duration {
+        if self.is_stopped() {
+            return std::time::Duration::ZERO;
+        }
+        match self.deadline() {
+            Some(deadline) => cap.min(deadline.saturating_duration_since(Instant::now())),
+            None => cap,
+        }
+    }
+}
+
+thread_local! {
+    static WORKER_STOP: RefCell<WorkerStop> = RefCell::new(WorkerStop::never());
+}
+
+/// Scoped only to a synchronous worker. Never hold a thread-local guard across
+/// an async suspension or move it to another thread.
+pub(crate) struct WorkerStopScope {
+    previous: Option<WorkerStop>,
+    _not_send: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+impl WorkerStopScope {
+    pub(crate) fn enter(stop: WorkerStop) -> Self {
+        Self {
+            previous: Some(WORKER_STOP.with(|current| current.replace(stop))),
+            _not_send: std::marker::PhantomData,
+        }
+    }
+}
+impl Drop for WorkerStopScope {
+    fn drop(&mut self) {
+        if let Some(previous) = self.previous.take() {
+            WORKER_STOP.with(|current| current.replace(previous));
+        }
+    }
+}
+
+pub(crate) fn current_worker_stop() -> WorkerStop {
+    WORKER_STOP.with(|current| current.borrow().clone())
+}
+
+pub(crate) fn ensure_worker_running(context: &str) -> Result<(), String> {
+    current_worker_stop().ensure_running(context)
+}
+
+pub(crate) fn current_worker_output(
+    command: &mut std::process::Command,
+    context: &str,
+) -> Result<std::process::Output, String> {
+    ensure_worker_running(context)?;
+    let stop = current_worker_stop();
+    if stop.is_managed() {
+        // These upstream helpers had no step cap. Keep that ordinary behavior
+        // until the SAME owner latches its deadline, rather than invent a cap.
+        crate::owned_process::run_output(command, context, std::time::Duration::MAX, stop)
+    } else {
+        command
+            .output()
+            .map_err(|error| format!("failed to run {context}: {error}"))
+    }
+}
+
+pub(crate) fn lock_worker_file(file: &std::fs::File) -> std::io::Result<()> {
+    if !current_worker_stop().is_managed() {
+        return file.lock();
+    }
+    loop {
+        ensure_worker_running("the marketplace staging lock").map_err(std::io::Error::other)?;
+        match file.try_lock() {
+            Ok(()) => return Ok(()),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                std::thread::sleep(std::time::Duration::from_millis(5))
+            }
+            Err(std::fs::TryLockError::Error(error)) => return Err(error),
+        }
+    }
+}
+
+/// Check the owning synchronous worker before each decoder read. Tar retains
+/// its own validation, size bounds, file modes and entry unpack semantics.
+pub(crate) struct WorkerRead<R> {
+    inner: R,
+    stop: WorkerStop,
+}
+impl<R> WorkerRead<R> {
+    pub(crate) fn new(inner: R) -> Self {
+        Self {
+            inner,
+            stop: current_worker_stop(),
+        }
+    }
+}
+impl<R: std::io::Read> std::io::Read for WorkerRead<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.stop
+            .ensure_running("archive data read")
+            .map_err(std::io::Error::other)?;
+        self.inner.read(buffer)
+    }
+}
+
 impl PluginTaskRegistry {
+    /// Drive aliases outside the state lock. Originals stay in the census
+    /// throughout polling; compaction only reads their completed Copy output.
+    fn poll_originals(&self) -> Result<(), ()> {
+        let receipts = self.state.lock().map_err(|_| ())?.tasks.clone();
+        for receipt in receipts {
+            let _ = receipt.now_or_never();
+        }
+        Ok(())
+    }
+
+    /// The stop signal for workers admitted to this registry.
+    pub fn worker_stop(&self) -> WorkerStop {
+        WorkerStop {
+            state: Some(Arc::clone(&self.state)),
+        }
+    }
+
     pub fn close(&self) {
         if let Ok(mut state) = self.state.lock() {
             state.closed = true;
+        }
+    }
+
+    fn reserve_original(
+        &self,
+    ) -> Result<
+        (
+            tokio::sync::oneshot::Sender<BoxFuture<'static, JoinOutcome>>,
+            Receipt,
+        ),
+        (),
+    > {
+        self.poll_originals().map_err(|_| {
+            codex_model_provider::record_auth_task_failure(
+                codex_model_provider::AuthTaskFailure::Unavailable,
+            );
+        })?;
+        let (attach, receive) = tokio::sync::oneshot::channel::<BoxFuture<'static, JoinOutcome>>();
+        let receipt = async move {
+            match receive.await {
+                Ok(original) => original.await,
+                Err(_) => JoinOutcome::Unavailable,
+            }
+        }
+        .boxed()
+        .shared();
+        {
+            let mut state = self.state.lock().map_err(|_| {
+                codex_model_provider::record_auth_task_failure(
+                    codex_model_provider::AuthTaskFailure::Unavailable,
+                );
+            })?;
+            if state.closed {
+                drop(state);
+                codex_model_provider::record_auth_task_failure(
+                    codex_model_provider::AuthTaskFailure::Refused,
+                );
+                return Err(());
+            }
+            state.compact();
+            state.tasks.push(receipt.clone());
+        }
+        Ok((attach, receipt))
+    }
+
+    /// Reserve this family BEFORE a finite external host original can be born.
+    /// Its alias awaits the same original observation; there is no spawned
+    /// async supervisor and no second account-work counter. The state lock is
+    /// released before calling the host or dropping any external observation.
+    pub fn prepare_auth_request(
+        &self,
+    ) -> Result<Option<codex_model_provider::DeferredAuthTask>, ()> {
+        let (attach, _) = self.reserve_original()?;
+        // A panic before attachment closes the sender and leaves the reserved
+        // receipt explicitly Unavailable, never a false clean empty census.
+        let (result, original): (_, BoxFuture<'static, JoinOutcome>) =
+            match codex_model_provider::prepare_deferred_auth_task() {
+                Ok(Some((request, observation))) => (
+                    Ok(Some(request)),
+                    async move {
+                        match std::panic::AssertUnwindSafe(observation)
+                            .catch_unwind()
+                            .await
+                        {
+                            Ok(Ok(())) => JoinOutcome::Joined,
+                            Ok(Err(codex_model_provider::AuthTaskFailure::Cancelled)) => {
+                                JoinOutcome::Cancelled
+                            }
+                            Ok(Err(codex_model_provider::AuthTaskFailure::Panicked)) => {
+                                JoinOutcome::Panicked
+                            }
+                            Ok(Err(_)) | Err(_) => JoinOutcome::Unavailable,
+                        }
+                    }
+                    .boxed(),
+                ),
+                Ok(None) => (Ok(None), async { JoinOutcome::Joined }.boxed()),
+                Err(_) => (Err(()), async { JoinOutcome::Unavailable }.boxed()),
+            };
+        if attach.send(original).is_err() {
+            self.worker_stop().mark_unavailable();
+            return Err(());
+        }
+        result
+    }
+
+    pub(crate) fn spawn_callback(
+        &self,
+        future: impl Future<Output = ()> + Send + 'static,
+    ) -> Result<(), ()> {
+        let runtime = Handle::try_current().map_err(|_| ())?;
+        self.spawn_callback_on(&runtime, future)
+    }
+
+    /// Callback runtime hops derive from the invoking finite scope, never from
+    /// a root captured by the reusable callback factory.
+    pub(crate) fn spawn_callback_on(
+        &self,
+        runtime: &Handle,
+        future: impl Future<Output = ()> + Send + 'static,
+    ) -> Result<(), ()> {
+        let _entered = runtime.enter();
+        match self.prepare_auth_request()? {
+            Some(request) => request.dispatch(Box::pin(future)).map_err(|failure| {
+                codex_model_provider::record_auth_task_failure(failure);
+            }),
+            None => self.spawn_on(runtime, future).map(|_| ()),
         }
     }
 
@@ -78,7 +447,8 @@ impl PluginTaskRegistry {
         &self,
         future: impl Future<Output = ()> + Send + 'static,
     ) -> Result<Receipt, ()> {
-        self.spawn_with(future, tokio::spawn)
+        let runtime = Handle::try_current().map_err(|_| ())?;
+        self.spawn_on(&runtime, future)
     }
 
     /// Spawn on an explicitly retained runtime. This is required when the
@@ -98,6 +468,7 @@ impl PluginTaskRegistry {
         F: Future<Output = ()> + Send + 'static,
         S: FnOnce(F) -> tokio::task::JoinHandle<()>,
     {
+        self.poll_originals()?;
         let mut state = self.state.lock().map_err(|_| ())?;
         if state.closed {
             return Err(());
@@ -117,33 +488,97 @@ impl PluginTaskRegistry {
         Ok(receipt)
     }
 
+    /// One-shot work has an initiating auth scope. Queue coordinators keep
+    /// spawn_thread: the first caller must not own later unrelated requests.
+    pub(crate) fn spawn_request_thread<F>(
+        &self,
+        name: &'static str,
+        thread: F,
+    ) -> Result<Receipt, ()>
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        let runtime = Handle::try_current().map_err(|_| {
+            codex_model_provider::record_auth_task_failure(
+                codex_model_provider::AuthTaskFailure::Unavailable,
+            );
+        })?;
+        let (attach, receipt) = self.reserve_original()?;
+        let stop = self.worker_stop();
+        // No family lock is held during external admission, captures' Drop,
+        // actual thread creation, or polling the physical observation.
+        let result = codex_model_provider::spawn_named_auth_thread(
+            name,
+            Box::new(move || {
+                let _entered = runtime.enter();
+                let _scope = WorkerStopScope::enter(stop);
+                thread();
+            }),
+        );
+        let admitted = result.is_ok();
+        if let Err(failure) = &result {
+            codex_model_provider::record_auth_task_failure(*failure);
+        }
+        let original = async move {
+            match result {
+                Ok(observation) => match std::panic::AssertUnwindSafe(observation)
+                    .catch_unwind()
+                    .await
+                {
+                    Ok(Ok(())) => JoinOutcome::Joined,
+                    Ok(Err(codex_model_provider::AuthTaskFailure::Cancelled)) => {
+                        JoinOutcome::Cancelled
+                    }
+                    Ok(Err(codex_model_provider::AuthTaskFailure::Panicked)) => {
+                        JoinOutcome::Panicked
+                    }
+                    Ok(Err(_)) | Err(_) => JoinOutcome::Unavailable,
+                },
+                Err(_) => JoinOutcome::Unavailable,
+            }
+        }
+        .boxed();
+        if attach.send(original).is_err() {
+            self.worker_stop().mark_unavailable();
+            return Err(());
+        }
+        if admitted { Ok(receipt) } else { Err(()) }
+    }
+
     pub(crate) fn spawn_thread<F>(&self, name: &'static str, thread: F) -> Result<Receipt, ()>
     where
         F: FnOnce() + Send + 'static,
     {
-        // Register the wrapper before starting the OS thread. Otherwise a
-        // close racing this call could leave a started thread with its only
-        // JoinHandle dropped by the failed admission path.
+        // Runtime and registry admission precede even creation of the OS
+        // thread. The retained blocking original creates AND joins it; no
+        // abortable async wrapper can drop a started thread's JoinHandle.
+        let runtime = Handle::try_current().map_err(|_| ())?;
+        self.poll_originals()?;
         let mut state = self.state.lock().map_err(|_| ())?;
         if state.closed {
             return Err(());
         }
         state.compact();
-        let handle = std::thread::Builder::new()
-            .name(name.to_owned())
-            .spawn(thread)
-            .map_err(|_| ())?;
-        let task = tokio::spawn(async move {
-            let result = tokio::task::spawn_blocking(move || handle.join()).await;
-            if !matches!(result, Ok(Ok(()))) {
-                // The wrapper itself is the retained receipt. A panic in the
-                // OS thread is terminal but diagnostic-worthy, never clean.
-                panic!("plugin worker thread failed");
+        let worker_runtime = runtime.clone();
+        let stop = self.worker_stop();
+        let task = runtime.spawn_blocking(move || {
+            match std::thread::Builder::new()
+                .name(name.to_owned())
+                .spawn(move || {
+                    let _entered = worker_runtime.enter();
+                    let _scope = WorkerStopScope::enter(stop);
+                    thread();
+                }) {
+                Ok(handle) => match handle.join() {
+                    Ok(()) => JoinOutcome::Joined,
+                    Err(_) => JoinOutcome::Panicked,
+                },
+                Err(_) => JoinOutcome::Unavailable,
             }
         });
         let receipt = async move {
             match task.await {
-                Ok(()) => JoinOutcome::Joined,
+                Ok(outcome) => outcome,
                 Err(error) if error.is_cancelled() => JoinOutcome::Cancelled,
                 Err(_) => JoinOutcome::Panicked,
             }
@@ -154,7 +589,22 @@ impl PluginTaskRegistry {
         Ok(receipt)
     }
 
+    /// Request cooperative stop even when the host cannot poll an async drain.
+    /// This closes births and keeps the first join deadline; it proves no join.
+    pub fn request_shutdown(&self, deadline: Instant) {
+        if let Ok(mut state) = self.state.lock() {
+            state.closed = true;
+            state.stop_requested = true;
+            let first_deadline = state.deadline.is_none();
+            state.deadline.get_or_insert(deadline);
+            if first_deadline {
+                state.shutdown_changed.notify_waiters();
+            }
+        }
+    }
+
     pub async fn shutdown_until(&self, deadline: Instant) -> PluginTaskDrain {
+        self.request_shutdown(deadline);
         let (deadline, tasks) = {
             let Ok(mut state) = self.state.lock() else {
                 return PluginTaskDrain {
@@ -162,11 +612,13 @@ impl PluginTaskRegistry {
                     ..Default::default()
                 };
             };
-            state.closed = true;
             let deadline = *state.deadline.get_or_insert(deadline);
             state.compact();
             (deadline, state.tasks.clone())
         };
+        // Request the stop before polling any retained original. Even an
+        // already-expired observer still takes a non-blocking join census.
+        let _ = self.poll_originals(); // A poisoned state is reported below.
         if !tasks.is_empty() && Instant::now() < deadline {
             tokio::select! {
                 biased;
@@ -185,7 +637,7 @@ impl PluginTaskRegistry {
             terminal: state.tasks.is_empty(),
             cancelled: state.cancelled,
             panicked: state.panicked,
-            unavailable: false,
+            unavailable: state.unavailable,
         }
     }
 }
@@ -197,6 +649,35 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use std::sync::atomic::Ordering;
     use tokio::time::Duration;
+
+    #[tokio::test(start_paused = true)]
+    async fn synchronous_stop_request_keeps_the_original_and_first_join_deadline() {
+        let registry = PluginTaskRegistry::default();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let receipt = registry
+            .spawn(async move {
+                let _ = released.await;
+            })
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        registry.request_shutdown(deadline);
+        assert!(registry.worker_stop().is_stopped());
+        assert!(
+            receipt.peek().is_none(),
+            "request alone is no proof of joining"
+        );
+        assert!(registry.spawn(async {}).is_err());
+        release.send(()).unwrap();
+        assert_eq!(receipt.await, JoinOutcome::Joined);
+        assert!(
+            registry
+                .shutdown_until(deadline + Duration::from_secs(30))
+                .await
+                .is_clean()
+        );
+        assert_eq!(registry.worker_stop().deadline(), Some(deadline));
+        assert!(Instant::now() < deadline);
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn close_rejects_late_task_birth_without_starting_it() {
@@ -321,11 +802,15 @@ mod tests {
         let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
         let thread_registry = registry.clone();
         let thread = std::thread::spawn(move || {
-            let _ = thread_registry
-                .spawn_on(&runtime, async move {
-                    let _ = finished_tx.send(());
-                })
-                .expect("explicit runtime should admit the task");
+            // The registry retains the join receipt; this caller observes
+            // completion through the signal below.
+            drop(
+                thread_registry
+                    .spawn_on(&runtime, async move {
+                        let _ = finished_tx.send(());
+                    })
+                    .expect("explicit runtime should admit the task"),
+            );
         });
         thread.join().expect("OS callback thread should return");
         finished_rx
@@ -335,5 +820,458 @@ mod tests {
             .shutdown_until(Instant::now() + Duration::from_secs(1))
             .await;
         assert!(report.is_clean());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stalled_worker_is_incomplete_at_the_bounded_deadline() {
+        let registry = PluginTaskRegistry::default();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        // A fake non-cooperative (a) worker: blocked, like an in-flight syscall.
+        drop(
+            registry
+                .spawn_thread("fake-stalled-plugin-worker", move || {
+                    let _ = release_rx.recv();
+                })
+                .expect("worker admission"),
+        );
+
+        let started = std::time::Instant::now();
+        let report = registry
+            .shutdown_until(Instant::now() + Duration::from_millis(100))
+            .await;
+        // Bounded drain; the join is reported incomplete, never clean.
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(!report.terminal);
+        assert!(!report.is_clean());
+        // Sticky: a later observation with a new deadline keeps the original.
+        let replay = registry
+            .shutdown_until(Instant::now() + Duration::from_secs(60))
+            .await;
+        assert!(!replay.terminal);
+
+        drop(release_tx);
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn worker_stop_requests_immediate_stop_without_extending_the_join_deadline() {
+        let registry = PluginTaskRegistry::default();
+        let stop = registry.worker_stop();
+        let cap = Duration::from_secs(30);
+        let budget = Duration::from_millis(20);
+        assert!(!stop.is_stopped());
+        assert_eq!(stop.step_timeout(cap), cap);
+
+        // Closing admission alone is not a request to interrupt existing work.
+        registry.close();
+        assert!(!stop.is_stopped());
+        let began = Instant::now();
+        let deadline = began + budget;
+        assert!(registry.shutdown_until(deadline).await.is_clean());
+        assert_eq!(Instant::now(), began);
+        assert!(stop.is_stopped());
+        assert_eq!(stop.step_timeout(cap), Duration::ZERO);
+        assert_eq!(stop.deadline(), Some(deadline));
+
+        // A later observer neither reopens work nor extends the original join budget.
+        assert!(registry.shutdown_until(began + cap).await.is_clean());
+        assert!(stop.is_stopped());
+        assert_eq!(stop.deadline(), Some(deadline));
+        assert_eq!(WorkerStop::never().step_timeout(cap), cap);
+    }
+
+    /// A fake curated-sync worker on its own OS thread. Each step waits for
+    /// the test's grant, checks the stop as the real worker does between
+    /// git/HTTP steps, and reports what it observed. The worker enters the
+    /// runtime context so `WorkerStop` reads the test's paused clock.
+    struct GatedWorker {
+        step: std::sync::mpsc::Sender<()>,
+        observed: tokio::sync::mpsc::UnboundedReceiver<bool>,
+        receipt: Receipt,
+        steps: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    fn spawn_gated_worker(registry: &PluginTaskRegistry) -> GatedWorker {
+        let clock = Handle::current();
+        let stop = registry.worker_stop();
+        let (step, step_rx) = std::sync::mpsc::channel::<()>();
+        let (observed_tx, observed) = tokio::sync::mpsc::unbounded_channel();
+        let steps = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let worker_steps = Arc::clone(&steps);
+        let receipt = registry
+            .spawn_thread("fake-curated-sync", move || {
+                let _clock = clock.enter();
+                // A closed gate means the worker's own work is complete.
+                while step_rx.recv().is_ok() {
+                    let stopped = stop.is_stopped();
+                    if !stopped {
+                        worker_steps.fetch_add(1, Ordering::SeqCst);
+                    }
+                    let _ = observed_tx.send(stopped);
+                    if stopped {
+                        return;
+                    }
+                }
+            })
+            .expect("worker admission");
+        GatedWorker {
+            step,
+            observed,
+            receipt,
+            steps,
+        }
+    }
+
+    impl GatedWorker {
+        async fn run_step(&mut self) -> bool {
+            self.step.send(()).expect("worker is waiting for a step");
+            self.observed.recv().await.expect("worker reports its step")
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_requests_worker_stop_before_the_original_join_deadline() {
+        let registry = PluginTaskRegistry::default();
+        let mut worker = spawn_gated_worker(&registry);
+        assert!(!worker.run_step().await);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let drain = registry.shutdown_until(deadline);
+        tokio::pin!(drain);
+        assert!((&mut drain).now_or_never().is_none());
+        assert!(worker.run_step().await, "shutdown must stop the next unit");
+        assert_eq!(worker.steps.load(Ordering::SeqCst), 1);
+        assert_eq!(worker.receipt.await, JoinOutcome::Joined);
+        assert!(drain.await.is_clean(), "the actual original must be joined");
+        assert!(
+            Instant::now() < deadline,
+            "stop must leave time for the join"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_interrupts_an_in_flight_owned_step_before_deadline_expiry() {
+        struct StepDrop(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for StepDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let registry = PluginTaskRegistry::default();
+        let stop = registry.worker_stop();
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let step_dropped = Arc::clone(&dropped);
+        let step = stop.run_until(Duration::from_secs(30), async move {
+            let _drop = StepDrop(step_dropped);
+            futures::future::pending::<()>().await;
+        });
+        tokio::pin!(step);
+        assert!((&mut step).now_or_never().is_none());
+        assert!(!dropped.load(Ordering::SeqCst));
+        let began = Instant::now();
+        let deadline = began + Duration::from_secs(2);
+        assert!(registry.shutdown_until(deadline).await.is_clean());
+        assert_eq!((&mut step).now_or_never(), Some(None));
+        assert!(dropped.load(Ordering::SeqCst));
+        assert_eq!(Instant::now(), began, "the join budget was not consumed");
+    }
+
+    #[test]
+    fn cooperatively_stopped_worker_no_longer_pins_runtime_drop() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .expect("runtime");
+        let registry = PluginTaskRegistry::default();
+        let budget = Duration::from_millis(200);
+        let one_ms = Duration::from_millis(1);
+        runtime.block_on(async {
+            let mut worker = spawn_gated_worker(&registry);
+            assert!(!worker.run_step().await);
+            assert!(!worker.run_step().await);
+
+            // The worker is parked between steps, unjoined, for the whole
+            // budget: the drain waits up to, and not past, the deadline.
+            let deadline = Instant::now() + budget;
+            let drain = registry.shutdown_until(deadline);
+            tokio::pin!(drain);
+            assert!((&mut drain).now_or_never().is_none());
+            tokio::time::advance(budget - one_ms).await;
+            assert!((&mut drain).now_or_never().is_none());
+            assert!(registry.worker_stop().is_stopped());
+            tokio::time::advance(one_ms).await;
+            let report = drain.await;
+            assert_eq!(Instant::now(), deadline);
+            assert!(!report.terminal);
+            assert!(!report.is_clean(), "stopped at the deadline, not completed");
+
+            // The parked worker has not observed the earlier request yet;
+            // its next stop check observes that request and it returns
+            // without doing another unit of work.
+            assert!(worker.run_step().await, "worker observes the stop");
+            assert_eq!(worker.steps.load(Ordering::SeqCst), 2);
+            assert_eq!(worker.receipt.await, JoinOutcome::Joined);
+
+            // The retained join is now observed; the latched deadline is
+            // replayed rather than extended.
+            let replay = registry
+                .shutdown_until(Instant::now() + Duration::from_secs(60))
+                .await;
+            assert!(replay.is_clean());
+            assert_eq!(Instant::now(), deadline);
+        });
+
+        // The worker returned, so the retained spawn_blocking join finished
+        // and the runtime drop does not wait on a still-running worker.
+        let dropped = std::time::Instant::now();
+        drop(runtime);
+        assert!(dropped.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn worker_joined_before_the_deadline_is_clean() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .expect("runtime");
+        let registry = PluginTaskRegistry::default();
+        runtime.block_on(async {
+            let mut worker = spawn_gated_worker(&registry);
+            assert!(!worker.run_step().await);
+
+            let deadline = Instant::now() + Duration::from_millis(200);
+            let drain = registry.shutdown_until(deadline);
+            tokio::pin!(drain);
+            assert!((&mut drain).now_or_never().is_none());
+            // The worker finishes its own work while the drain waits. The
+            // clock is never advanced, so the join precedes the deadline.
+            drop(worker.step);
+            let report = drain.await;
+            assert!(Instant::now() < deadline);
+            assert!(report.is_clean());
+            assert!(registry.worker_stop().is_stopped());
+            assert_eq!(worker.steps.load(Ordering::SeqCst), 1);
+            assert_eq!(worker.receipt.await, JoinOutcome::Joined);
+        });
+        drop(runtime);
+    }
+
+    #[test]
+    fn missing_runtime_refuses_before_async_or_os_thread_birth() {
+        let registry = PluginTaskRegistry::default();
+        let started = Arc::new(AtomicBool::new(false));
+        let thread_started = started.clone();
+        assert!(
+            registry
+                .spawn_thread("must-not-start", move || {
+                    thread_started.store(true, Ordering::SeqCst);
+                })
+                .is_err()
+        );
+        let async_started = started.clone();
+        assert!(
+            registry
+                .spawn(async move {
+                    async_started.store(true, Ordering::SeqCst);
+                })
+                .is_err()
+        );
+        assert!(!started.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn named_os_thread_panic_is_not_clean_wrapper_success() {
+        let registry = PluginTaskRegistry::default();
+        drop(
+            registry
+                .spawn_thread("panicking-plugin-original", || {
+                    panic!("synthetic plugin OS original panic");
+                })
+                .unwrap(),
+        );
+        let report = registry
+            .shutdown_until(Instant::now() + Duration::from_secs(1))
+            .await;
+        assert!(report.terminal && report.panicked && !report.is_clean());
+        assert!(registry.shutdown_until(Instant::now()).await.panicked);
+    }
+
+    #[tokio::test]
+    async fn cancelled_os_thread_observer_keeps_actual_original_join() {
+        let registry = PluginTaskRegistry::default();
+        let (started, entered) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let receipt = registry
+            .spawn_thread("observed-plugin-original", move || {
+                let _ = started.send(());
+                released.recv().expect("positive original release");
+            })
+            .unwrap();
+        entered.await.unwrap();
+        let observer = tokio::spawn(receipt);
+        observer.abort();
+        assert!(observer.await.unwrap_err().is_cancelled());
+        let deadline = Instant::now();
+        assert!(!registry.shutdown_until(deadline).await.terminal);
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let report = registry
+                    .shutdown_until(Instant::now() + Duration::from_secs(30))
+                    .await;
+                if report.terminal {
+                    assert!(report.is_clean());
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn in_flight_step_observes_shutdown_requested_after_its_first_poll() {
+        let registry = PluginTaskRegistry::default();
+        let stop = registry.worker_stop();
+        let step = stop.run_until(Duration::from_secs(30), std::future::pending::<()>());
+        tokio::pin!(step);
+        assert!(futures::poll!(step.as_mut()).is_pending());
+        let deadline = Instant::now() + Duration::from_secs(1);
+        assert!(registry.shutdown_until(deadline).await.is_clean());
+        assert_eq!(step.await, None);
+        assert!(Instant::now() < deadline);
+    }
+
+    #[tokio::test]
+    async fn expired_owner_does_not_poll_a_new_budgeted_step() {
+        let registry = PluginTaskRegistry::default();
+        let stop = registry.worker_stop();
+        assert!(registry.shutdown_until(Instant::now()).await.is_clean());
+        let polled = AtomicBool::new(false);
+        assert_eq!(
+            stop.run_until(Duration::from_secs(30), async {
+                polled.store(true, Ordering::SeqCst);
+            })
+            .await,
+            None
+        );
+        assert!(!polled.load(Ordering::SeqCst));
+    }
+    #[test]
+    fn worker_stop_scope_restores_nested_owner_after_unwind() {
+        assert!(!current_worker_stop().is_managed());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let outer = PluginTaskRegistry::default();
+        let inner = PluginTaskRegistry::default();
+        let _outer = WorkerStopScope::enter(outer.worker_stop());
+        let panic = std::panic::catch_unwind(|| {
+            let _inner = WorkerStopScope::enter(inner.worker_stop());
+            runtime.block_on(inner.shutdown_until(Instant::now()));
+            assert!(ensure_worker_running("inner").is_err());
+            panic!("synthetic scope unwind");
+        });
+        assert!(panic.is_err());
+        assert!(ensure_worker_running("restored outer").is_ok());
+        runtime.block_on(outer.shutdown_until(Instant::now()));
+        assert!(ensure_worker_running("outer").is_err());
+    }
+
+    #[tokio::test]
+    async fn actual_named_worker_inherits_runtime_and_its_exact_stop() {
+        let registry = PluginTaskRegistry::default();
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let observed = Arc::new(AtomicBool::new(false));
+        let seen = observed.clone();
+        let receipt = registry
+            .spawn_thread("inherited-stop-probe", move || {
+                assert!(Handle::try_current().is_ok());
+                assert!(current_worker_stop().is_managed());
+                assert!(ensure_worker_running("before close").is_ok());
+                entered.send(()).unwrap();
+                released.recv().unwrap();
+                seen.store(
+                    ensure_worker_running("after close").is_err(),
+                    Ordering::SeqCst,
+                );
+            })
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), started)
+            .await
+            .unwrap()
+            .unwrap();
+        let report = registry.shutdown_until(Instant::now()).await;
+        release.send(()).unwrap();
+        assert!(!report.terminal);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), receipt)
+                .await
+                .unwrap(),
+            JoinOutcome::Joined
+        );
+        assert!(observed.load(Ordering::SeqCst));
+        assert!(registry.shutdown_until(Instant::now()).await.is_clean());
+    }
+
+    #[tokio::test]
+    async fn unavailable_worker_cannot_begin_a_new_step_before_deadline() {
+        let registry = PluginTaskRegistry::default();
+        let _scope = WorkerStopScope::enter(registry.worker_stop());
+        registry.worker_stop().mark_unavailable();
+        assert!(!current_worker_stop().is_stopped());
+        assert!(
+            ensure_worker_running("next IO")
+                .unwrap_err()
+                .contains("unavailable custody")
+        );
+        drop(_scope);
+        assert!(registry.shutdown_until(Instant::now()).await.unavailable);
+    }
+
+    #[tokio::test]
+    async fn expired_worker_reader_never_polls_its_inner_read() {
+        struct ReadProbe(Arc<AtomicBool>);
+        impl std::io::Read for ReadProbe {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                self.0.store(true, Ordering::SeqCst);
+                Ok(0)
+            }
+        }
+        let registry = PluginTaskRegistry::default();
+        registry.shutdown_until(Instant::now()).await;
+        let _scope = WorkerStopScope::enter(registry.worker_stop());
+        let polled = Arc::new(AtomicBool::new(false));
+        let mut reader = WorkerRead::new(ReadProbe(polled.clone()));
+        assert!(std::io::Read::read(&mut reader, &mut [0; 4]).is_err());
+        assert!(!polled.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn worker_reader_keeps_its_birth_owner_across_scope_change() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let first = PluginTaskRegistry::default();
+        let second = PluginTaskRegistry::default();
+        let mut reader = {
+            let _scope = WorkerStopScope::enter(first.worker_stop());
+            WorkerRead::new(std::io::Cursor::new(b"ab"))
+        };
+        runtime.block_on(second.shutdown_until(Instant::now()));
+        {
+            let _scope = WorkerStopScope::enter(second.worker_stop());
+            let mut byte = [0];
+            assert_eq!(std::io::Read::read(&mut reader, &mut byte).unwrap(), 1);
+            assert_eq!(byte, [b'a']);
+        }
+        runtime.block_on(first.shutdown_until(Instant::now()));
+        assert!(std::io::Read::read(&mut reader, &mut [0]).is_err());
     }
 }

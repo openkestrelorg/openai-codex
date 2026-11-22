@@ -4,6 +4,8 @@ use codex_extension_api::ExtensionFuture;
 use codex_extension_api::ExtensionRegistryBuilder;
 use codex_extension_api::ThreadLifecycleContributor;
 use codex_extension_api::ThreadStartInput;
+use codex_protocol::capabilities::CapabilityRootLocation;
+use codex_protocol::capabilities::SelectedCapabilityRoot;
 use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::AgentStatus;
@@ -14,6 +16,8 @@ use codex_protocol::protocol::McpStartupUpdateEvent;
 use codex_protocol::protocol::RawResponseItemEvent;
 use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::TurnAbortedEvent;
+use codex_protocol::protocol::TurnEnvironmentSelection;
+use futures::FutureExt;
 use pretty_assertions::assert_eq;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
@@ -50,6 +54,7 @@ async fn forward_events_filters_private_events_before_blocked_send_is_cancelled(
         .send(Event {
             id: "full".to_string(),
             msg: EventMsg::TurnAborted(TurnAbortedEvent {
+                root_turn_id: None,
                 turn_id: Some("turn-1".to_string()),
                 started_at: None,
                 reason: TurnAbortReason::Interrupted,
@@ -85,6 +90,7 @@ async fn forward_events_filters_private_events_before_blocked_send_is_cancelled(
     }
     let visible_msg = EventMsg::RawResponseItem(RawResponseItemEvent {
         item: ResponseItem::CustomToolCall {
+            encrypted_content: None,
             id: None,
             status: None,
             call_id: "call-1".to_string(),
@@ -147,6 +153,7 @@ async fn forward_ops_preserves_submission_trace_context() {
     let submission = Submission {
         id: "sub-1".to_string(),
         op: Op::Interrupt,
+        turn_extension_init: None,
         trace: Some(codex_protocol::protocol::W3cTraceContext {
             traceparent: Some(
                 "00-1234567890abcdef1234567890abcdef-1234567890abcdef-01".to_string(),
@@ -156,6 +163,7 @@ async fn forward_ops_preserves_submission_trace_context() {
         parent_turn_id: Some("parent-turn".to_string()),
         root_turn_id: Some("root-turn".to_string()),
         residency_guard: None,
+        message_delivery: None,
     };
     tx_ops.send(submission).await.unwrap();
     drop(tx_ops);
@@ -185,38 +193,47 @@ async fn forward_ops_preserves_submission_trace_context() {
 
 #[tokio::test]
 async fn run_codex_thread_interactive_respects_pre_cancelled_spawn() {
-    let (parent_session, parent_ctx, _rx_events) =
-        crate::session::tests::make_session_and_context_with_rx().await;
-    let mut config = parent_ctx.config.as_ref().clone();
-    config.permissions.approval_policy = Constrained::allow_only(AskForApproval::Never);
-    let cancel_token = CancellationToken::new();
-    cancel_token.cancel();
-    let parent_environments = parent_ctx.initial_environments.clone();
+    for shutdown_requested in [false, true] {
+        let (parent_session, parent_ctx, _rx_events) =
+            crate::session::tests::make_session_and_context_with_rx().await;
+        if shutdown_requested {
+            parent_session
+                .services
+                .local_agent_runtime
+                .request_shutdown();
+        }
+        let mut config = parent_ctx.config.as_ref().clone();
+        config.permissions.approval_policy = Constrained::allow_only(AskForApproval::Never);
+        let cancel_token = CancellationToken::new();
+        cancel_token.cancel();
+        let parent_environments = parent_ctx.initial_environments.clone();
 
-    let result = timeout(
-        Duration::from_secs(/*secs*/ 1),
-        run_codex_thread_interactive(
-            config,
-            Arc::clone(&parent_session.services.auth_manager),
-            Arc::clone(&parent_session.services.models_manager),
-            parent_session,
-            parent_ctx,
-            parent_environments,
-            cancel_token,
-            SubAgentSource::Review,
-            codex_extension_api::SessionIsolation::Inherit,
-            /*initial_history*/ None,
-            crate::session::GitEnrichmentPolicy::Fresh,
-            codex_sandboxing::WindowsSandboxProxySettingsMode::Reconcile,
-        ),
-    )
-    .await
-    .expect("cancelled delegate spawn should not hang");
+        let result = timeout(
+            Duration::from_secs(/*secs*/ 1),
+            run_codex_thread_interactive(
+                config,
+                Arc::clone(&parent_session.services.auth_manager),
+                Arc::clone(&parent_session.services.models_manager),
+                parent_session,
+                parent_ctx,
+                parent_environments,
+                cancel_token,
+                SubAgentSource::Review,
+                codex_extension_api::SessionIsolation::Inherit,
+                /*initial_history*/ None,
+                crate::session::GitEnrichmentPolicy::Fresh,
+                codex_sandboxing::WindowsSandboxProxySettingsMode::Reconcile,
+            ),
+        )
+        .await
+        .expect("cancelled delegate spawn should not hang");
 
-    assert!(matches!(
-        result,
-        Err(err) if matches!(err.details(), CodexErrorDetails::TurnAborted)
-    ));
+        let error = result.err().expect("cancelled delegate spawn should fail");
+        assert!(
+            matches!(error.details(), CodexErrorDetails::TurnAborted),
+            "unexpected cancelled delegate spawn error (shutdown_requested={shutdown_requested}): {error}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -245,11 +262,7 @@ async fn delegate_start_analytics_honors_child_opt_out_with_enabled_parent() {
         .services
         .analytics_events_client = client.clone();
     parent_session
-        .set_app_server_client_info(
-            Some("codex-test".to_string()),
-            Some("1.0.0".to_string()),
-            /*mcp_elicitations_auto_deny*/ false,
-        )
+        .set_app_server_client_info(Some("codex-test".to_string()), Some("1.0.0".to_string()))
         .await
         .expect("set parent client metadata");
 
@@ -301,8 +314,11 @@ async fn delegate_start_analytics_honors_child_opt_out_with_enabled_parent() {
 
 #[tokio::test]
 async fn delegate_isolation_does_not_depend_on_attribution() {
-    let (mut parent_session, parent_ctx, _rx_events) =
+    let (mut parent_session, mut parent_ctx, _rx_events) =
         crate::session::tests::make_session_and_context_with_rx().await;
+    Arc::get_mut(&mut parent_ctx)
+        .expect("parent turn should be uniquely owned")
+        .disabled_plugin_ids = vec!["parent-root".to_string()];
     let thread_starts = Arc::new(AtomicUsize::new(0));
     let mut extensions = ExtensionRegistryBuilder::<Config>::new();
     extensions
@@ -311,6 +327,28 @@ async fn delegate_isolation_does_not_depend_on_attribution() {
         .expect("parent session should be uniquely owned")
         .services
         .extensions = Arc::new(extensions.build());
+
+    let request = parent_ctx
+        .initial_environments
+        .inheritable_requests()
+        .into_iter()
+        .next()
+        .expect("parent environment");
+    let root = SelectedCapabilityRoot {
+        id: "parent-root".to_string(),
+        location: CapabilityRootLocation::Environment {
+            environment_id: request.environment_id.clone(),
+            path: request.cwd.clone(),
+        },
+    };
+    parent_session
+        .services
+        .turn_environments
+        .update_selections(&[TurnEnvironmentSelection::new(
+            request,
+            std::slice::from_ref(&root),
+        )]);
+    let parent_environments = parent_session.services.turn_environments.snapshot().await;
 
     for (subagent_source, isolation, expected_thread_starts, expected_thread_source) in [
         (
@@ -340,7 +378,7 @@ async fn delegate_isolation_does_not_depend_on_attribution() {
             Arc::clone(&parent_session.services.models_manager),
             Arc::clone(&parent_session),
             Arc::clone(&parent_ctx),
-            parent_ctx.initial_environments.clone(),
+            parent_environments.clone(),
             CancellationToken::new(),
             subagent_source,
             isolation,
@@ -363,6 +401,28 @@ async fn delegate_isolation_does_not_depend_on_attribution() {
         assert_eq!(
             session.thread_config_snapshot().await.thread_source,
             Some(expected_thread_source)
+        );
+        let expected_roots = match isolation {
+            codex_extension_api::SessionIsolation::Inherit => vec![root.clone()],
+            codex_extension_api::SessionIsolation::Isolated => Vec::new(),
+        };
+        assert_eq!(session.services.selected_capability_roots, expected_roots);
+        let expected_disabled_plugins = match isolation {
+            codex_extension_api::SessionIsolation::Inherit => vec!["parent-root".to_string()],
+            codex_extension_api::SessionIsolation::Isolated => Vec::new(),
+        };
+        assert_eq!(
+            session.thread_settings_snapshot().await.disabled_plugin_ids,
+            expected_disabled_plugins,
+        );
+        assert_eq!(
+            session
+                .services
+                .turn_environments
+                .snapshot()
+                .await
+                .selected_capability_roots(),
+            expected_roots,
         );
         io.shutdown_and_wait()
             .await
@@ -403,4 +463,208 @@ async fn run_codex_thread_interactive_rejects_approval_policy_that_can_prompt() 
                     if message == "Codex delegates require approval policy `never`"
             )
     ));
+}
+
+/// Private delegates participate in tree shutdown even though they are not manager-visible.
+#[tokio::test]
+async fn tree_shutdown_waits_for_private_delegate() {
+    let (parent, context, _events) =
+        crate::session::tests::make_session_and_context_with_rx().await;
+    let mut config = context.config.as_ref().clone();
+    config.permissions.approval_policy = Constrained::allow_only(AskForApproval::Never);
+    let (_, io) = run_codex_thread_interactive(
+        config,
+        Arc::clone(&parent.services.auth_manager),
+        Arc::clone(&parent.services.models_manager),
+        Arc::clone(&parent),
+        Arc::clone(&context),
+        context.initial_environments.clone(),
+        CancellationToken::new(),
+        SubAgentSource::Review,
+        codex_extension_api::SessionIsolation::Isolated,
+        /*initial_history*/ None,
+        crate::session::GitEnrichmentPolicy::Fresh,
+        codex_sandboxing::WindowsSandboxProxySettingsMode::Reconcile,
+    )
+    .await
+    .expect("start private delegate");
+
+    let shutdown = parent.services.local_agent_runtime.request_shutdown();
+    timeout(Duration::from_secs(/*secs*/ 10), shutdown.wait())
+        .await
+        .expect("tree shutdown should wait for the private delegate")
+        .expect("private delegate should shut down cleanly");
+    assert!(io.session_loop_termination.now_or_never().is_some());
+}
+
+struct DelegateIdentityMember;
+
+impl crate::RuntimeConfigMembership for DelegateIdentityMember {
+    fn before_publication(&self, _config: &Config, _outcome: crate::ConfigRefreshOutcome) {}
+}
+
+#[derive(Default)]
+struct DelegateIdentityListener {
+    members: std::sync::Mutex<Vec<std::sync::Weak<DelegateIdentityMember>>>,
+}
+
+impl crate::RuntimeConfigChangeListener for DelegateIdentityListener {
+    fn before_runtime_config_change(&self) {}
+
+    fn register_runtime_config(
+        &self,
+        _config: &Config,
+    ) -> Option<Arc<dyn crate::RuntimeConfigMembership>> {
+        let member = Arc::new(DelegateIdentityMember);
+        self.members.lock().unwrap().push(Arc::downgrade(&member));
+        Some(member)
+    }
+}
+
+#[tokio::test]
+async fn private_delegate_registers_runtime_identity_with_its_parent_host() {
+    let (mut parent, context, _events) =
+        crate::session::tests::make_session_and_context_with_rx().await;
+    let listener = Arc::new(DelegateIdentityListener::default());
+    let host_listener: Arc<dyn crate::RuntimeConfigChangeListener> = listener.clone();
+    let gate = crate::RuntimeConfigChangeGate::default();
+    let services = &mut Arc::get_mut(&mut parent)
+        .expect("parent is uniquely owned before delegate start")
+        .services;
+    services.runtime_config_change_listener = Some(Arc::clone(&host_listener));
+    services.runtime_config_change_gate = Some(gate);
+    let mut config = context.config.as_ref().clone();
+    config.permissions.approval_policy = Constrained::allow_only(AskForApproval::Never);
+    config
+        .features
+        .set_enabled(codex_features::Feature::Plugins, false)
+        .unwrap();
+    let (session, io) = run_codex_thread_interactive(
+        config,
+        Arc::clone(&parent.services.auth_manager),
+        Arc::clone(&parent.services.models_manager),
+        Arc::clone(&parent),
+        Arc::clone(&context),
+        context.initial_environments.clone(),
+        CancellationToken::new(),
+        SubAgentSource::Review,
+        codex_extension_api::SessionIsolation::Isolated,
+        None,
+        crate::session::GitEnrichmentPolicy::Fresh,
+        codex_sandboxing::WindowsSandboxProxySettingsMode::Reconcile,
+    )
+    .await
+    .expect("start private delegate without a provider turn");
+    assert!(Arc::ptr_eq(
+        session
+            .services
+            .runtime_config_change_listener
+            .as_ref()
+            .unwrap(),
+        &host_listener
+    ));
+    assert!(session.services.runtime_config_membership.is_some());
+    {
+        let members = listener.members.lock().unwrap();
+        assert_eq!(
+            members.len(),
+            1,
+            "the direct Session::spawn path must register once"
+        );
+        assert!(members[0].upgrade().is_some());
+        drop(members);
+    }
+    io.shutdown_and_wait().await.expect("delegate shuts down");
+}
+
+#[derive(Debug)]
+struct RefusedDelegateParent {
+    store: String,
+    turn: String,
+    derived: AtomicUsize,
+}
+
+impl codex_extension_api::TurnStartAdmission for RefusedDelegateParent {
+    fn admit_turn_start(&self) -> Option<Box<dyn Send>> {
+        panic!("delegate must not acquire fresh parent admission")
+    }
+
+    fn requires_account_work(&self) -> bool {
+        true
+    }
+
+    fn derive_operation_work(
+        &self,
+        store: &codex_extension_api::ExtensionData,
+        turn: &str,
+    ) -> Result<
+        Option<Box<dyn codex_extension_api::HostOperationWork>>,
+        codex_extension_api::TurnWorkRefused,
+    > {
+        assert_eq!(store.level_id(), self.store);
+        assert_eq!(turn, self.turn);
+        self.derived.fetch_add(1, Ordering::SeqCst);
+        Err(codex_extension_api::TurnWorkRefused::Unavailable)
+    }
+}
+
+async fn refused_parent_delegate(one_shot: bool) {
+    let (mut parent, context, _events) =
+        crate::session::tests::make_session_and_context_with_rx().await;
+    let gate = Arc::new(RefusedDelegateParent {
+        store: parent.services.thread_extension_data.level_id().to_owned(),
+        turn: context.sub_id.clone(),
+        derived: AtomicUsize::new(0),
+    });
+    Arc::get_mut(&mut parent)
+        .expect("unique parent")
+        .services
+        .host_admission = Some(gate.clone());
+    let mut config = context.config.as_ref().clone();
+    config.permissions.approval_policy = Constrained::allow_only(AskForApproval::Never);
+    let result = if one_shot {
+        run_codex_thread_one_shot(
+            config,
+            parent.services.auth_manager.clone(),
+            parent.services.models_manager.clone(),
+            Vec::new(),
+            parent,
+            context,
+            CancellationToken::new(),
+            SubAgentSource::Review,
+            None,
+            None,
+        )
+        .await
+    } else {
+        run_codex_thread_interactive(
+            config,
+            parent.services.auth_manager.clone(),
+            parent.services.models_manager.clone(),
+            parent.clone(),
+            context.clone(),
+            context.initial_environments.clone(),
+            CancellationToken::new(),
+            SubAgentSource::Review,
+            codex_extension_api::SessionIsolation::Inherit,
+            None,
+            GitEnrichmentPolicy::Fresh,
+            codex_sandboxing::WindowsSandboxProxySettingsMode::Reconcile,
+        )
+        .await
+    };
+    assert!(matches!(result, Err(error)
+        if matches!(error.details(), CodexErrorDetails::Fatal(message)
+            if message == "MCP turn account work is unavailable")));
+    assert_eq!(gate.derived.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn interactive_delegate_refuses_exact_parent_work_before_construction() {
+    refused_parent_delegate(false).await;
+}
+
+#[tokio::test]
+async fn one_shot_delegate_refuses_exact_parent_work_before_construction() {
+    refused_parent_delegate(true).await;
 }

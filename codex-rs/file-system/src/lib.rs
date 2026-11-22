@@ -1,22 +1,26 @@
+mod cleanup_collector;
+pub use cleanup_collector::SandboxCleanupReceiptCollector;
 mod environment_accessor;
 mod exec_permission_profile_serde;
 mod find_up;
+mod local_logs;
+mod nfs;
 
 use bytes::Bytes;
 use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::config_types::WindowsSandboxProxySettingsMode;
+use codex_protocol::exec_output::SandboxCleanupState;
+pub use codex_protocol::exec_output::SandboxCleanupSummary;
 use codex_protocol::models::ManagedFileSystemPermissions;
 use codex_protocol::models::PermissionProfile;
-use codex_protocol::models::SandboxEnforcement;
 use codex_protocol::permissions::FileSystemAccessMode;
 use codex_protocol::permissions::FileSystemPath;
 use codex_protocol::permissions::FileSystemSandboxEntry;
 use codex_protocol::permissions::FileSystemSandboxEntryMissingPathBehavior;
-use codex_protocol::permissions::FileSystemSandboxPolicy;
 use codex_protocol::permissions::FileSystemSandboxPolicyContext;
 use codex_protocol::permissions::FileSystemSpecialPath;
 use codex_protocol::permissions::NetworkSandboxPolicy;
-use codex_protocol::protocol::SandboxPolicy;
+use codex_protocol::sandbox::SandboxOverride;
 use codex_utils_path_uri::LegacyAppPathString;
 use codex_utils_path_uri::PathUri;
 pub use environment_accessor::EnvironmentAccess;
@@ -27,6 +31,9 @@ pub use find_up::FindUpErrorPolicy;
 pub use find_up::find_nearest_ancestor_with_markers;
 pub use find_up::find_nearest_native_ancestor_with_markers;
 use futures::Stream;
+use futures::stream::BoxStream;
+pub use local_logs::LocalLogsDir;
+pub use nfs::is_nfs;
 use serde::Deserialize;
 use serde::Serialize;
 use std::future::Future;
@@ -39,6 +46,8 @@ use std::task::Poll;
 
 /// Maximum chunk size returned by [`ExecutorFileSystem::read_file_stream`].
 pub const FILE_READ_CHUNK_SIZE: usize = 1024 * 1024;
+/// Maximum decoded chunk size accepted by a streamed filesystem write.
+pub const FILE_WRITE_CHUNK_SIZE: usize = 1024 * 1024;
 /// Maximum accepted directory depth for a filesystem walk.
 pub const MAX_WALK_DEPTH: usize = 64;
 /// Maximum accepted directory count, including the walk root.
@@ -349,6 +358,9 @@ pub struct FileSystemSandboxContext {
     /// Serializes paths as executor file URIs instead of the profile's default native paths.
     #[serde(with = "exec_permission_profile_serde")]
     pub permissions: PermissionProfile,
+    /// Controller-selected override for observations, never an authorization to widen permissions.
+    #[serde(default, skip_serializing_if = "SandboxOverride::is_no_override")]
+    pub sandbox_override: SandboxOverride,
     /// Working directory on the selected executor used to interpret sandbox permissions.
     /// Required even for absolute permissions; a process may use a different working directory.
     pub cwd: PathUri,
@@ -369,29 +381,10 @@ pub struct FileSystemSandboxContext {
 }
 
 impl FileSystemSandboxContext {
-    pub fn from_legacy_sandbox_policy(
-        sandbox_policy: SandboxPolicy,
-        cwd: PathUri,
-    ) -> io::Result<Self> {
-        // Legacy policy projection materializes native roots, so convert at the receiving-host
-        // boundary while retaining the URI in the resulting sandbox context.
-        let native_cwd = cwd.to_abs_path()?;
-        let file_system_sandbox_policy =
-            FileSystemSandboxPolicy::from_legacy_sandbox_policy_for_cwd(
-                &sandbox_policy,
-                &native_cwd,
-            );
-        let permissions = PermissionProfile::from_runtime_permissions_with_enforcement(
-            SandboxEnforcement::from_legacy_sandbox_policy(&sandbox_policy),
-            &file_system_sandbox_policy,
-            NetworkSandboxPolicy::from(&sandbox_policy),
-        );
-        Ok(Self::from_permission_profile(permissions, cwd))
-    }
-
     pub fn from_permission_profile(permissions: PermissionProfile, cwd: PathUri) -> Self {
         Self {
             permissions,
+            sandbox_override: SandboxOverride::NoOverride,
             workspace_roots: vec![cwd.clone()],
             cwd,
             user_home_dir: None,
@@ -461,6 +454,8 @@ impl FileSystemSandboxContext {
 #[serde(rename_all = "camelCase")]
 pub struct WireFileSystemSandboxContext {
     permissions: ExecPermissionProfile,
+    #[serde(default, skip_serializing_if = "SandboxOverride::is_no_override")]
+    sandbox_override: SandboxOverride,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cwd: Option<PathUri>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -493,6 +488,7 @@ impl From<FileSystemSandboxContext> for WireFileSystemSandboxContext {
     fn from(sandbox: FileSystemSandboxContext) -> Self {
         let FileSystemSandboxContext {
             permissions,
+            sandbox_override,
             cwd,
             workspace_roots,
             user_home_dir,
@@ -529,6 +525,7 @@ impl From<FileSystemSandboxContext> for WireFileSystemSandboxContext {
         };
         Self {
             permissions,
+            sandbox_override,
             cwd: legacy_needs_cwd.then(|| cwd.clone()),
             workspace_roots: if legacy_needs_cwd {
                 workspace_roots.clone()
@@ -580,6 +577,7 @@ impl WireFileSystemSandboxContext {
     pub fn into_context(self, cwd: PathUri) -> FileSystemSandboxContext {
         FileSystemSandboxContext {
             permissions: self.permissions.into(),
+            sandbox_override: self.sandbox_override,
             cwd,
             workspace_roots: match self.policy_context {
                 Some(policy_context) => policy_context.workspace_roots,
@@ -599,6 +597,126 @@ pub type FileSystemResult<T> = io::Result<T>;
 /// Future returned by [`ExecutorFileSystem`] operations.
 pub type ExecutorFileSystemFuture<'a, T> =
     Pin<Box<dyn Future<Output = FileSystemResult<T>> + Send + 'a>>;
+
+/// Whether an operation ran a Linux sandbox launcher, i.e. owed a cleanup
+/// receipt. Other platform sandboxes (Seatbelt, Windows) create no synthetic
+/// mount targets and hold no cleanup custody, so they count as not launched.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SandboxLaunch {
+    /// Not known (an older executor, or a backend that cannot tell). A missing
+    /// receipt is then unproven.
+    #[default]
+    Unknown,
+    /// Positively no Linux sandbox launcher ran: no receipt is owed.
+    NotLaunched,
+    /// At least one launch ran; `sandbox_cleanup` carries the merged receipt
+    /// (`None` there means the receipt is missing, hence unproven).
+    Launched,
+}
+
+impl SandboxLaunch {
+    /// Combines the evidence of several operations: any `Unknown` keeps the
+    /// whole unproven, otherwise any launch makes it `Launched`.
+    pub fn merge(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Unknown, _) | (_, Self::Unknown) => Self::Unknown,
+            (Self::Launched, _) | (_, Self::Launched) => Self::Launched,
+            (Self::NotLaunched, Self::NotLaunched) => Self::NotLaunched,
+        }
+    }
+}
+
+/// A filesystem operation's result together with the cleanup receipt of the
+/// sandboxed helper launch(es) that served it. The receipt is independent of
+/// the result: a failed operation may carry a `Complete` receipt. `launch`
+/// tells a positive "nothing launched" apart from a missing receipt.
+#[derive(Debug)]
+pub struct FileSystemOutcome<T> {
+    pub result: FileSystemResult<T>,
+    pub sandbox_cleanup: Option<SandboxCleanupSummary>,
+    pub launch: SandboxLaunch,
+}
+
+impl<T> FileSystemOutcome<T> {
+    /// An outcome from a backend that cannot report launches (unproven).
+    pub fn without_receipt(result: FileSystemResult<T>) -> Self {
+        Self {
+            result,
+            sandbox_cleanup: None,
+            launch: SandboxLaunch::Unknown,
+        }
+    }
+
+    /// An outcome known to have run no Linux sandbox launcher.
+    pub fn not_launched(result: FileSystemResult<T>) -> Self {
+        Self {
+            result,
+            sandbox_cleanup: None,
+            launch: SandboxLaunch::NotLaunched,
+        }
+    }
+
+    /// An outcome whose launch(es) reported `sandbox_cleanup`.
+    pub fn launched(
+        result: FileSystemResult<T>,
+        sandbox_cleanup: Option<SandboxCleanupSummary>,
+    ) -> Self {
+        Self {
+            result,
+            sandbox_cleanup,
+            launch: SandboxLaunch::Launched,
+        }
+    }
+}
+
+/// Future returned by the receipt-bearing [`ExecutorFileSystem`] operations.
+pub type ExecutorFileSystemOutcomeFuture<'a, T> =
+    Pin<Box<dyn Future<Output = FileSystemOutcome<T>> + Send + 'a>>;
+
+/// Merges the cleanup receipts of several launches serving one operation.
+/// Counts add up and `joined` holds only if every launch joined. The state is
+/// the least proven one: `TimedOut` is sticky and never relabelled, then
+/// `Unreported` (no proof at all), then `Incomplete`; `Complete` only if all
+/// launches were.
+pub fn merge_sandbox_cleanup_summaries(
+    first: SandboxCleanupSummary,
+    second: SandboxCleanupSummary,
+) -> SandboxCleanupSummary {
+    fn rank(state: SandboxCleanupState) -> u8 {
+        match state {
+            SandboxCleanupState::Complete => 0,
+            SandboxCleanupState::Incomplete => 1,
+            SandboxCleanupState::Unreported => 2,
+            SandboxCleanupState::TimedOut => 3,
+        }
+    }
+    SandboxCleanupSummary {
+        state: if rank(second.state) > rank(first.state) {
+            second.state
+        } else {
+            first.state
+        },
+        reaped: first.reaped.saturating_add(second.reaped),
+        preserved_unproven: first
+            .preserved_unproven
+            .saturating_add(second.preserved_unproven),
+        host_owned: first.host_owned.saturating_add(second.host_owned),
+        handed_off: first.handed_off.saturating_add(second.handed_off),
+        timed_out: first.timed_out.saturating_add(second.timed_out),
+        joined: first.joined && second.joined,
+    }
+}
+
+/// Merges an optional receipt into an accumulated one.
+pub fn merge_optional_sandbox_cleanup(
+    accumulated: Option<SandboxCleanupSummary>,
+    next: Option<SandboxCleanupSummary>,
+) -> Option<SandboxCleanupSummary> {
+    match (accumulated, next) {
+        (Some(first), Some(second)) => Some(merge_sandbox_cleanup_summaries(first, second)),
+        (first, second) => first.or(second),
+    }
+}
 
 /// Stream of immutable chunks read from an [`ExecutorFileSystem`].
 pub struct FileSystemReadStream {
@@ -622,9 +740,151 @@ impl Stream for FileSystemReadStream {
     }
 }
 
+impl std::fmt::Debug for FileSystemReadStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FileSystemReadStream")
+            .finish_non_exhaustive()
+    }
+}
+
+impl FileSystemReadStream {
+    /// Ties the cleanup evidence of the launch that opened this file to the
+    /// stream: the returned handle resolves with it once the stream ends by
+    /// completion, error, drop or cancellation (a cancelled consumer drops the
+    /// stream). Nothing is driven in the background.
+    pub fn with_cleanup_receipt(
+        self,
+        sandbox_cleanup: Option<SandboxCleanupSummary>,
+    ) -> (Self, SandboxCleanupReceiptHandle) {
+        let (sender, receiver) = futures::channel::oneshot::channel();
+        let stream = Self::new(ReceiptOnStreamEnd {
+            inner: self,
+            sender: Some(sender),
+            sandbox_cleanup,
+        });
+        (stream, SandboxCleanupReceiptHandle { receiver })
+    }
+}
+
+/// Delivers a stream's cleanup receipt exactly once, when the stream ends.
+struct ReceiptOnStreamEnd {
+    inner: FileSystemReadStream,
+    sender: Option<futures::channel::oneshot::Sender<Option<SandboxCleanupSummary>>>,
+    sandbox_cleanup: Option<SandboxCleanupSummary>,
+}
+
+impl ReceiptOnStreamEnd {
+    fn deliver(&mut self) {
+        if let Some(sender) = self.sender.take() {
+            let _ = sender.send(self.sandbox_cleanup);
+        }
+    }
+}
+
+impl Stream for ReceiptOnStreamEnd {
+    type Item = FileSystemResult<Bytes>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        let item = Pin::new(&mut this.inner).poll_next(cx);
+        if matches!(item, Poll::Ready(None | Some(Err(_)))) {
+            this.deliver();
+        }
+        item
+    }
+}
+
+impl Drop for ReceiptOnStreamEnd {
+    fn drop(&mut self) {
+        self.deliver();
+    }
+}
+
+/// Resolves with a read stream's sandbox cleanup receipt once the stream has
+/// ended (see [`FileSystemReadStream::with_cleanup_receipt`]).
+#[derive(Debug)]
+pub struct SandboxCleanupReceiptHandle {
+    receiver: futures::channel::oneshot::Receiver<Option<SandboxCleanupSummary>>,
+}
+
+impl SandboxCleanupReceiptHandle {
+    /// A handle that is already resolved, for an open that produced no stream.
+    pub fn ready(sandbox_cleanup: Option<SandboxCleanupSummary>) -> Self {
+        let (sender, receiver) = futures::channel::oneshot::channel();
+        let _ = sender.send(sandbox_cleanup);
+        Self { receiver }
+    }
+
+    /// Waits until the stream has ended. A stream lost without delivering its
+    /// evidence is reported as unproven (`Unreported`, not joined), never as
+    /// clean.
+    pub async fn wait(self) -> Option<SandboxCleanupSummary> {
+        self.receiver.await.unwrap_or(Some(SandboxCleanupSummary {
+            state: SandboxCleanupState::Unreported,
+            reaped: 0,
+            preserved_unproven: 0,
+            host_owned: 0,
+            handed_off: 0,
+            timed_out: 0,
+            joined: false,
+        }))
+    }
+}
+
+/// A read stream (or the failure to open one) and the handle that resolves
+/// with the opening launch's cleanup receipt once the stream ends.
+#[derive(Debug)]
+pub struct ReadStreamOutcome {
+    pub result: FileSystemResult<FileSystemReadStream>,
+    pub sandbox_cleanup: SandboxCleanupReceiptHandle,
+    /// Whether opening ran a Linux sandbox launcher (known at open).
+    pub launch: SandboxLaunch,
+}
+
+impl ReadStreamOutcome {
+    /// Builds the outcome of an open whose launch produced `open_receipt`: a
+    /// stream carries it to its end; a failed open resolves it at once.
+    pub fn from_open(
+        result: FileSystemResult<FileSystemReadStream>,
+        open_receipt: Option<SandboxCleanupSummary>,
+        launch: SandboxLaunch,
+    ) -> Self {
+        match result {
+            Ok(stream) => {
+                let (stream, sandbox_cleanup) = stream.with_cleanup_receipt(open_receipt);
+                Self {
+                    result: Ok(stream),
+                    sandbox_cleanup,
+                    launch,
+                }
+            }
+            Err(error) => Self {
+                result: Err(error),
+                sandbox_cleanup: SandboxCleanupReceiptHandle::ready(open_receipt),
+                launch,
+            },
+        }
+    }
+}
+
+/// Future returned by [`ExecutorFileSystem::read_file_stream_with_receipt`].
+pub type ExecutorFileSystemReadStreamFuture<'a> =
+    Pin<Box<dyn Future<Output = ReadStreamOutcome> + Send + 'a>>;
+
 /// Abstract filesystem access used by components that may operate locally or via
 /// a remote environment.
 pub trait ExecutorFileSystem: Send + Sync {
+    /// Watches an unsandboxed observation: every `missing` path is absent and `present`
+    /// (if supplied) exists. Change, disconnection or supersession completes the receiver.
+    /// Unsupported filesystems and observations that cannot be verified return `None`.
+    fn watch_missing(
+        &self,
+        _missing: Vec<PathUri>,
+        _present: Option<PathUri>,
+    ) -> ExecutorFileSystemFuture<'_, Option<tokio::sync::oneshot::Receiver<()>>> {
+        Box::pin(async { Ok(None) })
+    }
+
     /// Resolves a path within this filesystem.
     fn canonicalize<'a>(
         &'a self,
@@ -645,6 +905,36 @@ pub trait ExecutorFileSystem: Send + Sync {
         path: &'a PathUri,
         sandbox: Option<&'a FileSystemSandboxContext>,
     ) -> ExecutorFileSystemFuture<'a, FileSystemReadStream>;
+
+    /// Replaces a regular file from a stream of bounded chunks.
+    ///
+    /// Accepts any sendable byte stream, boxed to keep this trait object-safe.
+    /// Input chunks must be nonempty and no larger than [`FILE_WRITE_CHUNK_SIZE`].
+    /// Returns the number of bytes written after closing the target. Parents must already exist.
+    /// Failure or cancellation may leave a truncated or partial target.
+    ///
+    /// Cancellation is best effort: dropping the future stops consuming input and issuing new
+    /// blocks, but an in-flight open or write may still truncate or modify the target. Dropping
+    /// does not wait for that I/O or remote handle cleanup, so a subsequent replacement may overlap
+    /// with the abandoned operation.
+    ///
+    /// Local and streaming-capable remote filesystems write one chunk at a time. For compatibility,
+    /// a remote filesystem may buffer the entire input and send one write to an older executor.
+    /// The default implementation returns `Unsupported` without consuming the input.
+    fn write_file_stream<'a>(
+        &'a self,
+        path: &'a PathUri,
+        contents: BoxStream<'a, FileSystemResult<Bytes>>,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, u64> {
+        Box::pin(async move {
+            let _ = (path, contents, sandbox);
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "filesystem does not support streaming writes",
+            ))
+        })
+    }
 
     /// Reads a file and decodes it as UTF-8 text.
     fn read_file_text<'a>(
@@ -709,4 +999,146 @@ pub trait ExecutorFileSystem: Send + Sync {
         copy_options: CopyOptions,
         sandbox: Option<&'a FileSystemSandboxContext>,
     ) -> ExecutorFileSystemFuture<'a, ()>;
+    // Receipt-bearing variants. A backend that launches sandboxed helpers
+    // overrides them to report the launches' cleanup; the defaults keep every
+    // other implementation compiling and report no receipt.
+
+    fn canonicalize_with_receipt<'a>(
+        &'a self,
+        path: &'a PathUri,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemOutcomeFuture<'a, PathUri> {
+        Box::pin(async move {
+            FileSystemOutcome::without_receipt(self.canonicalize(path, sandbox).await)
+        })
+    }
+
+    fn read_file_with_receipt<'a>(
+        &'a self,
+        path: &'a PathUri,
+        options: ReadFileOptions,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemOutcomeFuture<'a, Vec<u8>> {
+        Box::pin(async move {
+            FileSystemOutcome::without_receipt(self.read_file(path, options, sandbox).await)
+        })
+    }
+
+    fn write_file_with_receipt<'a>(
+        &'a self,
+        path: &'a PathUri,
+        contents: Vec<u8>,
+        options: WriteFileOptions,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemOutcomeFuture<'a, ()> {
+        Box::pin(async move {
+            FileSystemOutcome::without_receipt(
+                self.write_file(path, contents, options, sandbox).await,
+            )
+        })
+    }
+
+    fn create_directory_with_receipt<'a>(
+        &'a self,
+        path: &'a PathUri,
+        create_directory_options: CreateDirectoryOptions,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemOutcomeFuture<'a, ()> {
+        Box::pin(async move {
+            FileSystemOutcome::without_receipt(
+                self.create_directory(path, create_directory_options, sandbox)
+                    .await,
+            )
+        })
+    }
+
+    fn get_metadata_with_receipt<'a>(
+        &'a self,
+        path: &'a PathUri,
+        options: GetMetadataOptions,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemOutcomeFuture<'a, FileMetadata> {
+        Box::pin(async move {
+            FileSystemOutcome::without_receipt(self.get_metadata(path, options, sandbox).await)
+        })
+    }
+
+    fn read_directory_with_receipt<'a>(
+        &'a self,
+        path: &'a PathUri,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemOutcomeFuture<'a, Vec<ReadDirectoryEntry>> {
+        Box::pin(async move {
+            FileSystemOutcome::without_receipt(self.read_directory(path, sandbox).await)
+        })
+    }
+
+    fn walk_with_receipt<'a>(
+        &'a self,
+        path: &'a PathUri,
+        options: WalkOptions,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemOutcomeFuture<'a, WalkOutcome> {
+        Box::pin(async move {
+            FileSystemOutcome::without_receipt(self.walk(path, options, sandbox).await)
+        })
+    }
+
+    fn remove_with_receipt<'a>(
+        &'a self,
+        path: &'a PathUri,
+        remove_options: RemoveOptions,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemOutcomeFuture<'a, ()> {
+        Box::pin(async move {
+            FileSystemOutcome::without_receipt(self.remove(path, remove_options, sandbox).await)
+        })
+    }
+
+    fn copy_with_receipt<'a>(
+        &'a self,
+        source_path: &'a PathUri,
+        destination_path: &'a PathUri,
+        copy_options: CopyOptions,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemOutcomeFuture<'a, ()> {
+        Box::pin(async move {
+            FileSystemOutcome::without_receipt(
+                self.copy(source_path, destination_path, copy_options, sandbox)
+                    .await,
+            )
+        })
+    }
+
+    /// [`Self::read_file_stream`] plus a handle that resolves with the opening
+    /// launch's cleanup receipt once the stream ends (or at once if opening
+    /// failed). The default reports no receipt.
+    fn read_file_stream_with_receipt<'a>(
+        &'a self,
+        path: &'a PathUri,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemReadStreamFuture<'a> {
+        Box::pin(async move {
+            ReadStreamOutcome::from_open(
+                self.read_file_stream(path, sandbox).await,
+                /*open_receipt*/ None,
+                SandboxLaunch::Unknown,
+            )
+        })
+    }
+
+    /// Streaming writes preserve the upstream operation. A legacy backend
+    /// cannot prove whether it launched a helper, so its default is Unknown.
+    fn write_file_stream_with_receipt<'a>(
+        &'a self,
+        path: &'a PathUri,
+        contents: BoxStream<'a, FileSystemResult<Bytes>>,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemOutcomeFuture<'a, u64> {
+        Box::pin(async move {
+            FileSystemOutcome::without_receipt(
+                self.write_file_stream(path, contents, sandbox).await,
+            )
+        })
+    }
 }

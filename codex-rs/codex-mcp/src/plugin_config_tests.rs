@@ -1,5 +1,6 @@
 use super::PluginMcpConfigParseOutcome;
 use super::PluginMcpServerParseError;
+use super::normalize_executor_plugin_mcp_declarations;
 use super::parse_agent_plugin_mcp_config;
 use super::parse_executor_plugin_mcp_config;
 use super::parse_plugin_mcp_config;
@@ -537,9 +538,9 @@ fn stdio_server(
         required: false,
         startup_readiness: Default::default(),
         supports_parallel_tool_calls: false,
-        tool_input_schema_max_bytes: None,
         thread_identity_eligible: false,
         control_endpoint_eligible: false,
+        tool_input_schema_max_bytes: None,
         omit_tools_from: None,
         disabled_reason: None,
         startup_timeout_sec: None,
@@ -577,9 +578,9 @@ fn declared_placement_preserves_local_plugin_normalization() {
         required: false,
         startup_readiness: Default::default(),
         supports_parallel_tool_calls: false,
-        tool_input_schema_max_bytes: None,
         thread_identity_eligible: false,
         control_endpoint_eligible: false,
+        tool_input_schema_max_bytes: None,
         omit_tools_from: None,
         disabled_reason: None,
         startup_timeout_sec: None,
@@ -756,6 +757,18 @@ fn executor_environment_placement_resolves_foreign_uri_cwd() {
     .expect("parse plugin MCP config");
 
     assert_eq!(
+        normalize_executor_plugin_mcp_declarations(
+            &plugin_root,
+            BTreeMap::from([(
+                "demo".to_string(),
+                serde_json::json!({"command": "demo-mcp", "cwd": "scripts"}),
+            )]),
+            "executor-1",
+        ),
+        outcome
+    );
+
+    assert_eq!(
         outcome,
         PluginMcpConfigParseOutcome {
             servers: BTreeMap::from([(
@@ -901,9 +914,9 @@ fn local_environment_placement_preserves_http_env_references() {
                     required: false,
                     startup_readiness: Default::default(),
                     supports_parallel_tool_calls: false,
-                    tool_input_schema_max_bytes: None,
                     thread_identity_eligible: false,
                     control_endpoint_eligible: false,
+                    tool_input_schema_max_bytes: None,
                     omit_tools_from: None,
                     disabled_reason: None,
                     startup_timeout_sec: None,

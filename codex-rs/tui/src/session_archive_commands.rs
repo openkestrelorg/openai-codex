@@ -2,6 +2,8 @@
 //!
 //! The CLI commands are thin app-server clients: resolve a user-provided UUID or exact session
 //! name, then call the corresponding app-server RPC.
+//! Explicit remote session commands, including queue, leave authentication and execution to
+//! the selected server without initializing the caller's credentials or runtime.
 
 use std::io::IsTerminal;
 use std::io::Write;
@@ -11,6 +13,7 @@ use std::sync::Arc;
 
 use crate::Cli;
 use crate::app_server_session::AppServerSession;
+use crate::app_server_session::ThreadParamsMode;
 use crate::legacy_core::config::ConfigBuilder;
 use crate::legacy_core::config::ConfigOverrides;
 use crate::legacy_core::config::load_config_toml_with_layer_stack;
@@ -19,7 +22,6 @@ use crate::legacy_core::config::resolve_profile_v2_config_path;
 use crate::named_session_lookup::SessionCollection;
 use crate::named_session_lookup::display_label;
 use crate::named_session_lookup::lookup;
-use codex_app_server_client::InProcessHost;
 use codex_app_server_protocol::Thread as AppServerThread;
 use codex_arg0::Arg0DispatchPaths;
 use codex_config::CloudConfigBundleLoader;
@@ -171,7 +173,7 @@ async fn resolve_session_target(
         &[super::resume_source_kinds(
             /*include_non_interactive*/ false,
         )],
-        /*model_provider*/ None,
+        /*model_providers*/ None,
     )
     .await?
     {
@@ -246,6 +248,26 @@ pub(super) async fn start_app_server_for_session_command(
             profile_v2,
         ));
         launch_loader_overrides.user_config_profile = Some(profile_v2.clone());
+    }
+
+    if let Some(endpoint) = explicit_remote_endpoint {
+        // Validate config before connecting, but leave authentication and execution
+        // to the selected server even when this caller has workload identity set.
+        launch_loader_overrides.ignore_login_requirements = true;
+        ConfigBuilder::default()
+            .codex_home(codex_home)
+            .cli_overrides(cli_kv_overrides)
+            .loader_overrides(launch_loader_overrides)
+            .strict_config(strict_config)
+            .build()
+            .await
+            .wrap_err("failed to load config.toml")?;
+        return Ok(AppServerSession::new(
+            crate::backend_id::BackendId::new(),
+            super::connect_remote_app_server(endpoint).await?,
+            ThreadParamsMode::Remote,
+        )
+        .with_remote_cwd_override(cli.cwd.clone()));
     }
 
     let workload_identity_selected = codex_login::is_workload_identity_selected();
@@ -347,7 +369,6 @@ pub(super) async fn start_app_server_for_session_command(
             model_provider,
             codex_self_exe: arg0_paths.codex_self_exe.clone(),
             codex_linux_sandbox_exe: arg0_paths.codex_linux_sandbox_exe.clone(),
-            main_execve_wrapper_exe: arg0_paths.main_execve_wrapper_exe.clone(),
             show_raw_agent_reasoning: cli.oss.then_some(true),
             bypass_hook_trust: cli.bypass_hook_trust.then_some(true),
             ..Default::default()
@@ -370,8 +391,8 @@ pub(super) async fn start_app_server_for_session_command(
     let mut state_db = super::init_state_db_for_app_server_target(&config, &app_server_target)
         .await
         .wrap_err("failed to initialize state database")?;
-    let embedded_host = Some(Arc::new(InProcessHost::default()));
-    let app_server_result = super::start_app_server(
+    let embedded_host = Arc::new(codex_app_server_client::InProcessHost::default());
+    let app_server = super::start_app_server(
         &mut app_server_target,
         arg0_paths,
         config,
@@ -384,15 +405,15 @@ pub(super) async fn start_app_server_for_session_command(
         &mut state_db,
         environment_manager,
         embedded_network_policy,
-        embedded_host.clone(),
+        Arc::clone(&embedded_host),
     )
-    .await;
-    drop(embedded_host);
-    let app_server = app_server_result?;
-    Ok(
-        AppServerSession::new(app_server, app_server_target.thread_params_mode())
-            .with_remote_cwd_override(remote_cwd_override),
+    .await?;
+    Ok(AppServerSession::new(
+        crate::backend_id::BackendId::new(),
+        app_server,
+        app_server_target.thread_params_mode(),
     )
+    .with_remote_cwd_override(remote_cwd_override))
 }
 
 #[cfg(test)]

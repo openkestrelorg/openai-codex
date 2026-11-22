@@ -1,13 +1,24 @@
+//! Constructor registry attachment and original constructor joins remain required.
+//! Scope completion below is not a substitute for that original join.
+//!
 //! Keeps a not-yet-published session reachable if initialization fails.
 //!
 //! The construction registry owns this cell independently of the constructor
 //! future. Session only weakly references its cleanup owner, so retaining both
 //! here does not create a cycle.
+//!
+//! For a failed manager-owned start this cell also owns the start's agent-tree
+//! teardown guard. Membership is completed only after a deadline-bound cleanup
+//! observation is terminal, so upstream tree shutdown still waits for it.
 
 use super::SessionRetirementIo;
 use super::retirement::CleanupExecution;
 use super::retirement::SessionCleanupOwner;
 use super::session::Session;
+use crate::ThreadCleanupOutcome;
+use crate::ThreadLoopOutcome;
+use crate::ThreadShutdownOutcome;
+use crate::agent::control::AgentTreeTeardownGuard;
 use crate::codex_thread::ThreadRetirement;
 use crate::codex_thread::ThreadRetirementError;
 use crate::codex_thread::ThreadRetirementReport;
@@ -23,6 +34,7 @@ use std::sync::Mutex;
 use tokio::time::Instant;
 use tracing::warn;
 
+pub(crate) type RegistryDeadlineProbe = Box<dyn Fn() -> Option<Instant> + Send + Sync>;
 type PersistenceDisposalReceipt = Shared<BoxFuture<'static, bool>>;
 
 struct PreSessionPersistence {
@@ -52,6 +64,10 @@ pub(crate) struct UnpublishedSession {
 #[derive(Default)]
 pub(crate) struct SessionStartupCustody {
     state: Mutex<StartupState>,
+    /// Weak view of the owning registry's latched deadline.
+    registry_deadline: std::sync::OnceLock<RegistryDeadlineProbe>,
+    /// Permanent edge is separate from ordinary reset binding and Legacy phase.
+    shutdown_clock: std::sync::OnceLock<tokio::sync::watch::Sender<Option<Instant>>>,
     #[cfg(test)]
     pause_after_retain: Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
     #[cfg(test)]
@@ -62,8 +78,14 @@ pub(crate) struct SessionStartupCustody {
 struct StartupState {
     session: Option<UnpublishedSession>,
     persistence: Option<PreSessionPersistence>,
+    resources: Option<Arc<super::startup_resources::StartupResources>>,
+    completed_resources: Option<Arc<super::startup_resources::StartupResources>>,
     observed: Option<StartupCleanup>,
     deadline: Option<Instant>,
+    teardown: Option<AgentTreeTeardownGuard>,
+    /// Caller work (e.g. a managed lifetime's task token) kept with an
+    /// expired, unreceipted start until a terminal receipt or drop.
+    owners: Vec<Box<dyn Send>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -86,6 +108,62 @@ impl StartupCleanup {
             _ => false,
         }
     }
+
+    /// `None` while cleanup may still progress (timeout, refusal). Otherwise
+    /// the fixed failure kind to record before membership is completed.
+    fn teardown_settlement(self) -> Option<Option<&'static str>> {
+        if self.is_complete() {
+            return Some(None);
+        }
+        match self {
+            Self::NoUnpublishedSession => Some(None),
+            Self::BeforeLoop(execution) => cleanup_failure_kind(execution.into()).map(Some),
+            Self::Loop(report) => {
+                if report.session_loop == ThreadLoopOutcome::TimedOut {
+                    return None;
+                }
+                let cleanup = cleanup_failure_kind(report.cleanup)?;
+                if cleanup != "complete" {
+                    return Some(Some(cleanup));
+                }
+                Some(Some(match (report.session_loop, report.ordinary) {
+                    (ThreadLoopOutcome::Panicked, _) => "session_loop_panicked",
+                    (ThreadLoopOutcome::Cancelled, _) => "session_loop_cancelled",
+                    (_, ThreadShutdownOutcome::SubmitFailed) => "shutdown_submit_failed",
+                    (_, ThreadShutdownOutcome::TimedOut) => "shutdown_timed_out",
+                    _ => "cleanup_incomplete",
+                }))
+            }
+            Self::Refused(_) | Self::TimedOut => None,
+        }
+    }
+}
+
+/// `None` for non-terminal cleanup; `"complete"` for a clean receipt.
+fn cleanup_failure_kind(cleanup: ThreadCleanupOutcome) -> Option<&'static str> {
+    Some(match cleanup {
+        ThreadCleanupOutcome::Finished {
+            persistence_failed: false,
+        } => "complete",
+        ThreadCleanupOutcome::Finished {
+            persistence_failed: true,
+        } => "persistence_failed",
+        ThreadCleanupOutcome::Panicked => "cleanup_panicked",
+        ThreadCleanupOutcome::McpFailed => "mcp_failed",
+        ThreadCleanupOutcome::McpPrewarmFailed => "mcp_prewarm_failed",
+        ThreadCleanupOutcome::TaskJoinFailed => "task_join_failed",
+        ThreadCleanupOutcome::ConversationShutdownFailed => "conversation_shutdown_failed",
+        ThreadCleanupOutcome::CodeModeShutdownFailed => "code_mode_shutdown_failed",
+        ThreadCleanupOutcome::SandboxCleanupUnproven { timed_out: true } => {
+            "sandbox_cleanup_timed_out"
+        }
+        ThreadCleanupOutcome::SandboxCleanupUnproven { timed_out: false } => {
+            "sandbox_cleanup_unproven"
+        }
+        ThreadCleanupOutcome::TimedOut | ThreadCleanupOutcome::AuthorityUnavailable => {
+            return None;
+        }
+    })
 }
 
 #[cfg(test)]
@@ -93,6 +171,90 @@ impl StartupCleanup {
 mod tests;
 
 impl SessionStartupCustody {
+    pub(super) fn begin_resources(
+        &self,
+    ) -> Result<
+        (
+            Arc<super::startup_resources::StartupResources>,
+            super::startup_resources::StartupResourceGuard,
+        ),
+        (),
+    > {
+        let mut state = self.state.lock().map_err(|_| ())?;
+        if state.session.is_some()
+            || state.resources.is_some()
+            || state.observed.is_some()
+            || state.completed_resources.is_some()
+        {
+            return Err(());
+        }
+        // A registry can bind this cell before the constructor's first poll.
+        // Reject expired birth, and transfer an unexpired bound before effects.
+        if state
+            .deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            return Err(());
+        }
+        let (resources, guard) = super::startup_resources::StartupResources::begin();
+        if let Some(deadline) = state.deadline {
+            resources.bind_deadline(deadline).map_err(|_| ())?;
+        }
+        state.resources = Some(Arc::clone(&resources));
+        Ok((resources, guard))
+    }
+
+    pub(super) fn owns_resources(
+        &self,
+        resources: &super::startup_resources::StartupResources,
+    ) -> bool {
+        self.state.lock().is_ok_and(|state| {
+            state
+                .resources
+                .as_ref()
+                .is_some_and(|owned| std::ptr::eq(Arc::as_ptr(owned), resources))
+        })
+    }
+
+    fn early_resources(
+        &self,
+    ) -> Result<Option<Arc<super::startup_resources::StartupResources>>, ()> {
+        let state = self.state.lock().map_err(|_| ())?;
+        if state
+            .resources
+            .as_ref()
+            .is_some_and(|resources| !resources.finished())
+        {
+            return Err(());
+        }
+        Ok(if state.session.is_none() {
+            state.resources.clone()
+        } else {
+            None
+        })
+    }
+
+    fn finish_early(
+        &self,
+        persistence: StartupCleanup,
+        resources: CleanupExecution,
+    ) -> StartupCleanup {
+        let outcome = if !persistence.is_complete() {
+            persistence
+        } else {
+            StartupCleanup::BeforeLoop(resources)
+        };
+        if outcome.is_complete() {
+            if let Ok(mut state) = self.state.lock() {
+                state.completed_resources = state.resources.take();
+                state.observed = Some(outcome);
+            } else {
+                return StartupCleanup::Refused(ThreadRetirementError::AuthorityUnavailable);
+            }
+        }
+        outcome
+    }
+
     #[cfg(test)]
     pub(super) fn retain_persistence(&self, thread_id: ThreadId, live_thread: LiveThread) {
         self.retain_persistence_guard(
@@ -101,6 +263,19 @@ impl SessionStartupCustody {
                 live_thread,
             )))),
         );
+    }
+
+    /// Retain an acquisition whose disposal cannot progress while the returned
+    /// lock is held, so a test can observe exactly when disposal is driven.
+    #[cfg(test)]
+    pub(crate) async fn retain_blocked_persistence_for_test(
+        &self,
+        thread_id: ThreadId,
+    ) -> tokio::sync::OwnedMutexGuard<LiveThreadInitGuard> {
+        let guard = Arc::new(tokio::sync::Mutex::new(LiveThreadInitGuard::default()));
+        let held = Arc::clone(&guard).lock_owned().await;
+        self.retain_persistence_guard(thread_id, guard);
+        held
     }
 
     /// Retain acquisition before its first poll, not just its eventual writer.
@@ -182,10 +357,18 @@ impl SessionStartupCustody {
 
     /// Called synchronously at Session birth, before startup can await or fail.
     pub(super) fn retain(&self, session: &Arc<Session>) -> bool {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Ok(mut state) = self.state.lock() else {
+            return false;
+        };
+        if state.session.is_some()
+            || state.observed.is_some()
+            || state
+                .resources
+                .as_ref()
+                .is_some_and(|resources| !resources.matches(session))
+        {
+            return false;
+        }
         if state
             .persistence
             .as_ref()
@@ -221,21 +404,202 @@ impl SessionStartupCustody {
         }
     }
 
-    /// Publication has transferred the exact session to a CodexThread owner.
-    pub(crate) fn published(&self) {
-        let previous = self
+    /// Retain a failed manager-owned start's tree membership until this cell's
+    /// cleanup is terminal. Dropping the cell first records `GuardAbandoned`.
+    pub(crate) fn adopt_teardown(&self, mut teardown: AgentTreeTeardownGuard) {
+        let mut state = self
             .state
             .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(pending) = state.session.as_ref() {
+            teardown.set_thread_id(pending.session.thread_id);
+        }
+        let previous = state.teardown.replace(teardown);
+        drop(state);
+        drop(previous);
+    }
+
+    /// Tighten-only: a later, shorter bound (e.g. a manager deadline latched
+    /// after the constructor's own cleanup began) wins; a later, longer one
+    /// never extends the first. Once elapsed, every observation is a sticky
+    /// TimedOut that drives no work.
+    fn tighten(state: &mut StartupState, deadline: Instant) -> Instant {
+        let deadline = state
+            .deadline
+            .map_or(deadline, |current| current.min(deadline));
+        state.deadline = Some(deadline);
+        deadline
+    }
+
+    /// Clamp this cell, and an unpublished session's cleanup owner, to an
+    /// earlier deadline without starting any work.
+    pub(crate) fn tighten_deadline(&self, deadline: Instant) {
+        let (cleanup, resources) = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let deadline = Self::tighten(&mut state, deadline);
+            (
+                state
+                    .session
+                    .as_ref()
+                    .map(|pending| (Arc::clone(&pending.cleanup), deadline)),
+                state.resources.clone(),
+            )
+        };
+        if let Some(resources) = resources {
+            let _ = resources.bind_deadline(deadline);
+        }
+        if let Some((cleanup, deadline)) = cleanup {
+            // Legacy cleanup cannot accept a bound; it remains unobserved here.
+            let _ = cleanup.bind_deadline(deadline);
+        }
+    }
+
+    /// Permanent manager edge, distinct from ordinary reset/retirement binding.
+    pub(crate) fn tighten_shutdown_edge(&self, deadline: Instant) {
+        self.tighten_deadline(deadline);
+        let clock = self
+            .shutdown_clock
+            .get_or_init(|| tokio::sync::watch::channel(None).0);
+        clock.send_modify(|bound| {
+            *bound = Some(bound.map_or(deadline, |previous| previous.min(deadline)));
+        });
+        let owners = self.state.lock().ok().map(|state| {
+            (
+                state.resources.clone(),
+                state
+                    .session
+                    .as_ref()
+                    .map(|pending| Arc::clone(&pending.cleanup)),
+            )
+        });
+        if let Some((resources, cleanup)) = owners {
+            if let Some(resources) = resources {
+                resources.clamp_shutdown_edge(deadline);
+            }
+            if let Some(cleanup) = cleanup {
+                let _ = cleanup.bind_shutdown_edge_deadline(deadline);
+            }
+        }
+    }
+
+    pub(crate) fn set_registry_deadline_probe(&self, probe: RegistryDeadlineProbe) {
+        let _ = self.registry_deadline.set(probe);
+    }
+
+    /// Prove registry expiry even if no constructor arm or drain has touched
+    /// this cell yet: tighten (only) to the elapsed registry deadline, which
+    /// also binds an unpublished session's cleanup owner via bind_deadline.
+    pub(crate) fn latch_registry_expiry(&self) {
+        let Some(deadline) = self.registry_deadline.get().and_then(|probe| probe()) else {
+            return;
+        };
+        if Instant::now() >= deadline {
+            self.tighten_deadline(deadline);
+        }
+    }
+
+    /// Proven expiry: the latched bound has elapsed, so any observation is
+    /// inspection only.
+    pub(crate) fn elapsed_deadline(&self) -> Option<Instant> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state
+            .deadline
+            .filter(|deadline| Instant::now() >= *deadline)
+    }
+
+    pub(crate) fn retain_owner(&self, owner: Box<dyn Send>) {
+        self.state
+            .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .session
-            .take();
+            .owners
+            .push(owner);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn constructor_stage_for_test(&self) -> Option<(bool, bool, bool)> {
+        let state = self.state.lock().unwrap();
+        let resources = state
+            .resources
+            .as_ref()
+            .or(state.completed_resources.as_ref())?;
+        Some((
+            state.session.is_some(),
+            resources.runtime_created_for_test(),
+            resources.finished(),
+        ))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retained_for_test(&self) -> (bool, usize, bool) {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Third: whether any cleanup ran for the retained start (a persistence
+        // disposal was created or the unpublished session's cleanup finished).
+        (
+            state.teardown.is_some(),
+            state.owners.len(),
+            state
+                .persistence
+                .as_ref()
+                .is_some_and(|persistence| persistence.disposal.is_some())
+                || state
+                    .session
+                    .as_ref()
+                    .is_some_and(|pending| pending.cleanup.completed().is_some()),
+        )
+    }
+
+    /// Record any terminal failure on the retained guard, then complete it.
+    /// Non-terminal observations keep membership; nothing is detached.
+    fn settle_teardown(&self, cleanup: StartupCleanup) {
+        let Some(failure) = cleanup.teardown_settlement() else {
+            return;
+        };
+        self.complete_teardown(failure);
+    }
+
+    fn complete_teardown(&self, failure: Option<&'static str>) {
+        let (teardown, owners) = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (state.teardown.take(), std::mem::take(&mut state.owners))
+        };
+        if let Some(teardown) = teardown {
+            if let Some(kind) = failure {
+                teardown.record_shutdown_failure("startup_custody", kind);
+            }
+            teardown.complete();
+        }
+        // Retained caller work is released with the receipt, after membership.
+        drop(owners);
+    }
+
+    /// Publication has transferred the exact session to a CodexThread owner.
+    pub(crate) fn published(&self) {
+        let previous = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (state.session.take(), state.resources.take())
+        };
         drop(previous);
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.state
-            .lock()
-            .is_ok_and(|state| state.session.is_none() && state.persistence.is_none())
+        self.state.lock().is_ok_and(|state| {
+            state.session.is_none() && state.persistence.is_none() && state.resources.is_none()
+        })
     }
 
     #[expect(
@@ -285,9 +649,11 @@ impl SessionStartupCustody {
             return StartupCleanup::Refused(ThreadRetirementError::AuthorityUnavailable);
         }
         if complete {
-            state.observed = Some(StartupCleanup::BeforeLoop(CleanupExecution::Finished {
-                persistence_failed: false,
-            }));
+            if state.resources.is_none() {
+                state.observed = Some(StartupCleanup::BeforeLoop(CleanupExecution::Finished {
+                    persistence_failed: false,
+                }));
+            }
             state.persistence.take();
         }
         StartupCleanup::BeforeLoop(CleanupExecution::Finished {
@@ -308,7 +674,7 @@ impl SessionStartupCustody {
             if state.session.is_some() {
                 return None;
             }
-            let deadline = *state.deadline.get_or_insert(deadline);
+            let deadline = Self::tighten(&mut state, deadline);
             let Some(persistence) = state.persistence.as_mut() else {
                 return Some(StartupCleanup::NoUnpublishedSession);
             };
@@ -400,6 +766,59 @@ impl SessionStartupCustody {
     /// terminal. This does not relabel legacy work with a later deadline.
     pub(crate) fn shutdown_legacy(&self) -> futures::future::BoxFuture<'_, bool> {
         Box::pin(async move {
+            let clock = self
+                .shutdown_clock
+                .get_or_init(|| tokio::sync::watch::channel(None).0);
+            let mut changes = clock.subscribe();
+            let cleanup = self.shutdown_legacy_observed();
+            tokio::pin!(cleanup);
+            let complete = loop {
+                // A settled positive receipt remains observable after expiry.
+                if self.is_empty() {
+                    break true;
+                }
+                let deadline = *changes.borrow_and_update();
+                if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                    break false;
+                }
+                let expiry = async move {
+                    match deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending().await,
+                    }
+                };
+                tokio::select! {
+                    biased;
+                    changed = changes.changed() => if changed.is_err() { break false; },
+                    _ = expiry => break false,
+                    complete = &mut cleanup => break complete,
+                }
+            };
+            if complete {
+                // Only positive proof releases adopted membership here; an
+                // incomplete legacy observation keeps it with this cell.
+                self.complete_teardown(None);
+            }
+            complete
+        })
+    }
+
+    fn shutdown_legacy_observed(&self) -> futures::future::BoxFuture<'_, bool> {
+        Box::pin(async move {
+            match self.early_resources() {
+                Err(_) => return false,
+                Ok(Some(resources)) => {
+                    let (persistence, resource) = tokio::join!(
+                        self.shutdown_persistence_legacy(),
+                        resources.observe_legacy()
+                    );
+                    let persistence = StartupCleanup::BeforeLoop(CleanupExecution::Finished {
+                        persistence_failed: !persistence.unwrap_or(false),
+                    });
+                    return self.finish_early(persistence, resource).is_complete();
+                }
+                Ok(None) => {}
+            }
             if let Some(complete) = self.shutdown_persistence_legacy().await {
                 return complete;
             }
@@ -435,6 +854,7 @@ impl SessionStartupCustody {
                     let Ok(mut state) = self.state.lock() else {
                         return false;
                     };
+                    state.completed_resources = state.resources.take();
                     state.session.take()
                 };
                 drop(previous);
@@ -443,13 +863,56 @@ impl SessionStartupCustody {
         })
     }
 
-    /// Only after the constructor is terminal: cleanup must not race startup
+    /// Only after the start future is terminal: cleanup must not race startup
     /// mutating the same Session. The caller keeps this cell on incomplete proof.
+    /// A terminal observation settles adopted tree membership exactly once.
     pub(crate) fn shutdown_until(
         &self,
         deadline: Instant,
     ) -> futures::future::BoxFuture<'_, StartupCleanup> {
         Box::pin(async move {
+            let result = self.shutdown_until_observed(deadline).await;
+            self.settle_teardown(result);
+            result
+        })
+    }
+
+    fn shutdown_until_observed(
+        &self,
+        deadline: Instant,
+    ) -> futures::future::BoxFuture<'_, StartupCleanup> {
+        Box::pin(async move {
+            match self.early_resources() {
+                Err(_) => {
+                    return StartupCleanup::Refused(ThreadRetirementError::AuthorityUnavailable);
+                }
+                Ok(Some(resources)) => {
+                    let (persistence, resource) = tokio::join!(
+                        self.shutdown_persistence_until(deadline),
+                        resources.observe_until(deadline)
+                    );
+                    let resource = match resource {
+                        Ok(outcome) => outcome,
+                        Err(super::retirement::DeadlineBindingError::LegacyCleanupStarted) => {
+                            return StartupCleanup::Refused(
+                                ThreadRetirementError::LegacyCleanupStarted,
+                            );
+                        }
+                        Err(_) => {
+                            return StartupCleanup::Refused(
+                                ThreadRetirementError::AuthorityUnavailable,
+                            );
+                        }
+                    };
+                    return self.finish_early(
+                        persistence.unwrap_or(StartupCleanup::Refused(
+                            ThreadRetirementError::AuthorityUnavailable,
+                        )),
+                        resource,
+                    );
+                }
+                Ok(None) => {}
+            }
             if let Some(result) = self.shutdown_persistence_until(deadline).await {
                 return result;
             }
@@ -460,7 +923,7 @@ impl SessionStartupCustody {
                 if let Some(observed) = state.observed {
                     return observed;
                 }
-                let deadline = *state.deadline.get_or_insert(deadline);
+                let deadline = Self::tighten(&mut state, deadline);
                 let Some(pending) = state.session.as_mut() else {
                     return StartupCleanup::NoUnpublishedSession;
                 };
@@ -499,7 +962,9 @@ impl SessionStartupCustody {
                     }
                 }
             };
-            if result.is_complete() {
+            if result.teardown_settlement().is_some() {
+                // A terminal failed receipt is replayed, not re-timed, by later
+                // drains; only positive proof releases the session itself.
                 let previous = {
                     let Ok(mut state) = self.state.lock() else {
                         return StartupCleanup::Refused(
@@ -507,7 +972,12 @@ impl SessionStartupCustody {
                         );
                     };
                     state.observed = Some(result);
-                    state.session.take()
+                    if result.is_complete() {
+                        state.completed_resources = state.resources.take();
+                        state.session.take()
+                    } else {
+                        None
+                    }
                 };
                 drop(previous);
             }

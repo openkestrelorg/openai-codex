@@ -10,6 +10,8 @@ use codex_app_server_protocol::ThreadInteractiveSubscriptionChangedNotification;
 use codex_app_server_protocol::ThreadInteractiveSubscriptionEntry;
 use codex_app_server_protocol::ThreadInteractiveSubscriptionListResponse;
 use codex_app_server_protocol::ThreadItem;
+use codex_app_server_protocol::ThreadRetentionAcquireResponse;
+use codex_app_server_protocol::ThreadRetentionRefusalReason;
 use codex_app_server_protocol::ThreadSettings;
 use codex_app_server_protocol::Turn;
 use codex_app_server_protocol::TurnError;
@@ -24,11 +26,13 @@ use codex_protocol::items::AgentMessageContent as CoreAgentMessageContent;
 use codex_protocol::items::TurnItem as CoreTurnItem;
 use codex_protocol::models::MessagePhase;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::ThreadHistoryMode;
 use codex_rollout::RolloutItem;
 use codex_rollout::state_db::StateDbHandle;
 use codex_utils_path_uri::LegacyAppPathString;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::collections::hash_map::Entry;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::Weak;
@@ -40,6 +44,10 @@ use tracing::error;
 use uuid::Uuid;
 
 type PendingInterruptQueue = Vec<ConnectionRequestId>;
+
+// The unload that inserts an entry owns its removal. Dropping the sender wakes deferred
+// listener attachment only after that unload finishes cleanup.
+pub(crate) type PendingThreadUnloads = Arc<Mutex<HashMap<ThreadId, watch::Sender<()>>>>;
 
 pub(crate) mod recovery;
 mod retirement;
@@ -169,6 +177,101 @@ pub(crate) enum RetentionReleaseOutcome {
     GrantMismatch,
 }
 
+/// Opt-in retention requested by `thread/start`, `thread/resume` or
+/// `thread/fork` with `retainForConnection`. The principal is derived from the
+/// server-established session exactly as for `thread/retention/acquire`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ConnectionRetention {
+    NotRequested,
+    Refused(ThreadRetentionRefusalReason),
+    Requested(RetentionPrincipalId),
+}
+
+/// Request params paired with the retention authority the session resolved
+/// for their `retainForConnection` flag.
+#[derive(Clone, Debug)]
+pub(crate) struct RetainingParams<P> {
+    pub(crate) params: P,
+    pub(crate) retention: ConnectionRetention,
+}
+
+impl<P> RetainingParams<P> {
+    pub(crate) fn not_requested(params: P) -> Self {
+        Self {
+            params,
+            retention: ConnectionRetention::NotRequested,
+        }
+    }
+}
+
+/// A grant minted by an in-flight request, released if that request fails
+/// before its response reports the grant.
+pub(crate) type MintedRetention = (ThreadId, RetentionPrincipalId, RetentionGrantId);
+
+impl ConnectionRetention {
+    /// No grant is held because the authority was lost or revoked before the
+    /// response (a failed attach, or a clear whose subscription did not move).
+    pub(crate) fn unavailable(self) -> ConnectionRetentionOutcome {
+        self.unattempted(ThreadRetentionRefusalReason::AuthorityUnavailable)
+    }
+
+    /// The requesting connection closed, so its principal is no longer live.
+    pub(crate) fn connection_closed(self) -> ConnectionRetentionOutcome {
+        self.unattempted(ThreadRetentionRefusalReason::IneligiblePrincipal)
+    }
+
+    /// The outcome when no grant could be attempted for this request.
+    pub(crate) fn unattempted(
+        self,
+        reason: ThreadRetentionRefusalReason,
+    ) -> ConnectionRetentionOutcome {
+        match self {
+            Self::NotRequested => ConnectionRetentionOutcome::NotRequested,
+            Self::Refused(reason) => ConnectionRetentionOutcome::Refused(reason),
+            Self::Requested(_) => ConnectionRetentionOutcome::Refused(reason),
+        }
+    }
+}
+
+/// Server-side result of an atomic subscription-and-grant. It keeps the
+/// minted grant so a failed request can release exactly what it created.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ConnectionRetentionOutcome {
+    NotRequested,
+    Refused(ThreadRetentionRefusalReason),
+    Granted {
+        principal: RetentionPrincipalId,
+        outcome: Result<RetentionAcquireOutcome, RetentionAuthorityError>,
+    },
+}
+
+impl ConnectionRetentionOutcome {
+    /// Wire evidence for the response; `None` only when not requested.
+    pub(crate) fn evidence(&self) -> Option<ThreadRetentionAcquireResponse> {
+        match self {
+            Self::NotRequested => None,
+            Self::Refused(reason) => {
+                Some(ThreadRetentionAcquireResponse::Refused { reason: *reason })
+            }
+            Self::Granted { outcome, .. } => Some(
+                crate::message_processor::retention_acquire_response(outcome.clone()),
+            ),
+        }
+    }
+
+    /// A grant newly minted by this request. Pre-existing grants are never
+    /// returned, so failure cleanup cannot release another adoption's grant.
+    pub(crate) fn minted_grant(&self) -> Option<(RetentionPrincipalId, RetentionGrantId)> {
+        match self {
+            Self::Granted {
+                principal,
+                outcome: Ok(RetentionAcquireOutcome::Acquired { grant_id }),
+            } => Some((*principal, grant_id.clone())),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RetentionAuthorityError {
     IneligiblePrincipal,
@@ -197,6 +300,8 @@ pub(crate) struct PendingThreadResumeRequest {
         Option<codex_app_server_protocol::TurnsPage>,
     pub(crate) resume_cursor_store: Option<Arc<dyn codex_thread_store::ThreadStore>>,
     pub(crate) redact_resume_payloads: bool,
+    /// Installed atomically with this connection's warm-resume subscription.
+    pub(crate) retention: ConnectionRetention,
 }
 
 // ThreadListenerCommand is used to perform operations in the context of the thread listener, for serialization purposes.
@@ -231,23 +336,44 @@ pub(crate) enum ThreadListenerCommand {
     },
 }
 
+/// Retained until core resolves or withdraws the prompt, even if the client replies first.
+pub(crate) struct PendingNetworkApproval {
+    pub(crate) request_id: RequestId,
+    pub(crate) permission_guard: crate::thread_status::ThreadWatchActiveGuard,
+}
+
 /// Per-conversation accumulation of the latest states e.g. error message while a turn runs.
 #[derive(Default, Clone)]
 pub(crate) struct TurnSummary {
     pub(crate) started_at: Option<i64>,
-    pub(crate) command_execution_started: HashSet<String>,
+    pub(crate) command_start_times: HashMap<String, i64>,
     pub(crate) last_error: Option<TurnError>,
     pub(crate) last_agent_message: Option<ThreadItem>,
 }
 
+impl TurnSummary {
+    pub(crate) fn record_command_start(&mut self, item_id: String, started_at_ms: i64) -> bool {
+        if let std::collections::hash_map::Entry::Vacant(entry) =
+            self.command_start_times.entry(item_id)
+        {
+            entry.insert(started_at_ms);
+            true
+        } else {
+            false
+        }
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct ThreadState {
+    goal_resume_lock: Arc<Mutex<()>>,
     pub(crate) pending_interrupts: PendingInterruptQueue,
+    pub(crate) network_approvals: HashMap<String, PendingNetworkApproval>,
     pub(crate) turn_summary: TurnSummary,
     pub(crate) last_terminal_turn_id: Option<String>,
     /// Lets an internal runtime replacement wait until the old listener has processed Core's
     /// `ShutdownComplete` event before that listener is superseded.
-    shutdown_drain_waiter: Option<oneshot::Sender<()>>,
+    pub(crate) shutdown_drain: Option<watch::Receiver<bool>>,
     pub(crate) cancel_tx: Option<oneshot::Sender<()>>,
     pub(crate) listener_completion:
         Option<futures::future::Shared<futures::future::BoxFuture<'static, bool>>>,
@@ -256,11 +382,19 @@ pub(crate) struct ThreadState {
     last_thread_settings: Option<ThreadSettings>,
     listener_command_tx: Option<mpsc::UnboundedSender<ThreadListenerCommand>>,
     current_turn_history: ThreadHistoryBuilder,
+    history_mode: ThreadHistoryMode,
+    evict_superseded_agent_text: bool,
     listener_thread: Option<Weak<CodexThread>>,
     watch_registration: WatchRegistration,
 }
 
 impl ThreadState {
+    /// Serializes goal edits, cold resume, and terminal cleanup for this exact state.
+    pub(crate) async fn lock_goal_resume(state: &Mutex<Self>) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = Arc::clone(&state.lock().await.goal_resume_lock);
+        lock.lock_owned().await
+    }
+
     pub(crate) fn listener_matches(&self, conversation: &Arc<CodexThread>) -> bool {
         self.listener_thread
             .as_ref()
@@ -268,18 +402,32 @@ impl ThreadState {
             .is_some_and(|existing| Arc::ptr_eq(&existing, conversation))
     }
 
+    /// A shut-down runtime can still have terminal events buffered for its listener.
+    pub(crate) fn pending_shutdown_drain(&self) -> Option<watch::Receiver<bool>> {
+        let drain = self.shutdown_drain.as_ref()?;
+        let thread = self.listener_thread.as_ref()?.upgrade()?;
+        (thread.has_shutdown_status() && !*drain.borrow() && drain.has_changed().is_ok())
+            .then(|| drain.clone())
+    }
+
     pub(crate) fn set_listener(
         &mut self,
         cancel_tx: oneshot::Sender<()>,
+        shutdown_drain: watch::Receiver<bool>,
         conversation: &Arc<CodexThread>,
         watch_registration: WatchRegistration,
         thread_settings_baseline: ThreadSettings,
+        history_mode: ThreadHistoryMode,
     ) -> (mpsc::UnboundedReceiver<ThreadListenerCommand>, u64) {
         if let Some(previous) = self.cancel_tx.replace(cancel_tx) {
             let _ = previous.send(());
         }
+        self.shutdown_drain = Some(shutdown_drain);
         self.listener_generation = self.listener_generation.wrapping_add(1);
         self.last_thread_settings = Some(thread_settings_baseline);
+        self.history_mode = history_mode;
+        self.evict_superseded_agent_text =
+            history_mode == ThreadHistoryMode::Paginated && conversation.rollout_path().is_some();
         let (listener_command_tx, listener_command_rx) = mpsc::unbounded_channel();
         self.listener_command_tx = Some(listener_command_tx);
         self.listener_thread = Some(Arc::downgrade(conversation));
@@ -291,7 +439,7 @@ impl ThreadState {
         if let Some(cancel_tx) = self.cancel_tx.take() {
             let _ = cancel_tx.send(());
         }
-        self.shutdown_drain_waiter = None;
+        self.shutdown_drain = None;
         self.listener_command_tx = None;
         self.current_turn_history.reset();
         self.listener_thread = None;
@@ -329,19 +477,12 @@ impl ThreadState {
         self.current_turn_history.active_turn_metadata_snapshot()
     }
 
-    pub(crate) fn register_shutdown_drain_waiter(&mut self) -> oneshot::Receiver<()> {
-        let (completion_tx, completion_rx) = oneshot::channel();
-        self.shutdown_drain_waiter = Some(completion_tx);
-        completion_rx
-    }
-
-    pub(crate) fn take_shutdown_drain_waiter(&mut self) -> Option<oneshot::Sender<()>> {
-        self.shutdown_drain_waiter.take()
-    }
-
     pub(crate) fn track_current_turn_event(&mut self, event_turn_id: &str, event: &EventMsg) {
         if let EventMsg::TurnStarted(payload) = event {
-            self.turn_summary.started_at = payload.started_at;
+            self.turn_summary = TurnSummary {
+                started_at: payload.started_at,
+                ..Default::default()
+            };
         }
         if let EventMsg::ItemCompleted(payload) = event
             && let CoreTurnItem::AgentMessage(item) = &payload.item
@@ -350,10 +491,14 @@ impl ThreadState {
                 matches!(content, CoreAgentMessageContent::Text { text } if !text.trim().is_empty())
             })
         {
-            self.turn_summary.last_agent_message =
-                Some(ThreadItem::from(CoreTurnItem::AgentMessage(item.clone())));
+            self.turn_summary.last_agent_message = Some(ThreadItem::from(payload));
         }
-        self.current_turn_history.handle_event(event);
+        if self.evict_superseded_agent_text {
+            self.current_turn_history.handle_live_paginated_event(event);
+        } else {
+            self.current_turn_history
+                .handle_event_for_history_mode(event, self.history_mode);
+        }
         if matches!(event, EventMsg::TurnAborted(_) | EventMsg::TurnComplete(_)) {
             self.last_terminal_turn_id = Some(event_turn_id.to_string());
             if !self.current_turn_history.has_active_turn() {
@@ -403,6 +548,181 @@ pub(crate) async fn resolve_server_request_on_thread_listener(
 
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test]
+    async fn retaining_listener_install_is_atomic_and_reuses_only_its_exact_grant() {
+        let manager = ThreadStateManager::new();
+        let thread = ThreadId::new();
+        let connection = ConnectionId(1);
+        let principal = RetentionPrincipalId::connection_owned();
+        manager
+            .connection_initialized(
+                connection,
+                ConnectionCapabilities {
+                    retention_principal: Some(principal),
+                    ..Default::default()
+                },
+            )
+            .await;
+        let candidate = manager.created_listener_state(thread).await;
+        let request = Some((connection, ConnectionRetention::Requested(principal)));
+        let refused = manager
+            .subscribe_and_install_listener_retaining(
+                thread,
+                &candidate,
+                &[connection],
+                request,
+                |_| Err::<(), _>("not installed"),
+            )
+            .await;
+        assert!(matches!(refused, Err("not installed")));
+        assert!(!manager.state.lock().await.lifecycle.contains_key(&thread));
+        let (_, _, attached, outcome) = manager
+            .subscribe_and_install_listener_retaining(
+                thread,
+                &candidate,
+                &[connection],
+                request,
+                |_| Ok::<_, ()>(()),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(attached);
+        let (owner, minted) = outcome.minted_grant().expect("exact new grant");
+        assert_eq!(owner, principal);
+        let snapshot = manager.subscribe_to_retention(thread).await.unwrap();
+        assert!(
+            snapshot.borrow().granted,
+            "grant precedes listener driver publication"
+        );
+        let (_, _, _, again) = manager
+            .subscribe_and_install_listener_retaining(
+                thread,
+                &candidate,
+                &[connection],
+                request,
+                |_| Ok::<_, ()>(()),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            again.minted_grant().is_none(),
+            "pre-existing grant must not be released as new"
+        );
+        assert_eq!(
+            again.evidence(),
+            Some(ThreadRetentionAcquireResponse::AlreadyHeld {
+                grant_id: minted.into_wire(),
+            })
+        );
+        manager.remove_connection(connection).await;
+        assert!(
+            !snapshot.borrow().granted,
+            "ordinary connection close revokes its grant"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_listener_candidate_cannot_grant_retention_to_replacement_state() {
+        let manager = ThreadStateManager::new();
+        let thread = ThreadId::new();
+        let connection = ConnectionId(1);
+        let principal = RetentionPrincipalId::connection_owned();
+        manager
+            .connection_initialized(
+                connection,
+                ConnectionCapabilities {
+                    retention_principal: Some(principal),
+                    ..Default::default()
+                },
+            )
+            .await;
+        let stale = manager.created_listener_state(thread).await;
+        let replacement = manager.thread_state(thread).await;
+        assert!(!Arc::ptr_eq(stale.state(), &replacement));
+        let mut invoked = false;
+        let result = manager
+            .subscribe_and_install_listener_retaining(
+                thread,
+                &stale,
+                &[connection],
+                Some((connection, ConnectionRetention::Requested(principal))),
+                |_| {
+                    invoked = true;
+                    Ok::<_, ()>(())
+                },
+            )
+            .await
+            .unwrap();
+        assert!(result.is_none());
+        assert!(!invoked);
+        assert!(
+            !manager
+                .subscribe_to_retention(thread)
+                .await
+                .unwrap()
+                .borrow()
+                .granted
+        );
+    }
+
+    #[tokio::test]
+    async fn atomic_listener_install_preserves_upstream_failure_and_exact_subscription_identity() {
+        let manager = ThreadStateManager::new();
+        let id = ThreadId::new();
+        let connection = ConnectionId(1);
+        manager
+            .connection_initialized(
+                connection,
+                ConnectionCapabilities {
+                    trusted_interactive: true,
+                    ..Default::default()
+                },
+            )
+            .await;
+        let candidate = manager.created_listener_state(id).await;
+        let failed = manager
+            .subscribe_and_install_listener(id, &candidate, &[connection], |_| {
+                Err::<(), _>("installation refused")
+            })
+            .await;
+        assert!(matches!(failed, Err("installation refused")));
+        {
+            let state = manager.state.lock().await;
+            assert!(!state.threads.contains_key(&id));
+            assert!(!state.lifecycle.contains_key(&id));
+        }
+        assert!(
+            manager
+                .thread_interactive_subscription_list()
+                .await
+                .entries
+                .is_empty()
+        );
+        let installed = manager
+            .subscribe_and_install_listener(id, &candidate, &[connection], |attached| {
+                Ok::<_, ()>(attached)
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(installed.0 && installed.2 && *installed.1.borrow());
+        {
+            let state = manager.state.lock().await;
+            assert!(Arc::ptr_eq(&state.threads[&id].state, candidate.state()));
+            assert!(state.lifecycle[&id].is_identity(candidate.state()));
+        }
+        let first = manager.thread_interactive_subscription_list().await;
+        assert_eq!(first.entries[0].interactive_subscription_count, 1);
+        manager
+            .subscribe_and_install_listener(id, &candidate, &[connection], |_| Ok::<_, ()>(()))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(manager.thread_interactive_subscription_list().await, first);
+    }
     use super::*;
     use crate::outgoing_message::OutgoingEnvelope;
     use crate::outgoing_message::OutgoingMessage;
@@ -994,6 +1314,69 @@ mod tests {
             OutgoingMessageSender::new(outgoing_tx, AnalyticsEventsClient::disabled()),
         ));
 
+        let candidate = manager.created_listener_state(successor_thread_id).await;
+        for owner in [None, Some(ThreadId::new())] {
+            assert!(
+                manager
+                    .subscribe_and_install_listener_with_clear_owner(
+                        successor_thread_id,
+                        &candidate,
+                        &[],
+                        None,
+                        owner,
+                        |_| -> Result<(), ()> {
+                            panic!("non-owner must not install a reserved listener")
+                        },
+                    )
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert!(
+            manager
+                .subscribe_and_install_listener_with_clear_owner(
+                    successor_thread_id,
+                    &candidate,
+                    &[requester],
+                    None,
+                    Some(predecessor_thread_id),
+                    |_| -> Result<(), ()> {
+                        panic!("clear listener installation must not subscribe")
+                    },
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            manager
+                .subscribe_and_install_listener_with_clear_owner(
+                    successor_thread_id,
+                    &candidate,
+                    &[],
+                    None,
+                    Some(predecessor_thread_id),
+                    |attached| {
+                        assert!(!attached);
+                        Ok::<(), ()>(())
+                    },
+                )
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(!manager.has_subscribers(successor_thread_id).await);
+        assert_eq!(
+            manager
+                .state
+                .lock()
+                .await
+                .clear_successor_reservations
+                .get(&successor_thread_id),
+            Some(&predecessor_thread_id)
+        );
+
         assert!(matches!(
             manager
                 .try_ensure_connection_subscribed_for_listener(
@@ -1503,6 +1886,7 @@ mod tests {
     fn thread_settings(model: &str) -> ThreadSettings {
         ThreadSettings {
             disabled_plugin_ids: Vec::new(),
+            environments: Some(Vec::new()),
             cwd: AbsolutePathBuf::from_absolute_path("/tmp").expect("absolute path"),
             approval_policy: AskForApproval::OnRequest,
             approvals_reviewer: ApprovalsReviewer::User,
@@ -1527,6 +1911,293 @@ mod tests {
             personality: None,
         }
     }
+
+    #[tokio::test]
+    async fn atomic_connection_retention_is_installed_with_the_subscription() {
+        let manager = ThreadStateManager::new();
+        let thread_id = ThreadId::new();
+        let principal = RetentionPrincipalId::connection_owned();
+        let connection = ConnectionId(1);
+        manager
+            .connection_initialized(
+                connection,
+                ConnectionCapabilities {
+                    retention_principal: Some(principal),
+                    ..ConnectionCapabilities::default()
+                },
+            )
+            .await;
+
+        let retained = manager
+            .try_add_connection_to_thread_retaining(
+                thread_id,
+                connection,
+                ConnectionRetention::Requested(principal),
+            )
+            .await
+            .expect("live connection subscribes");
+        let Some((minted_principal, grant_id)) = retained.minted_grant() else {
+            panic!("requested retention must mint a grant: {retained:?}");
+        };
+        assert_eq!(minted_principal, principal);
+        assert_eq!(
+            retained.evidence(),
+            Some(ThreadRetentionAcquireResponse::Acquired {
+                grant_id: grant_id.clone().into_wire(),
+            })
+        );
+        // The lifecycle row is granted before any listener could arm unload.
+        assert!(
+            manager
+                .subscribe_to_retention(thread_id)
+                .await
+                .expect("lifecycle row")
+                .borrow()
+                .granted
+        );
+        assert_eq!(
+            manager.acquire_retention(thread_id, principal).await,
+            Ok(RetentionAcquireOutcome::AlreadyHeld { grant_id })
+        );
+
+        // Without the flag nothing is granted and no evidence is produced.
+        let passive = ThreadId::new();
+        assert_eq!(
+            manager
+                .try_add_connection_to_thread_retaining(
+                    passive,
+                    connection,
+                    ConnectionRetention::NotRequested,
+                )
+                .await
+                .expect("live connection subscribes"),
+            ConnectionRetentionOutcome::NotRequested
+        );
+        assert!(
+            !manager
+                .subscribe_to_retention(passive)
+                .await
+                .expect("lifecycle row")
+                .borrow()
+                .granted
+        );
+
+        // Failure before publication removes observation state, which revokes
+        // the grant; a later incarnation mints a fresh one.
+        manager.remove_thread_state(thread_id).await;
+        manager.thread_state(thread_id).await;
+        assert!(matches!(
+            manager.acquire_retention(thread_id, principal).await,
+            Ok(RetentionAcquireOutcome::Acquired { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn atomic_connection_retention_never_outlives_its_connection() {
+        let manager = ThreadStateManager::new();
+        let thread_id = ThreadId::new();
+        let principal = RetentionPrincipalId::connection_owned();
+        let connection = ConnectionId(1);
+        let closed_principal = RetentionPrincipalId::connection_owned();
+        let closed = ConnectionId(2);
+        for (connection, principal) in [(connection, principal), (closed, closed_principal)] {
+            manager
+                .connection_initialized(
+                    connection,
+                    ConnectionCapabilities {
+                        retention_principal: Some(principal),
+                        ..ConnectionCapabilities::default()
+                    },
+                )
+                .await;
+        }
+
+        // Closed before the request reaches the lifecycle lock: refused.
+        manager.remove_connection(closed).await;
+        assert!(matches!(
+            manager
+                .try_add_connection_to_thread_retaining(
+                    thread_id,
+                    closed,
+                    ConnectionRetention::Requested(closed_principal),
+                )
+                .await,
+            Err(ConnectionSubscriptionError::ConnectionClosed)
+        ));
+
+        // Closed after the grant: the ordinary revocation removes it.
+        let retained = manager
+            .try_add_connection_to_thread_retaining(
+                thread_id,
+                connection,
+                ConnectionRetention::Requested(principal),
+            )
+            .await
+            .expect("live connection subscribes");
+        assert!(retained.minted_grant().is_some());
+        manager.remove_connection(connection).await;
+        {
+            let state = manager.state.lock().await;
+            assert!(
+                state
+                    .retention_grants_by_thread
+                    .get(&thread_id)
+                    .is_none_or(HashMap::is_empty)
+            );
+            assert!(
+                !state
+                    .retention_threads_by_principal
+                    .contains_key(&principal)
+            );
+        }
+        assert!(
+            !manager
+                .subscribe_to_retention(thread_id)
+                .await
+                .expect("lifecycle row")
+                .borrow()
+                .granted
+        );
+    }
+
+    #[tokio::test]
+    async fn atomic_connection_retention_refuses_ineligible_requests_explicitly() {
+        let manager = ThreadStateManager::new();
+        let thread_id = ThreadId::new();
+        let principal = RetentionPrincipalId::connection_owned();
+        let foreign_principal = RetentionPrincipalId::connection_owned();
+        let unclassified = RetentionPrincipalId::unclassified();
+        for (connection, principal) in [
+            (ConnectionId(1), principal),
+            (ConnectionId(2), foreign_principal),
+            (ConnectionId(3), unclassified),
+        ] {
+            manager
+                .connection_initialized(
+                    connection,
+                    ConnectionCapabilities {
+                        retention_principal: Some(principal),
+                        ..ConnectionCapabilities::default()
+                    },
+                )
+                .await;
+        }
+        let refused = |reason| Some(ThreadRetentionAcquireResponse::Refused { reason });
+
+        // Session-level ineligibility is reported, not silently skipped.
+        let session_refused = manager
+            .try_add_connection_to_thread_retaining(
+                thread_id,
+                ConnectionId(1),
+                ConnectionRetention::Refused(ThreadRetentionRefusalReason::IneligiblePrincipal),
+            )
+            .await
+            .expect("live connection subscribes");
+        assert_eq!(
+            session_refused.evidence(),
+            refused(ThreadRetentionRefusalReason::IneligiblePrincipal)
+        );
+        // Another live connection's principal is never accepted.
+        let foreign = manager
+            .try_add_connection_to_thread_retaining(
+                thread_id,
+                ConnectionId(1),
+                ConnectionRetention::Requested(foreign_principal),
+            )
+            .await
+            .expect("live connection subscribes");
+        assert_eq!(foreign.minted_grant(), None);
+        assert_eq!(
+            foreign.evidence(),
+            refused(ThreadRetentionRefusalReason::IneligiblePrincipal)
+        );
+        // An unclassified principal fails closed exactly as acquisition does.
+        let unavailable = manager
+            .try_add_connection_to_thread_retaining(
+                thread_id,
+                ConnectionId(3),
+                ConnectionRetention::Requested(unclassified),
+            )
+            .await
+            .expect("live connection subscribes");
+        assert_eq!(
+            unavailable.evidence(),
+            refused(ThreadRetentionRefusalReason::AuthorityUnavailable)
+        );
+        assert!(
+            !manager
+                .subscribe_to_retention(thread_id)
+                .await
+                .expect("lifecycle row")
+                .borrow()
+                .granted
+        );
+    }
+
+    #[tokio::test]
+    async fn retention_install_after_connection_revoke_leaves_no_grant() {
+        let manager = ThreadStateManager::new();
+        let thread_id = ThreadId::new();
+        let principal = RetentionPrincipalId::connection_owned();
+        let connection = ConnectionId(1);
+        manager
+            .connection_initialized(
+                connection,
+                ConnectionCapabilities {
+                    retention_principal: Some(principal),
+                    ..ConnectionCapabilities::default()
+                },
+            )
+            .await;
+        // The clear successor exists but is not yet subscribed by the requester.
+        manager.thread_state(thread_id).await;
+        // Session eligibility already passed when the request was dispatched.
+        let retention = ConnectionRetention::Requested(principal);
+        // The connection closes and its revocation runs before the install.
+        manager.remove_connection(connection).await;
+
+        let outcome = manager
+            .grant_connection_retention(thread_id, connection, retention)
+            .await;
+        assert_eq!(
+            outcome,
+            ConnectionRetentionOutcome::Granted {
+                principal,
+                outcome: Err(RetentionAuthorityError::IneligiblePrincipal),
+            }
+        );
+        assert_eq!(outcome.minted_grant(), None);
+        assert!(matches!(
+            manager
+                .try_add_connection_to_thread_retaining(thread_id, connection, retention)
+                .await,
+            Err(ConnectionSubscriptionError::ConnectionClosed)
+        ));
+        assert!(matches!(
+            manager
+                .try_ensure_connection_subscribed_for_listener_retaining(
+                    thread_id, connection, /*experimental_raw_events*/ false, retention,
+                )
+                .await,
+            Err(ConnectionSubscriptionError::ConnectionClosed)
+        ));
+        assert_eq!(
+            manager.acquire_retention(thread_id, principal).await,
+            Err(RetentionAuthorityError::IneligiblePrincipal)
+        );
+        let state = manager.state.lock().await;
+        assert!(
+            state
+                .retention_grants_by_thread
+                .get(&thread_id)
+                .is_none_or(HashMap::is_empty)
+        );
+        assert!(
+            !state
+                .retention_threads_by_principal
+                .contains_key(&principal)
+        );
+    }
 }
 
 struct ThreadEntry {
@@ -1537,15 +2208,19 @@ struct ThreadEntry {
 
 impl Default for ThreadEntry {
     fn default() -> Self {
-        Self {
-            state: Arc::new(Mutex::new(ThreadState::default())),
-            connection_ids: HashSet::new(),
-            has_connections_watcher: watch::channel(false).0,
-        }
+        Self::new(Arc::new(Mutex::new(ThreadState::default())))
     }
 }
 
 impl ThreadEntry {
+    fn new(state: Arc<Mutex<ThreadState>>) -> Self {
+        Self {
+            state,
+            connection_ids: HashSet::new(),
+            has_connections_watcher: watch::channel(false).0,
+        }
+    }
+
     fn update_has_connections(&self) {
         let _ = self.has_connections_watcher.send_if_modified(|current| {
             let prev = *current;
@@ -1568,7 +2243,9 @@ struct ThreadStateManagerInner {
     // neither survive its principal nor be released by another principal.
     retention_grants_by_thread: HashMap<ThreadId, HashMap<RetentionPrincipalId, RetentionGrantId>>,
     retention_threads_by_principal: HashMap<RetentionPrincipalId, HashSet<ThreadId>>,
-    clear_transition_reservations: HashSet<ThreadId>,
+    // Keyed by predecessor; each records the exact observation entry the
+    // clear reserved, so a stale same-id incarnation is never fenced by it.
+    clear_transition_reservations: HashMap<ThreadId, ClearReservation>,
     // B is disclosed to the requester before the durable A -> B subscription
     // move completes. Keep it unavailable to ordinary subscribe/resume until
     // that single atomic move consumes the predecessor subscription.
@@ -1578,6 +2255,33 @@ struct ThreadStateManagerInner {
     interactive_subscription_counts: HashMap<ThreadId, u32>,
 }
 
+/// One held clear reservation: the exact observation entry it fences plus a
+/// per-reservation token whose `Arc` identity is the exact-reservation key.
+struct ClearReservation {
+    identity: Weak<Mutex<ThreadState>>,
+    token: Arc<ClearReservationToken>,
+}
+
+/// Lock-free state a guard records on its own reservation from `Drop`.
+#[derive(Default)]
+struct ClearReservationToken {
+    /// Admitted clear work ended without a proven join (its future was
+    /// dropped mid-clear). Retained for the life of this process and reported
+    /// incomplete at shutdown; never paired with `pending_release`.
+    unproven: std::sync::atomic::AtomicBool,
+    /// Proven pre-work cancellation whose `Drop` could not take the manager
+    /// mutex. The next ordinary path that holds it consumes this flag and
+    /// releases exactly this reservation (`consume_pending_clear_release`).
+    pending_release: std::sync::atomic::AtomicBool,
+}
+
+/// What a successful clear reservation hands to its guard.
+struct ReservedClear {
+    identity: Weak<Mutex<ThreadState>>,
+    token: Arc<ClearReservationToken>,
+    wake: Option<Arc<tokio::sync::Notify>>,
+}
+
 #[derive(Debug)]
 pub(crate) enum ConnectionSubscriptionError {
     ConnectionClosed,
@@ -1585,6 +2289,89 @@ pub(crate) enum ConnectionSubscriptionError {
 }
 
 impl ThreadStateManagerInner {
+    /// Validation and reservation share this mutex transaction, as does the
+    /// snapshot publication that disarms idle unload for the exact entry.
+    fn reserve_clear_transition_locked(
+        &mut self,
+        predecessor_thread_id: ThreadId,
+        connection_id: ConnectionId,
+    ) -> Result<ReservedClear, ClearTransitionAuthorityError> {
+        // A deferred pre-work release of the previous reservation is consumed
+        // first, so it never blocks (or leaks into) a new clear.
+        self.consume_pending_clear_release(predecessor_thread_id);
+        let Some(thread_entry) = self.threads.get(&predecessor_thread_id) else {
+            return Err(ClearTransitionAuthorityError::UnknownPredecessor);
+        };
+        if !thread_entry.connection_ids.contains(&connection_id) {
+            return Err(ClearTransitionAuthorityError::NotSubscribed);
+        }
+        let identity = Arc::downgrade(&thread_entry.state);
+        if self
+            .clear_transition_reservations
+            .contains_key(&predecessor_thread_id)
+        {
+            return Err(ClearTransitionAuthorityError::TransitionConflict);
+        }
+        let token = Arc::new(ClearReservationToken::default());
+        self.clear_transition_reservations.insert(
+            predecessor_thread_id,
+            ClearReservation {
+                identity: identity.clone(),
+                token: Arc::clone(&token),
+            },
+        );
+        self.publish_clear_hold(predecessor_thread_id);
+        let wake = self
+            .lifecycle
+            .get(&predecessor_thread_id)
+            .map(retirement::RetentionLifecycle::clear_wake);
+        Ok(ReservedClear {
+            identity,
+            token,
+            wake,
+        })
+    }
+
+    /// Removes the reservation only if it is still the exact one `token`
+    /// identifies (same entry and same reservation), then re-arms idle unload.
+    fn release_exact_clear_reservation(
+        &mut self,
+        thread_id: ThreadId,
+        identity: &Weak<Mutex<ThreadState>>,
+        token: &Arc<ClearReservationToken>,
+    ) -> bool {
+        if !self
+            .clear_transition_reservations
+            .get(&thread_id)
+            .is_some_and(|held| held.identity.ptr_eq(identity) && Arc::ptr_eq(&held.token, token))
+        {
+            return false;
+        }
+        self.clear_transition_reservations.remove(&thread_id);
+        self.publish_clear_hold(thread_id);
+        true
+    }
+
+    /// Consumes a deferred pre-work release, under this mutex. Only the flag
+    /// on the reservation currently held for `thread_id` counts: a flag left
+    /// on an older reservation's token can never release a newer one.
+    fn consume_pending_clear_release(&mut self, thread_id: ThreadId) -> bool {
+        if !self
+            .clear_transition_reservations
+            .get(&thread_id)
+            .is_some_and(|held| {
+                held.token
+                    .pending_release
+                    .load(std::sync::atomic::Ordering::Acquire)
+            })
+        {
+            return false;
+        }
+        self.clear_transition_reservations.remove(&thread_id);
+        self.publish_clear_hold(thread_id);
+        true
+    }
+
     fn ensure_thread_entry(&mut self, thread_id: ThreadId) -> &mut ThreadEntry {
         match self.threads.entry(thread_id) {
             std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
@@ -1596,6 +2383,97 @@ impl ThreadStateManagerInner {
                 entry.insert(thread)
             }
         }
+    }
+
+    /// The exact authority checks of `thread/retention/acquire`. Every grant,
+    /// explicit or atomic with a subscription, is installed only here.
+    fn grant_retention_locked(
+        &mut self,
+        thread_id: ThreadId,
+        principal: RetentionPrincipalId,
+    ) -> Result<RetentionAcquireOutcome, RetentionAuthorityError> {
+        if !self.retention_principal_is_live(principal) {
+            return Err(RetentionAuthorityError::IneligiblePrincipal);
+        }
+        match principal.owner() {
+            RetentionPrincipalOwner::ConnectionOwned => {}
+            RetentionPrincipalOwner::Unclassified => {
+                return Err(RetentionAuthorityError::AuthorityUnavailable);
+            }
+            RetentionPrincipalOwner::ThreadOwned(owner) if owner == thread_id => {
+                return Err(RetentionAuthorityError::SelfRetention);
+            }
+            RetentionPrincipalOwner::ThreadOwned(_) => {}
+        }
+        if !self.threads.contains_key(&thread_id) {
+            return Err(RetentionAuthorityError::UnknownThread);
+        }
+
+        let record = self
+            .lifecycle
+            .get(&thread_id)
+            .ok_or(RetentionAuthorityError::AuthorityUnavailable)?;
+        if record.is_retiring() {
+            return Err(RetentionAuthorityError::LifecycleClosed);
+        }
+
+        let grants = self
+            .retention_grants_by_thread
+            .entry(thread_id)
+            .or_default();
+        if let Some(grant_id) = grants.get(&principal) {
+            return Ok(RetentionAcquireOutcome::AlreadyHeld {
+                grant_id: grant_id.clone(),
+            });
+        }
+
+        let grant_id = RetentionGrantId::new();
+        grants.insert(principal, grant_id.clone());
+        self.retention_threads_by_principal
+            .entry(principal)
+            .or_default()
+            .insert(thread_id);
+        self.publish_retention(thread_id);
+        record_retention_action(thread_id, principal, RetentionAction::Acquired);
+        Ok(RetentionAcquireOutcome::Acquired { grant_id })
+    }
+
+    /// Opt-in retention installed in the same critical section that subscribes
+    /// `connection_id`. The principal must be that live connection's own
+    /// server-minted identity, and the lifecycle row must belong to the exact
+    /// observation entry being subscribed: a row kept for another incarnation
+    /// (for example a retiring row with a sticky report) is never adopted.
+    fn grant_connection_retention_locked(
+        &mut self,
+        thread_id: ThreadId,
+        connection_id: ConnectionId,
+        retention: ConnectionRetention,
+    ) -> ConnectionRetentionOutcome {
+        let principal = match retention {
+            ConnectionRetention::NotRequested => return ConnectionRetentionOutcome::NotRequested,
+            ConnectionRetention::Refused(reason) => {
+                return ConnectionRetentionOutcome::Refused(reason);
+            }
+            ConnectionRetention::Requested(principal) => principal,
+        };
+        let outcome = if self
+            .live_connections
+            .get(&connection_id)
+            .and_then(|capabilities| capabilities.retention_principal)
+            != Some(principal)
+        {
+            Err(RetentionAuthorityError::IneligiblePrincipal)
+        } else if self
+            .threads
+            .get(&thread_id)
+            .zip(self.lifecycle.get(&thread_id))
+            .is_some_and(|(entry, record)| !record.is_identity(&entry.state))
+        {
+            Err(RetentionAuthorityError::AuthorityUnavailable)
+        } else {
+            self.grant_retention_locked(thread_id, principal)
+        };
+        ConnectionRetentionOutcome::Granted { principal, outcome }
     }
 
     fn retention_principal_is_live(&self, principal: RetentionPrincipalId) -> bool {
@@ -1744,6 +2622,130 @@ pub(crate) enum ClearTransitionAuthorityError {
     TransitionConflict,
 }
 
+/// Why the authoritative A -> B clear subscription move did not happen.
+/// Only `ConnectionClosed` is evidence that the requester disconnected.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ClearSubscriptionMoveRefusal {
+    /// The requester is no longer in `live_connections`.
+    ConnectionClosed,
+    /// The predecessor's observation entry is gone (retired or removed).
+    PredecessorUnavailable,
+    /// The live requester is no longer subscribed to the predecessor.
+    NotSubscribedToPredecessor,
+    /// The live requester is already subscribed to the successor.
+    AlreadySubscribedToSuccessor,
+    /// A trusted interactive requester's predecessor count is missing.
+    InteractiveSubscriptionMissing,
+}
+
+/// Custody of one exact clear reservation.
+///
+/// `release` frees it, and the clear calls that only after its own future has
+/// run to a return: completion, or a refusal whose awaited work (hook
+/// children, DB writes) has itself returned.
+///
+/// Dropping an armed guard distinguishes two cases by the `begin_work` stage
+/// marker, which the clear sets immediately before its first clear work (the
+/// durable transition reservation, then hooks and the subscription move):
+/// - No work began: nothing can be in flight, so the drop releases the exact
+///   reservation inline if the manager mutex is free (its critical sections
+///   never await). If it is contended, the drop sets `pending_release` on its
+///   own reservation token and wakes the thread's listener; the next ordinary
+///   path holding the mutex (that listener's wake, an idle or resume claim,
+///   or a new clear reservation) consumes it and releases exactly this
+///   reservation, re-arming idle unload. No task is spawned and nothing polls.
+/// - Admitted work began: the drop is not proof that hook children or DB
+///   writes stopped, so the reservation and the predecessor's idle fence are
+///   retained and marked unproven, with no lock, task, or polling. Nothing
+///   releases it in-process; host shutdown reports it incomplete without
+///   waiting (`ThreadRequestProcessor::shutdown_threads`). A process restart
+///   only ends this in-memory reservation; it neither proves nor reconciles
+///   the interrupted clear's effects, which keep the existing durable
+///   clear/resume behaviour.
+pub(crate) struct ClearTransitionAuthorityGuard {
+    manager: ThreadStateManager,
+    thread_id: ThreadId,
+    identity: Weak<Mutex<ThreadState>>,
+    token: Arc<ClearReservationToken>,
+    wake: Option<Arc<tokio::sync::Notify>>,
+    work_started: bool,
+    armed: bool,
+}
+
+impl ClearTransitionAuthorityGuard {
+    /// Stage marker: positively records that clear work is about to begin.
+    /// From here on a drop without `release` retains the reservation.
+    pub(crate) fn begin_work(&mut self) {
+        self.work_started = true;
+    }
+
+    /// Called only after the clear's own future has returned. Disarms only
+    /// once the manager mutex is held, so a release cancelled while waiting
+    /// for it still leaves the reservation retained and marked unproven.
+    pub(crate) async fn release(mut self) -> bool {
+        let manager = self.manager.clone();
+        let mut state = manager.state.lock().await;
+        self.armed = false;
+        state.release_exact_clear_reservation(self.thread_id, &self.identity, &self.token)
+    }
+}
+
+impl Drop for ClearTransitionAuthorityGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if !self.work_started {
+            // Proven no-work: no hook, DB write or subscription move began.
+            if let Ok(mut state) = self.manager.state.try_lock() {
+                state.release_exact_clear_reservation(self.thread_id, &self.identity, &self.token);
+                return;
+            }
+            // Contended: defer to the next ordinary path holding the mutex.
+            self.token
+                .pending_release
+                .store(true, std::sync::atomic::Ordering::Release);
+            if let Some(wake) = &self.wake {
+                wake.notify_one();
+            }
+            return;
+        }
+        self.token
+            .unproven
+            .store(true, std::sync::atomic::Ordering::Release);
+        tracing::warn!(
+            thread_id = %self.thread_id,
+            "admitted clear ended without a proven join; reservation retained as incomplete"
+        );
+    }
+}
+
+/// The manager mutex, held by a test (see `hold_state_lock_for_test`).
+#[cfg(test)]
+pub(crate) struct StateLockHold {
+    guard: tokio::sync::OwnedMutexGuard<ThreadStateManagerInner>,
+}
+
+#[cfg(test)]
+impl StateLockHold {
+    /// `(unproven, pending_release)` of the reservation held for `thread_id`.
+    pub(crate) fn clear_flags(&self, thread_id: ThreadId) -> Option<(bool, bool)> {
+        self.guard
+            .clear_transition_reservations
+            .get(&thread_id)
+            .map(|held| {
+                (
+                    held.token
+                        .unproven
+                        .load(std::sync::atomic::Ordering::Acquire),
+                    held.token
+                        .pending_release
+                        .load(std::sync::atomic::Ordering::Acquire),
+                )
+            })
+    }
+}
+
 /// Server-established connection properties. Client-provided initialize data
 /// must not set `trusted_interactive` without the later entitlement boundary.
 #[derive(Clone, Copy, Default)]
@@ -1770,7 +2772,43 @@ impl Default for ThreadStateManager {
     }
 }
 
+/// A listener's state, which may not have been published to the manager yet.
+pub(crate) enum ListenerStateCandidate {
+    Existing(Arc<Mutex<ThreadState>>),
+    Unpublished(Arc<Mutex<ThreadState>>),
+}
+
+impl ListenerStateCandidate {
+    pub(crate) fn state(&self) -> &Arc<Mutex<ThreadState>> {
+        match self {
+            Self::Existing(state) | Self::Unpublished(state) => state,
+        }
+    }
+}
+
 impl ThreadStateManager {
+    /// Coordinates goal edits with cold/path-based resume for just this thread.
+    pub(crate) async fn lock_goal_resume(
+        &self,
+        thread_id: ThreadId,
+    ) -> tokio::sync::OwnedMutexGuard<()> {
+        loop {
+            let thread_state = self.thread_state(thread_id).await;
+            let guard = ThreadState::lock_goal_resume(&thread_state).await;
+            // Teardown may have replaced the entry while this caller waited for the lock.
+            if self
+                .state
+                .lock()
+                .await
+                .threads
+                .get(&thread_id)
+                .is_some_and(|entry| Arc::ptr_eq(&entry.state, &thread_state))
+            {
+                return guard;
+            }
+        }
+    }
+
     pub(crate) fn new() -> Self {
         Self {
             state: Arc::new(Mutex::new(ThreadStateManagerInner {
@@ -1826,51 +2864,7 @@ impl ThreadStateManager {
         principal: RetentionPrincipalId,
     ) -> Result<RetentionAcquireOutcome, RetentionAuthorityError> {
         let mut state = self.state.lock().await;
-        if !state.retention_principal_is_live(principal) {
-            return Err(RetentionAuthorityError::IneligiblePrincipal);
-        }
-        match principal.owner() {
-            RetentionPrincipalOwner::ConnectionOwned => {}
-            RetentionPrincipalOwner::Unclassified => {
-                return Err(RetentionAuthorityError::AuthorityUnavailable);
-            }
-            RetentionPrincipalOwner::ThreadOwned(owner) if owner == thread_id => {
-                return Err(RetentionAuthorityError::SelfRetention);
-            }
-            RetentionPrincipalOwner::ThreadOwned(_) => {}
-        }
-        if !state.threads.contains_key(&thread_id) {
-            return Err(RetentionAuthorityError::UnknownThread);
-        }
-
-        let record = state
-            .lifecycle
-            .get(&thread_id)
-            .ok_or(RetentionAuthorityError::AuthorityUnavailable)?;
-        if record.is_retiring() {
-            return Err(RetentionAuthorityError::LifecycleClosed);
-        }
-
-        let grants = state
-            .retention_grants_by_thread
-            .entry(thread_id)
-            .or_default();
-        if let Some(grant_id) = grants.get(&principal) {
-            return Ok(RetentionAcquireOutcome::AlreadyHeld {
-                grant_id: grant_id.clone(),
-            });
-        }
-
-        let grant_id = RetentionGrantId::new();
-        grants.insert(principal, grant_id.clone());
-        state
-            .retention_threads_by_principal
-            .entry(principal)
-            .or_default()
-            .insert(thread_id);
-        state.publish_retention(thread_id);
-        record_retention_action(thread_id, principal, RetentionAction::Acquired);
-        Ok(RetentionAcquireOutcome::Acquired { grant_id })
+        state.grant_retention_locked(thread_id, principal)
     }
 
     /// Releases only the caller's exact active grant. A random or stale handle
@@ -1981,36 +2975,107 @@ impl ThreadStateManager {
     ///
     /// Validation and reservation occur under the same mutex so two subscribed clients
     /// cannot both acquire clear authority for the same predecessor.
+    #[cfg(test)]
     pub(crate) async fn reserve_clear_transition_authority(
         &self,
         predecessor_thread_id: ThreadId,
         connection_id: ConnectionId,
     ) -> Result<(), ClearTransitionAuthorityError> {
         let mut state = self.state.lock().await;
-        let Some(thread_entry) = state.threads.get(&predecessor_thread_id) else {
-            return Err(ClearTransitionAuthorityError::UnknownPredecessor);
-        };
-        if !thread_entry.connection_ids.contains(&connection_id) {
-            return Err(ClearTransitionAuthorityError::NotSubscribed);
-        }
-        if !state
-            .clear_transition_reservations
-            .insert(predecessor_thread_id)
-        {
-            return Err(ClearTransitionAuthorityError::TransitionConflict);
-        }
-        Ok(())
+        state
+            .reserve_clear_transition_locked(predecessor_thread_id, connection_id)
+            .map(|_| ())
     }
 
-    pub(crate) async fn release_clear_transition_authority(
+    /// `reserve_clear_transition_authority` that arms its release guard in the
+    /// same mutex transaction, so no cancellation point separates the two.
+    pub(crate) async fn reserve_clear_transition_authority_guarded(
         &self,
         predecessor_thread_id: ThreadId,
-    ) -> bool {
+        connection_id: ConnectionId,
+    ) -> Result<ClearTransitionAuthorityGuard, ClearTransitionAuthorityError> {
+        let mut state = self.state.lock().await;
+        let ReservedClear {
+            identity,
+            token,
+            wake,
+        } = state.reserve_clear_transition_locked(predecessor_thread_id, connection_id)?;
+        Ok(ClearTransitionAuthorityGuard {
+            manager: self.clone(),
+            thread_id: predecessor_thread_id,
+            identity,
+            token,
+            wake,
+            work_started: false,
+            armed: true,
+        })
+    }
+
+    /// The per-thread wake a pre-work clear cancellation signals when its
+    /// `Drop` could not take the mutex. The listener consumes on wake.
+    pub(crate) async fn clear_release_wake(
+        &self,
+        thread_id: ThreadId,
+    ) -> Option<Arc<tokio::sync::Notify>> {
+        self.state
+            .lock()
+            .await
+            .lifecycle
+            .get(&thread_id)
+            .map(retirement::RetentionLifecycle::clear_wake)
+    }
+
+    /// Consumes a deferred pre-work release for the exact held reservation.
+    pub(crate) async fn consume_pending_clear_release(&self, thread_id: ThreadId) -> bool {
+        self.state
+            .lock()
+            .await
+            .consume_pending_clear_release(thread_id)
+    }
+
+    /// Holds the manager mutex so a test can make `Drop` contend for it.
+    #[cfg(test)]
+    pub(crate) async fn hold_state_lock_for_test(&self) -> StateLockHold {
+        StateLockHold {
+            guard: Arc::clone(&self.state).lock_owned().await,
+        }
+    }
+
+    /// Clear reservations still held, as `(predecessor, unproven)`, for
+    /// incomplete reporting only. Shutdown never waits on them; the bounded
+    /// manager shutdown proceeds under its own owner deadline.
+    pub(crate) async fn held_clear_transition_reservations(&self) -> Vec<(ThreadId, bool)> {
         self.state
             .lock()
             .await
             .clear_transition_reservations
+            .iter()
+            .map(|(thread_id, held)| {
+                (
+                    *thread_id,
+                    held.token
+                        .unproven
+                        .load(std::sync::atomic::Ordering::Acquire),
+                )
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn release_clear_transition_authority(
+        &self,
+        predecessor_thread_id: ThreadId,
+    ) -> bool {
+        let mut state = self.state.lock().await;
+        if state
+            .clear_transition_reservations
             .remove(&predecessor_thread_id)
+            .is_none()
+        {
+            return false;
+        }
+        state.publish_clear_hold(predecessor_thread_id);
+        true
     }
 
     /// Releases B only after the durable clear reaches its terminal
@@ -2042,7 +3107,7 @@ impl ThreadStateManager {
         let mut state = self.state.lock().await;
         if !state
             .clear_transition_reservations
-            .contains(&predecessor_thread_id)
+            .contains_key(&predecessor_thread_id)
             || state
                 .clear_successor_reservations
                 .contains_key(&successor_thread_id)
@@ -2104,6 +3169,18 @@ impl ThreadStateManager {
         state.ensure_thread_entry(thread_id).state.clone()
     }
 
+    pub(crate) async fn created_listener_state(
+        &self,
+        thread_id: ThreadId,
+    ) -> ListenerStateCandidate {
+        match self.state.lock().await.threads.get(&thread_id) {
+            Some(entry) => ListenerStateCandidate::Existing(Arc::clone(&entry.state)),
+            None => {
+                ListenerStateCandidate::Unpublished(Arc::new(Mutex::new(ThreadState::default())))
+            }
+        }
+    }
+
     pub(crate) fn current_listener_command_tx(
         &self,
         thread_id: ThreadId,
@@ -2136,6 +3213,7 @@ impl ThreadStateManager {
     pub(crate) async fn remove_thread_state(&self, thread_id: ThreadId) {
         let (thread_state, interactive_subscription_change) = {
             let mut state = self.state.lock().await;
+            self.unregister_listener_command_tx(thread_id);
             let thread_state = state
                 .threads
                 .remove(&thread_id)
@@ -2165,7 +3243,6 @@ impl ThreadStateManager {
         };
         self.publish_interactive_subscription_change(interactive_subscription_change)
             .await;
-        self.unregister_listener_command_tx(thread_id);
 
         if let Some(thread_state) = thread_state {
             let mut thread_state = thread_state.lock().await;
@@ -2178,6 +3255,32 @@ impl ThreadStateManager {
             );
             thread_state.clear_listener();
         }
+    }
+
+    /// Removes an unsubscribed listener's entry without clearing a replacement's state.
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "the listener generation must stay fixed while removing its map entry"
+    )]
+    pub(crate) async fn remove_unsubscribed_listener(
+        &self,
+        thread_id: ThreadId,
+        expected: &Arc<Mutex<ThreadState>>,
+        generation: u64,
+    ) -> bool {
+        let mut thread_state = expected.lock().await;
+        let mut state = self.state.lock().await;
+        if thread_state.listener_generation != generation
+            || !state.threads.get(&thread_id).is_some_and(|entry| {
+                Arc::ptr_eq(&entry.state, expected) && entry.connection_ids.is_empty()
+            })
+        {
+            return false;
+        }
+        state.threads.remove(&thread_id);
+        self.unregister_listener_command_tx(thread_id);
+        thread_state.clear_listener();
+        true
     }
 
     pub(crate) async fn clear_all_listeners(&self) {
@@ -2211,10 +3314,6 @@ impl ThreadStateManager {
     ) -> bool {
         let change = {
             let mut state = self.state.lock().await;
-            if !state.threads.contains_key(&thread_id) {
-                return false;
-            }
-
             if !state
                 .thread_ids_by_connection
                 .get(&connection_id)
@@ -2259,26 +3358,51 @@ impl ThreadStateManager {
     /// Moves one live connection from an authoritative clear predecessor to
     /// its successor with one subscription revision. The caller has already
     /// established the durable A/B/T transition and listener readiness.
+    #[cfg(test)]
     pub(crate) async fn move_connection_for_clear(
         &self,
         predecessor_thread_id: ThreadId,
         successor_thread_id: ThreadId,
         connection_id: ConnectionId,
     ) -> bool {
+        self.try_move_connection_for_clear(
+            predecessor_thread_id,
+            successor_thread_id,
+            connection_id,
+        )
+        .await
+        .is_ok()
+    }
+
+    /// `move_connection_for_clear` with the exact refusal cause, classified
+    /// under the same mutex as the move so liveness is evidence, not inference.
+    pub(crate) async fn try_move_connection_for_clear(
+        &self,
+        predecessor_thread_id: ThreadId,
+        successor_thread_id: ThreadId,
+        connection_id: ConnectionId,
+    ) -> Result<(), ClearSubscriptionMoveRefusal> {
         let change = {
             let mut state = self.state.lock().await;
-            if !state.live_connections.contains_key(&connection_id)
-                || !state
-                    .thread_ids_by_connection
-                    .get(&connection_id)
-                    .is_some_and(|thread_ids| thread_ids.contains(&predecessor_thread_id))
-                || state
-                    .thread_ids_by_connection
-                    .get(&connection_id)
-                    .is_some_and(|thread_ids| thread_ids.contains(&successor_thread_id))
-                || !state.threads.contains_key(&predecessor_thread_id)
+            if !state.live_connections.contains_key(&connection_id) {
+                return Err(ClearSubscriptionMoveRefusal::ConnectionClosed);
+            }
+            if !state.threads.contains_key(&predecessor_thread_id) {
+                return Err(ClearSubscriptionMoveRefusal::PredecessorUnavailable);
+            }
+            if !state
+                .thread_ids_by_connection
+                .get(&connection_id)
+                .is_some_and(|thread_ids| thread_ids.contains(&predecessor_thread_id))
             {
-                return false;
+                return Err(ClearSubscriptionMoveRefusal::NotSubscribedToPredecessor);
+            }
+            if state
+                .thread_ids_by_connection
+                .get(&connection_id)
+                .is_some_and(|thread_ids| thread_ids.contains(&successor_thread_id))
+            {
+                return Err(ClearSubscriptionMoveRefusal::AlreadySubscribedToSuccessor);
             }
 
             let trusted_interactive = state
@@ -2294,11 +3418,11 @@ impl ThreadStateManager {
                     .interactive_subscription_counts
                     .contains_key(&predecessor_thread_id)
             {
-                return false;
+                return Err(ClearSubscriptionMoveRefusal::InteractiveSubscriptionMissing);
             }
 
             let Some(thread_ids) = state.thread_ids_by_connection.get_mut(&connection_id) else {
-                return false;
+                return Err(ClearSubscriptionMoveRefusal::NotSubscribedToPredecessor);
             };
             thread_ids.remove(&predecessor_thread_id);
             thread_ids.insert(successor_thread_id);
@@ -2307,7 +3431,7 @@ impl ThreadStateManager {
                 predecessor.connection_ids.remove(&connection_id);
                 predecessor.update_has_connections();
             } else {
-                return false;
+                return Err(ClearSubscriptionMoveRefusal::PredecessorUnavailable);
             }
             let successor = state.ensure_thread_entry(successor_thread_id);
             successor.connection_ids.insert(connection_id);
@@ -2329,7 +3453,7 @@ impl ThreadStateManager {
                 let Some(predecessor_change) =
                     state.remove_interactive_subscription(predecessor_thread_id)
                 else {
-                    return false;
+                    return Err(ClearSubscriptionMoveRefusal::InteractiveSubscriptionMissing);
                 };
                 let successor_change = state.add_interactive_subscription(successor_thread_id);
                 vec![successor_change, predecessor_change]
@@ -2339,10 +3463,9 @@ impl ThreadStateManager {
             state.interactive_subscription_change(changes)
         };
         self.publish_interactive_subscription_change(change).await;
-        true
+        Ok(())
     }
 
-    #[cfg(test)]
     pub(crate) async fn has_subscribers(&self, thread_id: ThreadId) -> bool {
         self.state
             .lock()
@@ -2350,6 +3473,145 @@ impl ThreadStateManager {
             .threads
             .get(&thread_id)
             .is_some_and(|thread_entry| !thread_entry.connection_ids.is_empty())
+    }
+
+    /// Publish only after listener installation succeeds; preserve upstream's
+    /// unpublished candidate identity while updating retention/subscription
+    /// authority in the same manager transaction.
+    pub(crate) async fn subscribe_and_install_listener<T, E>(
+        &self,
+        thread_id: ThreadId,
+        candidate: &ListenerStateCandidate,
+        connection_ids: &[ConnectionId],
+        install: impl FnOnce(bool) -> Result<T, E>,
+    ) -> Result<Option<(T, watch::Receiver<bool>, bool)>, E> {
+        self.subscribe_and_install_listener_retaining(
+            thread_id,
+            candidate,
+            connection_ids,
+            None,
+            install,
+        )
+        .await
+        .map(|value| value.map(|(installed, watcher, attached, _)| (installed, watcher, attached)))
+    }
+
+    pub(crate) async fn subscribe_and_install_listener_retaining<T, E>(
+        &self,
+        thread_id: ThreadId,
+        candidate: &ListenerStateCandidate,
+        connection_ids: &[ConnectionId],
+        retention: Option<(ConnectionId, ConnectionRetention)>,
+        install: impl FnOnce(bool) -> Result<T, E>,
+    ) -> Result<Option<(T, watch::Receiver<bool>, bool, ConnectionRetentionOutcome)>, E> {
+        self.subscribe_and_install_listener_with_clear_owner(
+            thread_id,
+            candidate,
+            connection_ids,
+            retention,
+            None,
+            install,
+        )
+        .await
+    }
+
+    /// A clear may install only its reserved successor's listener, without
+    /// exposing a subscription before its durable A -> B move completes.
+    pub(crate) async fn subscribe_and_install_listener_with_clear_owner<T, E>(
+        &self,
+        thread_id: ThreadId,
+        candidate: &ListenerStateCandidate,
+        connection_ids: &[ConnectionId],
+        retention: Option<(ConnectionId, ConnectionRetention)>,
+        clear_predecessor: Option<ThreadId>,
+        install: impl FnOnce(bool) -> Result<T, E>,
+    ) -> Result<Option<(T, watch::Receiver<bool>, bool, ConnectionRetentionOutcome)>, E> {
+        let (installed, watcher, attached, change, retained) = {
+            let mut state = self.state.lock().await;
+            let clear_authorized = match (
+                state.clear_successor_reservations.get(&thread_id),
+                clear_predecessor,
+            ) {
+                (None, None) => true,
+                (Some(owner), Some(predecessor)) => {
+                    *owner == predecessor
+                        && state
+                            .clear_transition_reservations
+                            .contains_key(&predecessor)
+                        && connection_ids.is_empty()
+                        && retention.is_none()
+                }
+                _ => false,
+            };
+            if !clear_authorized
+                || state
+                    .lifecycle
+                    .get(&thread_id)
+                    .is_some_and(retirement::RetentionLifecycle::is_retiring)
+            {
+                return Ok(None);
+            }
+            match (state.threads.get(&thread_id), candidate) {
+                (Some(entry), _) if Arc::ptr_eq(&entry.state, candidate.state()) => {}
+                (None, ListenerStateCandidate::Unpublished(_)) => {}
+                _ => return Ok(None),
+            }
+            let attached = connection_ids
+                .iter()
+                .any(|id| state.live_connections.contains_key(id));
+            let installed = install(attached)?;
+            state
+                .threads
+                .entry(thread_id)
+                .or_insert_with(|| ThreadEntry::new(Arc::clone(candidate.state())));
+            state.lifecycle.entry(thread_id).or_insert_with(|| {
+                retirement::RetentionLifecycle::new(Arc::downgrade(candidate.state()))
+            });
+            let mut changes = Vec::new();
+            for &id in connection_ids {
+                if !state.live_connections.contains_key(&id) {
+                    continue;
+                }
+                let added = state
+                    .thread_ids_by_connection
+                    .entry(id)
+                    .or_default()
+                    .insert(thread_id);
+                state
+                    .threads
+                    .get_mut(&thread_id)
+                    .unwrap_or_else(|| panic!("installed entry"))
+                    .connection_ids
+                    .insert(id);
+                if added
+                    && state
+                        .live_connections
+                        .get(&id)
+                        .is_some_and(|caps| caps.trusted_interactive)
+                {
+                    changes.push(state.add_interactive_subscription(thread_id));
+                }
+            }
+            let entry = state
+                .threads
+                .get(&thread_id)
+                .unwrap_or_else(|| panic!("installed entry"));
+            entry.update_has_connections();
+            let watcher = entry.has_connections_watcher.subscribe();
+            let retained = match retention {
+                Some((id, request)) if connection_ids.contains(&id) => {
+                    state.grant_connection_retention_locked(thread_id, id, request)
+                }
+                Some(_) => ConnectionRetentionOutcome::Refused(
+                    ThreadRetentionRefusalReason::IneligiblePrincipal,
+                ),
+                None => ConnectionRetentionOutcome::NotRequested,
+            };
+            let change = state.interactive_subscription_change(changes);
+            (installed, watcher, attached, change, retained)
+        };
+        self.publish_interactive_subscription_change(change).await;
+        Ok(Some((installed, watcher, attached, retained)))
     }
 
     #[allow(dead_code)] // Used by in-crate state tests; live requests use the guarded variant.
@@ -2363,21 +3625,47 @@ impl ThreadStateManager {
             thread_id,
             connection_id,
             experimental_raw_events,
+            ConnectionRetention::NotRequested,
         )
         .await
         .ok()
+        .map(|(thread_state, _)| thread_state)
     }
 
+    /// Production listeners subscribe through the `_retaining` variant.
+    #[cfg(test)]
     pub(crate) async fn try_ensure_connection_subscribed_for_listener(
         &self,
         thread_id: ThreadId,
         connection_id: ConnectionId,
         experimental_raw_events: bool,
     ) -> Result<Arc<Mutex<ThreadState>>, ConnectionSubscriptionError> {
+        self.try_ensure_connection_subscribed_for_listener_retaining(
+            thread_id,
+            connection_id,
+            experimental_raw_events,
+            ConnectionRetention::NotRequested,
+        )
+        .await
+        .map(|(thread_state, _)| thread_state)
+    }
+
+    /// Subscribes for a listener attach, installing
+    /// requested retention in the subscription's critical section, before
+    /// the caller can attach a listener that arms idle retirement.
+    pub(crate) async fn try_ensure_connection_subscribed_for_listener_retaining(
+        &self,
+        thread_id: ThreadId,
+        connection_id: ConnectionId,
+        experimental_raw_events: bool,
+        retention: ConnectionRetention,
+    ) -> Result<(Arc<Mutex<ThreadState>>, ConnectionRetentionOutcome), ConnectionSubscriptionError>
+    {
         self.try_ensure_connection_subscribed_inner(
             thread_id,
             connection_id,
             experimental_raw_events,
+            retention,
         )
         .await
     }
@@ -2387,14 +3675,18 @@ impl ThreadStateManager {
         thread_id: ThreadId,
         connection_id: ConnectionId,
         experimental_raw_events: bool,
-    ) -> Result<Arc<Mutex<ThreadState>>, ConnectionSubscriptionError> {
-        let (thread_state, interactive_subscription_change) = {
+        retention: ConnectionRetention,
+    ) -> Result<(Arc<Mutex<ThreadState>>, ConnectionRetentionOutcome), ConnectionSubscriptionError>
+    {
+        let (thread_state, interactive_subscription_change, retained) = {
             let mut state = self.state.lock().await;
-            if !state.live_connections.contains_key(&connection_id) {
-                return Err(ConnectionSubscriptionError::ConnectionClosed);
-            }
+            // A reserved clear successor is owned by its clear transition even
+            // when the requesting connection already closed: no listener attach.
             if state.clear_successor_reservations.contains_key(&thread_id) {
                 return Err(ConnectionSubscriptionError::ClearSuccessorReserved);
+            }
+            if !state.live_connections.contains_key(&connection_id) {
+                return Err(ConnectionSubscriptionError::ConnectionClosed);
             }
             let was_added = state
                 .thread_ids_by_connection
@@ -2407,6 +3699,8 @@ impl ThreadStateManager {
                 thread_entry.update_has_connections();
                 thread_entry.state.clone()
             };
+            let retained =
+                state.grant_connection_retention_locked(thread_id, connection_id, retention);
             let changes = state
                 .live_connections
                 .get(&connection_id)
@@ -2415,7 +3709,11 @@ impl ThreadStateManager {
                 .flatten()
                 .into_iter()
                 .collect();
-            (thread_state, state.interactive_subscription_change(changes))
+            (
+                thread_state,
+                state.interactive_subscription_change(changes),
+                retained,
+            )
         };
         self.publish_interactive_subscription_change(interactive_subscription_change)
             .await;
@@ -2425,15 +3723,50 @@ impl ThreadStateManager {
                 thread_state_guard.set_experimental_raw_events(/*enabled*/ true);
             }
         }
-        Ok(thread_state)
+        Ok((thread_state, retained))
     }
 
+    /// Production subscriptions go through the `_retaining` variant.
+    #[cfg(test)]
     pub(crate) async fn try_add_connection_to_thread(
         &self,
         thread_id: ThreadId,
         connection_id: ConnectionId,
     ) -> Result<(), ConnectionSubscriptionError> {
-        let change = {
+        self.try_add_connection_to_thread_retaining(
+            thread_id,
+            connection_id,
+            ConnectionRetention::NotRequested,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Installs requested retention for `connection_id` on an existing,
+    /// not-yet-subscribed thread (the clear successor, before its listener
+    /// starts). The connection must still be live; its later close revokes
+    /// the grant through `remove_connection`.
+    pub(crate) async fn grant_connection_retention(
+        &self,
+        thread_id: ThreadId,
+        connection_id: ConnectionId,
+        retention: ConnectionRetention,
+    ) -> ConnectionRetentionOutcome {
+        let mut state = self.state.lock().await;
+        state.grant_connection_retention_locked(thread_id, connection_id, retention)
+    }
+
+    /// Subscribes `connection_id` and, when requested, installs its retention
+    /// grant in the same manager critical section. A connection that already
+    /// closed is refused before any grant; one that closes afterwards loses
+    /// the grant through `remove_connection`'s ordinary revocation.
+    pub(crate) async fn try_add_connection_to_thread_retaining(
+        &self,
+        thread_id: ThreadId,
+        connection_id: ConnectionId,
+        retention: ConnectionRetention,
+    ) -> Result<ConnectionRetentionOutcome, ConnectionSubscriptionError> {
+        let (change, retained) = {
             let mut state = self.state.lock().await;
             if !state.live_connections.contains_key(&connection_id) {
                 return Err(ConnectionSubscriptionError::ConnectionClosed);
@@ -2451,6 +3784,8 @@ impl ThreadStateManager {
                 thread_entry.connection_ids.insert(connection_id);
                 thread_entry.update_has_connections();
             }
+            let retained =
+                state.grant_connection_retention_locked(thread_id, connection_id, retention);
             let changes = state
                 .live_connections
                 .get(&connection_id)
@@ -2459,10 +3794,10 @@ impl ThreadStateManager {
                 .flatten()
                 .into_iter()
                 .collect();
-            state.interactive_subscription_change(changes)
+            (state.interactive_subscription_change(changes), retained)
         };
         self.publish_interactive_subscription_change(change).await;
-        Ok(())
+        Ok(retained)
     }
 
     pub(crate) async fn remove_connection(&self, connection_id: ConnectionId) -> Vec<ThreadId> {

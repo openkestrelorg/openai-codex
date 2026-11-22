@@ -9,12 +9,15 @@ use super::*;
 use crate::mcp::McpRuntimeProjection;
 use codex_config::McpServerDisabledReason;
 use codex_config::McpServerTransportConfig;
+use codex_file_system::WindowsSandboxSelection;
 use codex_mcp::CODEX_APPS_MCP_SERVER_NAME;
 use codex_mcp::ElicitationReviewerHandle;
 use codex_mcp::McpServerRegistration;
 use codex_mcp::McpServerSource;
 use codex_mcp::McpStartupPolicy;
 use codex_mcp::PreparedMcpCall;
+use codex_mcp::ToolInfo;
+use codex_otel::auth_storage::AuthStorageOriginator;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
 use std::collections::HashSet;
 
@@ -27,7 +30,6 @@ pub(super) struct McpDesiredState {
     pub(super) environments: TurnEnvironmentSnapshot,
     pub(super) local_process_cwd: PathBuf,
     pub(super) disabled_plugin_ids: Vec<String>,
-    pub(super) control_endpoint: Option<String>,
 }
 
 impl Session {
@@ -37,6 +39,7 @@ impl Session {
         next: &SessionConfiguration,
     ) -> bool {
         current.cwd() != next.cwd()
+            || current.runtime_workspace_roots != next.runtime_workspace_roots
             || current.step_settings.approval_policy.value()
                 != next.step_settings.approval_policy.value()
             || current.step_settings.approvals_reviewer != next.step_settings.approvals_reviewer
@@ -51,10 +54,7 @@ impl Session {
         server: &str,
     ) -> anyhow::Result<()> {
         let work = self.turn_mcp_work(turn)?;
-        let access = work.as_deref().map_or(
-            codex_mcp::McpAttemptAccess::Unscoped,
-            codex_mcp::McpAttemptAccess::Admitted,
-        );
+        let access = codex_mcp::McpAttemptAccess::from_work(work.as_deref());
         self.refresh_mcp_if_dirty_with_authority(access).await?;
         self.services
             .mcp_runtime
@@ -63,25 +63,45 @@ impl Session {
         Ok(())
     }
 
-    /// Captures this session's current MCP client and catalog for one tool call.
+    /// Preserve the current advertised metadata while capturing execution from
+    /// this publication's live client under the exact calling turn's custody.
     pub(crate) async fn prepare_mcp_call(
         self: &Arc<Self>,
         turn: &TurnContext,
-        server: &str,
-        tool: &str,
-    ) -> anyhow::Result<Option<PreparedMcpCall>> {
+        advertised_tool: &ToolInfo,
+    ) -> anyhow::Result<PreparedMcpCall> {
         let work = self.turn_mcp_work(turn)?;
-        let access = work.as_deref().map_or(
-            codex_mcp::McpAttemptAccess::Unscoped,
-            codex_mcp::McpAttemptAccess::Admitted,
-        );
+        let access = codex_mcp::McpAttemptAccess::from_work(work.as_deref());
+        self.prepare_mcp_call_inner(advertised_tool, access).await
+    }
+
+    /// Captures a call for standalone review without consulting an uninstalled turn.
+    pub(crate) async fn prepare_mcp_call_with_authority(
+        self: &Arc<Self>,
+        advertised_tool: &ToolInfo,
+        access: codex_mcp::McpAttemptAccess<'_>,
+    ) -> anyhow::Result<PreparedMcpCall> {
+        let work = self.derive_mcp_attempt_work(access)?;
+        self.prepare_mcp_call_inner(
+            advertised_tool,
+            codex_mcp::McpAttemptAccess::from_work(work.as_deref()),
+        )
+        .await
+    }
+
+    async fn prepare_mcp_call_inner(
+        self: &Arc<Self>,
+        advertised_tool: &ToolInfo,
+        access: codex_mcp::McpAttemptAccess<'_>,
+    ) -> anyhow::Result<PreparedMcpCall> {
         self.refresh_mcp_if_dirty_with_authority(access).await?;
-        Ok(self
-            .services
+        if advertised_tool.server_name == CODEX_APPS_MCP_SERVER_NAME {
+            self.wait_for_apps_tool_refresh().await;
+        }
+        self.services
             .mcp_runtime
-            .current_binding_for_call_with_authority(server, access)
+            .prepare_call_with_authority(advertised_tool, access)
             .await
-            .and_then(|binding| binding.prepare_call(server, tool)))
     }
 
     pub(super) async fn latest_mcp_desired_state(
@@ -96,19 +116,9 @@ impl Session {
                 state.active_disabled_plugin_ids.clone(),
             )
         };
-        let cwd = environments
-            .primary()
-            .and_then(|environment| environment.cwd().to_abs_path().ok())
-            .unwrap_or_else(|| session_configuration.cwd().clone());
-        let config = self.build_per_turn_config(
-            &session_configuration,
-            cwd,
-            environments.primary_workspace_roots(),
-        );
-        let local_process_cwd = environments
-            .local_environment_cwd()
-            .unwrap_or_else(|| session_configuration.cwd().clone())
-            .to_path_buf();
+        let config =
+            self.build_per_turn_config(&session_configuration, environments.local_selection());
+        let local_process_cwd = config.cwd.to_path_buf();
 
         McpDesiredState {
             config: Arc::new(config),
@@ -119,7 +129,6 @@ impl Session {
             environments,
             local_process_cwd,
             disabled_plugin_ids,
-            control_endpoint: session_configuration.control_endpoint,
         }
     }
 
@@ -129,20 +138,13 @@ impl Session {
         auth: Option<CodexAuth>,
         mcp_projection: McpRuntimeProjection,
         resolved_environments: &TurnEnvironmentSnapshot,
-        mcp_runtime_cwd: PathBuf,
         access: codex_mcp::McpAttemptAccess<'_>,
     ) -> anyhow::Result<()> {
-        let cwd = AbsolutePathBuf::from_absolute_path(mcp_runtime_cwd)
-            .unwrap_or_else(|_| session_configuration.cwd().clone());
         let config = self.build_per_turn_config(
             session_configuration,
-            cwd,
-            resolved_environments.primary_workspace_roots(),
+            resolved_environments.local_selection(),
         );
-        let local_process_cwd = resolved_environments
-            .local_environment_cwd()
-            .unwrap_or_else(|| session_configuration.cwd().clone())
-            .to_path_buf();
+        let local_process_cwd = config.cwd.to_path_buf();
         let desired = McpDesiredState {
             config: Arc::new(config),
             auth,
@@ -152,7 +154,6 @@ impl Session {
             environments: resolved_environments.clone(),
             local_process_cwd,
             disabled_plugin_ids: session_configuration.disabled_plugin_ids.clone(),
-            control_endpoint: session_configuration.control_endpoint.clone(),
         };
         self.publish_mcp_runtime_with_authority(
             &desired,
@@ -181,14 +182,20 @@ impl Session {
         mut projection: McpRuntimeProjection,
     ) -> BoxFuture<'a, McpRuntimeProjection> {
         Box::pin(async move {
-            if self.isolation == codex_extension_api::SessionIsolation::Isolated {
+            if self.isolation == codex_extension_api::SessionIsolation::Isolated
+                || self
+                    .services
+                    .mcp_thread_init
+                    .get::<crate::mcp::McpServersDisabled>()
+                    .is_some()
+            {
                 return projection;
             }
 
             let mut catalog = None;
             let mut registered = HashSet::new();
             for selected in environments.turn_environments() {
-                let environment = &selected.environment;
+                let environment = selected.environment();
                 if !environment.is_remote() {
                     continue;
                 }
@@ -331,10 +338,10 @@ impl Session {
             ready_selected_capability_roots,
             elicitation_reviewer,
         );
-        // Keep the existing requirement until every constructor/turn producer
-        // is converted; explicit callers already transfer finite startup work.
         input.startup_work = startup_work;
-        self.services.mcp_runtime.replace(input).await;
+        AuthStorageOriginator::from_client_name(&desired.originator)
+            .scope(self.services.mcp_runtime.replace(input))
+            .await;
         self.services.thread_extension_data.insert(selected_plugins);
         Ok(())
     }
@@ -354,6 +361,7 @@ impl Session {
         } = mcp_projection;
         config.approval_policy = desired.config.permissions.approval_policy.clone();
         config.permission_profile = desired.config.permissions.effective_permission_profile();
+        config.host_cwd = desired.config.cwd.clone();
         config.approvals_reviewer = desired.config.approvals_reviewer;
         config.environment_cwds = desired
             .environments
@@ -369,25 +377,43 @@ impl Session {
             .environment_cwds
             .entry(codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string())
             .or_insert_with(|| PathUri::from_abs_path(&desired.config.cwd));
-        let mcp_servers = effective_mcp_servers(&config, auth.as_ref());
-        config.set_server_permission_profiles(
-            &mcp_servers,
-            desired.environments.turn_environments().map(|environment| {
+        config.environment_use_mxc = desired
+            .environments
+            .turn_environments()
+            .map(|environment| {
                 (
                     environment.selection.environment_id.clone(),
-                    environment.permission_profile_with_workspace_roots(),
+                    environment.windows_sandbox_selection_for_turn_metadata()
+                        == WindowsSandboxSelection::Mxc,
+                )
+            })
+            .collect();
+        config
+            .environment_use_mxc
+            .entry(codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string())
+            .or_insert(
+                cfg!(windows)
+                    && desired.config.effective_local_windows_sandbox_type()
+                        == SandboxType::WindowsMxc,
+            );
+        let mcp_servers = effective_mcp_servers(&config, auth.as_ref());
+        config.set_server_permissions(
+            &mcp_servers,
+            desired.environments.turn_environments().map(|environment| {
+                // Freeze the executor paths used to interpret this profile with the MCP call.
+                let mut sandbox = environment.sandbox_context(/*additional_permissions*/ None);
+                sandbox.permissions = sandbox
+                    .permissions
+                    .materialize_project_roots_with_path_uris(&sandbox.workspace_roots);
+                (
+                    environment.selection.environment_id.clone(),
+                    Arc::new(sandbox),
                 )
             }),
         );
         let mcp_config = Arc::new(config);
-        let runtime_context = McpRuntimeContext::new(
-            self.services.turn_environments.environment_manager(),
-            desired.local_process_cwd.clone(),
-        )
-        .with_selected_environments(
-            desired.environments.all_selections().into(),
-            desired.environments.ready_environment_handles(),
-        );
+        let runtime_context =
+            self.mcp_runtime_context(&desired.environments, &desired.local_process_cwd);
         McpRuntimeInput {
             attempt_requirement: if self
                 .services
@@ -400,8 +426,25 @@ impl Session {
                 codex_mcp::McpAttemptRequirement::Ungated
             },
             startup_work: None,
+            network_policy_metadata: None,
+            runtime_auth: desired
+                .config
+                .features
+                .enabled(Feature::RuntimeAgentInstances)
+                .then(|| {
+                    (
+                        Arc::clone(&self.services.runtime_auth),
+                        desired.config.runtime_auth_mode,
+                    )
+                }),
             startup_policy: if matches!(desired.session_source, SessionSource::SubAgent(_)) {
-                McpStartupPolicy::LazyWhenCached
+                McpStartupPolicy::DeferCachedServers
+            } else if desired
+                .config
+                .features
+                .enabled(Feature::McpLazyStdioStartup)
+            {
+                McpStartupPolicy::DeferCachedStdio
             } else {
                 McpStartupPolicy::Eager
             },
@@ -421,8 +464,6 @@ impl Session {
             auth_manager: Some(Arc::clone(&self.services.auth_manager)),
             elicitation_reviewer,
             elicitation_lifecycle: Some(self.mcp_elicitation_lifecycle()),
-            canonical_thread_id: Some(self.services.thread_extension_data.level_id().to_string()),
-            control_endpoint: desired.control_endpoint.clone(),
         }
     }
 }

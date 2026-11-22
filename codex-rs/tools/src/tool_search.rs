@@ -3,6 +3,7 @@ use crate::LoadableToolSpec;
 use crate::ResponsesApiNamespace;
 use crate::ResponsesApiNamespaceTool;
 use crate::ResponsesApiTool;
+use crate::ToolName;
 use crate::ToolSearchSourceInfo;
 use crate::ToolSpec;
 use crate::default_namespace_description;
@@ -16,32 +17,25 @@ pub struct ToolSearchEntry {
 }
 
 impl ToolSearchEntry {
-    /// Names exposed by the normalized search result, without materializing schemas.
-    pub fn name_candidates(&self) -> Vec<String> {
-        let mut names = Vec::new();
-        match self.spec.as_ref() {
-            ToolSpec::Function(_) | ToolSpec::Freeform(_) => {
-                let name = self.spec.name();
-                names.push(DEFAULT_FUNCTION_NAMESPACE.to_string());
-                names.push(name.to_string());
-                names.push(format!("{DEFAULT_FUNCTION_NAMESPACE}{name}"));
-            }
-            ToolSpec::Namespace(namespace) => {
-                names.push(namespace.name.clone());
-                for tool in &namespace.tools {
-                    let name = match tool {
-                        ResponsesApiNamespaceTool::Function(tool) => &tool.name,
-                        ResponsesApiNamespaceTool::Custom(tool) => &tool.name,
-                    };
-                    names.push(name.clone());
-                    names.push(format!("{}{name}", namespace.name));
+    /// Iterate candidate identities without materializing their tool schemas.
+    pub fn tool_names(&self) -> impl Iterator<Item = ToolName> + '_ {
+        let (namespace, name, tools): (&str, Option<&str>, &[ResponsesApiNamespaceTool]) =
+            match self.spec.as_ref() {
+                ToolSpec::Function(tool) => (DEFAULT_FUNCTION_NAMESPACE, Some(&tool.name), &[]),
+                ToolSpec::Freeform(tool) => (DEFAULT_FUNCTION_NAMESPACE, Some(&tool.name), &[]),
+                ToolSpec::Namespace(namespace) => {
+                    (&namespace.name, None, namespace.tools.as_slice())
                 }
-            }
-            ToolSpec::ToolSearch { .. } | ToolSpec::WebSearch { .. } => {
-                unreachable!("search entries contain only loadable tools");
-            }
-        }
-        names
+                ToolSpec::ToolSearch { .. } | ToolSpec::WebSearch { .. } => {
+                    unreachable!("search entries contain only loadable tools");
+                }
+            };
+        name.into_iter()
+            .chain(tools.iter().map(|tool| match tool {
+                ResponsesApiNamespaceTool::Function(tool) => tool.name.as_str(),
+                ResponsesApiNamespaceTool::Custom(tool) => tool.name.as_str(),
+            }))
+            .map(move |name| ToolName::namespaced(namespace, name))
     }
 
     /// Materialize only selected results; output schemas remain shared until discarded.
@@ -183,9 +177,9 @@ fn append_function_search_text(tool: &ResponsesApiTool, parts: &mut Vec<String>)
 
 fn append_schema_search_text(schema: &JsonSchema, parts: &mut Vec<String>) {
     if let Some(description) = &schema.description {
-        push_search_part(parts, description.clone());
+        push_search_part(parts, description.to_string());
     }
-    if let Some(properties) = &schema.properties {
+    if let Some(properties) = schema.properties.as_deref() {
         for (name, schema) in properties {
             push_search_part(parts, name.clone());
             append_schema_search_text(schema, parts);

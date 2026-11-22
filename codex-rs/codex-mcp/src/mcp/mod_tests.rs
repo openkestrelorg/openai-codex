@@ -1,13 +1,18 @@
 use super::*;
 use crate::McpPluginAttribution;
+use crate::McpServerPermissions;
 use crate::McpServerRegistration;
 use crate::connection_manager::tests::create_ready_async_managed_client;
 use crate::mcp::auth::McpAuthStatusEntry;
 use crate::rmcp_client::StartupOutcomeError;
 use crate::server::McpCredentialPolicy;
+use anyhow::Context;
 use codex_config::Constrained;
 use codex_config::types::AppToolApproval;
 use codex_config::types::AuthKeyringBackendKind;
+use codex_exec_server_test_support::environment_manager_without_environments;
+use codex_login::AuthCredentialsStoreMode;
+use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use codex_plugin::AppConnectorId;
 use codex_plugin::PluginCapabilitySummary;
@@ -23,20 +28,110 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering;
-use wiremock::Mock;
-use wiremock::MockServer;
-use wiremock::Request;
-use wiremock::ResponseTemplate;
-use wiremock::matchers::method;
-use wiremock::matchers::path;
+use std::time::Duration;
 
 #[tokio::test]
-async fn status_snapshot_only_downgrades_oauth_authentication_failures() {
+async fn ema_auth_statuses_do_not_wait_for_account_refresh() -> anyhow::Result<()> {
+    let home = tempfile::tempdir()?;
+    // Account ID token for user/workspace, issued by idp.example to account-client.
+    let id_token = concat!(
+        "eyJhbGciOiJFUzI1NiJ9.",
+        "eyJpc3MiOiJodHRwczovL2lkcC5leGFtcGxlIiwic3ViIjoidXNlciIsImF1ZCI6ImFjY291bnQt",
+        "Y2xpZW50IiwiZXhwIjoxLCJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF91",
+        "c2VyX2lkIjoidXNlciIsImNoYXRncHRfYWNjb3VudF9pZCI6IndvcmtzcGFjZSJ9fQ",
+        ".signature",
+    );
+    std::fs::write(
+        home.path().join("auth.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "auth_mode": "chatgpt",
+            "tokens": {
+                "id_token": id_token,
+                "access_token": "account-access",
+                "refresh_token": "account-refresh",
+                "account_id": "workspace",
+                "login_owner_id": "completed-login",
+                "oauth_provenance": {
+                    "issuer": "https://idp.example",
+                    "client_id": "account-client"
+                }
+            },
+            "last_refresh": "2099-01-01T00:00:00Z"
+        }))?,
+    )?;
+    let manager = AuthManager::shared(
+        home.path().to_path_buf(),
+        /*enable_codex_api_key_env*/ false,
+        AuthCredentialsStoreMode::File,
+        /*forced_chatgpt_workspace_id*/ None,
+        /*chatgpt_base_url*/ None,
+        AuthKeyringBackendKind::default(),
+        codex_login::test_support::transport_default_auth_route_config(),
+    )
+    .await;
+    let auth = manager.auth_cached().context("account auth")?;
+    let lease = manager
+        .lease_account_oauth_grant()
+        .await?
+        .context("account grant")?;
+    let mut servers = HashMap::new();
+    for name in ["first", "second"] {
+        let mut server: McpServerConfig = serde_json::from_value(serde_json::json!({
+            "url": format!("https://resource.example/{name}"),
+            "auth": "ema_auth"
+        }))?;
+        server
+            .resolve_ema_registration(&codex_config::McpServerIdpOAuthConfig {
+                issuer: "https://idp.example".into(),
+                client_id: "enterprise-client".into(),
+                client_secret: None,
+                token_endpoint_auth_method: None,
+            })
+            .map_err(anyhow::Error::msg)?;
+        servers.insert(
+            name.to_string(),
+            EffectiveMcpServer::from_host_config(server),
+        );
+    }
+    let runtime_context = McpRuntimeContext::new(
+        Arc::new(environment_manager_without_environments()),
+        home.path().to_path_buf(),
+    );
+    let statuses = tokio::time::timeout(
+        Duration::from_secs(5),
+        compute_auth_statuses(
+            servers.iter(),
+            OAuthCredentialsStoreMode::File,
+            AuthKeyringBackendKind::default(),
+            Some(&auth),
+            Some(&manager),
+            &crate::EmaState::default(),
+            &runtime_context,
+        ),
+    )
+    .await
+    .context("MCP auth status waited for the held account lease")?;
+    assert_eq!(
+        statuses
+            .into_iter()
+            .map(|(name, entry)| (name, entry.auth_state))
+            .collect::<HashMap<_, _>>(),
+        HashMap::from([
+            ("first".to_string(), McpAuthState::BearerToken),
+            ("second".to_string(), McpAuthState::BearerToken),
+        ]),
+    );
+    drop(lease);
+    Ok(())
+}
+
+#[tokio::test]
+async fn status_snapshot_only_downgrades_oauth_and_ema_authentication_failures() {
     let auth_failure = StartupOutcomeError::Failed {
         error: "OAuth refresh token was rejected".to_string(),
         is_authentication_required: true,
+        is_ema_authentication_required: false,
+        shutdown: None,
     };
     let mut manager = McpConnectionSet::empty(/*prefix_mcp_tool_names*/ true);
     let mut auth_status_entries = HashMap::new();
@@ -53,19 +148,37 @@ async fn status_snapshot_only_downgrades_oauth_authentication_failures() {
             Some(StartupOutcomeError::Failed {
                 error: "provider temporarily unavailable".to_string(),
                 is_authentication_required: false,
+                is_ema_authentication_required: false,
+                shutdown: None,
             }),
+        ),
+        (
+            "ema-failed",
+            McpAuthState::BearerToken,
+            Some(auth_failure.clone()),
+        ),
+        ("ema-ready", McpAuthState::BearerToken, None),
+        (
+            "ema-provider-error",
+            McpAuthState::BearerToken,
+            Some(anyhow::anyhow!("provider temporarily unavailable").into()),
         ),
         ("bearer", McpAuthState::BearerToken, Some(auth_failure)),
     ] {
         let mut client = create_ready_async_managed_client(Vec::new()).await;
         if let Some(error) = startup_error {
-            client.client = futures::future::ready(Err(error)).boxed().shared().into();
+            client.client = (futures::future::ready(Err(error)).boxed().shared()).into();
         }
         manager.insert_test_client(name, client);
         auth_status_entries.insert(
             name.to_string(),
             McpAuthStatusEntry {
-                config: None,
+                config: name.starts_with("ema-").then(|| {
+                    serde_json::from_value(serde_json::json!({
+                        "url": "https://example.com/mcp", "auth": "ema_auth",
+                    }))
+                    .expect("EMA config")
+                }),
                 auth_state,
             },
         );
@@ -79,7 +192,8 @@ async fn status_snapshot_only_downgrades_oauth_authentication_failures() {
         McpSnapshotDetail::ToolsAndAuthOnly,
         crate::McpAttemptAccess::Unscoped,
     )
-    .await;
+    .await
+    .unwrap();
 
     assert_eq!(
         snapshot.auth_statuses,
@@ -87,6 +201,9 @@ async fn status_snapshot_only_downgrades_oauth_authentication_failures() {
             ("oauth-failed".to_string(), McpAuthStatus::NotLoggedIn),
             ("oauth-ready".to_string(), McpAuthStatus::OAuth),
             ("oauth-provider-error".to_string(), McpAuthStatus::OAuth),
+            ("ema-failed".to_string(), McpAuthStatus::NotLoggedIn),
+            ("ema-ready".to_string(), McpAuthStatus::BearerToken),
+            ("ema-provider-error".to_string(), McpAuthStatus::BearerToken),
             ("bearer".to_string(), McpAuthStatus::BearerToken),
         ]),
     );
@@ -99,6 +216,8 @@ pub(crate) fn test_mcp_config(codex_home: PathBuf) -> McpConfig {
         requires_read_only_mcp_tools: false,
         codex_home,
         mcp_enterprise_managed_auth: None,
+        ema_state: Default::default(),
+        mcp_ema_cancellation: codex_config::McpEmaCancellation::default(),
         xaa_enabled: false,
         mcp_oauth_credentials_store_mode: OAuthCredentialsStoreMode::default(),
         oauth_refresh_mode: McpOAuthRefreshMode::Legacy,
@@ -109,16 +228,23 @@ pub(crate) fn test_mcp_config(codex_home: PathBuf) -> McpConfig {
         skill_mcp_dependency_install_enabled: true,
         approval_policy: Constrained::allow_any(AskForApproval::OnRequest),
         permission_profile: PermissionProfile::default(),
+        host_cwd: AbsolutePathBuf::current_dir().expect("test working directory"),
         config_layer_stack: codex_config::ConfigLayerStack::default(),
+        plugins: Default::default(),
         approvals_reviewer: codex_config::types::ApprovalsReviewer::default(),
         environment_cwds: HashMap::new(),
-        server_permission_profiles: HashMap::new(),
+        environment_use_mxc: HashMap::new(),
+        server_permissions: HashMap::new(),
+        codex_self_exe: None,
         codex_linux_sandbox_exe: None,
         use_legacy_landlock: false,
         apps_enabled: false,
+        apps_early_resource_discovery: false,
         prefix_mcp_tool_names: true,
         non_prefixed_mcp_tool_servers: Vec::new(),
         protocol_mode: McpProtocolMode::Legacy,
+        discover_local_stdio: false,
+        mcp_tool_list_changed: true,
         host_owned_apps_protocol_mode: McpProtocolMode::Legacy,
         client_elicitation_capability: ElicitationCapability::default(),
         mcp_server_catalog: ResolvedMcpCatalog::default(),
@@ -133,15 +259,15 @@ pub(crate) fn test_elicitation_config(
 ) -> Arc<McpConfig> {
     let mut config = test_mcp_config(PathBuf::new());
     config.approval_policy = Constrained::allow_any(approval_policy);
-    config.permission_profile = permission_profile.clone();
+    config.permission_profile = permission_profile;
     config
-        .server_permission_profiles
-        .insert(server_name.to_string(), permission_profile);
+        .server_permissions
+        .insert(server_name.to_string(), McpServerPermissions::Thread);
     Arc::new(config)
 }
 
 #[test]
-fn ema_catalog_supports_configured_installed_and_selected_plugins_without_widening_policy() {
+fn ema_catalog_allows_only_configured_servers_without_widening_policy() {
     let server: McpServerConfig = serde_json::from_value(serde_json::json!({
         "url": "https://resource.example/mcp", "auth": "ema_auth",
         "oauth": { "client_id": "resource-client", "authorization_server_issuer": "https://as.example" }
@@ -168,6 +294,8 @@ fn ema_catalog_supports_configured_installed_and_selected_plugins_without_wideni
     let mut config = test_mcp_config(PathBuf::new());
     let idp = codex_config::McpServerIdpOAuthConfig {
         issuer: "https://idp.example".into(),
+        client_secret: None,
+        token_endpoint_auth_method: None,
         client_id: "enterprise-client".into(),
     };
     let deny_all = codex_protocol::mcp_policy::EnvironmentMcpPolicy {
@@ -188,11 +316,9 @@ fn ema_catalog_supports_configured_installed_and_selected_plugins_without_wideni
         });
         let servers = effective_mcp_servers(&config, /*auth*/ None);
         for name in ["configured", "installed", "selected"] {
-            assert_eq!(servers[name].enabled(), xaa_enabled && !denied, "{name}");
-            assert_eq!(
-                servers[name].config().oauth_idp(),
-                xaa_enabled.then_some(&idp)
-            );
+            let eligible = name == "configured" && xaa_enabled;
+            assert_eq!(servers[name].enabled(), eligible && !denied, "{name}");
+            assert_eq!(servers[name].config().oauth_idp(), eligible.then_some(&idp));
             assert_eq!(servers[name].config().auth, McpServerAuth::EmaAuth);
         }
     }
@@ -233,7 +359,7 @@ fn mcp_server_permissions_handle_unattached_and_threadless_servers() {
     config.mcp_server_catalog = catalog.build();
     let servers = effective_mcp_servers(&config, /*auth*/ None);
     assert_eq!(config.permission_profile_for_server("selected"), None);
-    config.set_server_permission_profiles(&servers, std::iter::empty());
+    config.set_server_permissions(&servers, std::iter::empty());
 
     assert_eq!(
         config.permission_profile_for_server("selected"),
@@ -304,17 +430,6 @@ fn mcp_prompt_auto_approval_honors_approved_tools_in_all_permission_modes() {
         ));
     }
 
-    assert!(!mcp_permission_prompt_is_auto_approved(
-        AskForApproval::OnRequest,
-        &PermissionProfile::read_only(),
-        McpPermissionPromptAutoApproveContext {
-            tool_approval_mode: Some(AppToolApproval::Auto),
-        },
-    ));
-}
-
-#[test]
-fn mcp_prompt_auto_approval_rejects_auto_mode_in_default_permission_mode() {
     assert!(!mcp_permission_prompt_is_auto_approved(
         AskForApproval::OnRequest,
         &PermissionProfile::read_only(),
@@ -455,6 +570,10 @@ fn codex_apps_mcp_url_for_base_url_uses_plugin_service_paths() {
     assert_eq!(
         codex_apps_mcp_url_for_base_url("https://chat.openai.com"),
         "https://chat.openai.com/backend-api/ps/mcp"
+    );
+    assert_eq!(
+        codex_apps_mcp_url_for_base_url("https://gov.chatgpt.com/backend-api/"),
+        "https://gov.chatgpt.com/backend-api/ps/mcp"
     );
     assert_eq!(
         codex_apps_mcp_url_for_base_url("http://localhost:8080/api/codex"),
@@ -614,10 +733,52 @@ fn effective_mcp_servers_require_catalog_registration() {
 }
 
 #[test]
-fn effective_mcp_servers_preserve_chatgpt_auth_for_staging() {
+fn effective_mcp_servers_preserve_chatgpt_auth_for_trusted_origins() {
+    for (base_url, server_url) in [
+        ("https://chatgpt-staging.com", "https://chatgpt-staging.com"),
+        (
+            "https://preview.chatgpt-staging.com",
+            "https://preview.chatgpt-staging.com",
+        ),
+        ("https://gov.chatgpt.com", "https://chatgpt.com"),
+        (
+            "https://chatgpt.com",
+            "https://gov.chatgpt.com/backend-api/",
+        ),
+        ("https://chatgpt.com", "https://GOV.CHATGPT.COM:443"),
+    ] {
+        let mut config = test_mcp_config(PathBuf::new());
+        config.chatgpt_base_url = base_url.to_string();
+        let server = codex_apps_mcp_server_config(
+            server_url, /*apps_mcp_product_sku*/ None, /*originator*/ None,
+        );
+        let mut catalog = ResolvedMcpCatalog::builder();
+        catalog.register(McpServerRegistration::from_config(
+            "trusted".to_string(),
+            server,
+        ));
+        config.mcp_server_catalog = catalog.build();
+
+        let effective = effective_mcp_servers(&config, /*auth*/ None);
+
+        assert_eq!(
+            effective["trusted"].config().auth,
+            McpServerAuth::ChatGpt,
+            "backend {base_url}, server {server_url}",
+        );
+    }
+}
+
+#[test]
+fn effective_mcp_servers_reject_untrusted_origins_for_chatgpt_auth() {
     for url in [
-        "https://chatgpt-staging.com",
-        "https://preview.chatgpt-staging.com",
+        "http://gov.chatgpt.com",
+        "https://gov.chatgpt.com:8443",
+        "https://gov.chatgpt.com.evil.example",
+        "https://sub.gov.chatgpt.com",
+        "https://gov.chatgpt.com.",
+        "https://gov.chatgpt.com@evil.example",
+        "https://example.com",
     ] {
         let mut config = test_mcp_config(PathBuf::new());
         config.chatgpt_base_url = url.to_string();
@@ -626,15 +787,18 @@ fn effective_mcp_servers_preserve_chatgpt_auth_for_staging() {
         );
         let mut catalog = ResolvedMcpCatalog::builder();
         catalog.register(McpServerRegistration::from_config(
-            "staging".to_string(),
-            server.clone(),
+            "untrusted".to_string(),
+            server,
         ));
         config.mcp_server_catalog = catalog.build();
-        let configured = HashMap::from([("staging".to_string(), server)]);
-        let effective =
-            effective_mcp_servers_from_configured(configured, &config, /*auth*/ None);
 
-        assert_eq!(effective["staging"].config().auth, McpServerAuth::ChatGpt);
+        let effective = effective_mcp_servers(&config, /*auth*/ None);
+
+        assert_eq!(
+            effective["untrusted"].config().auth,
+            McpServerAuth::OAuth,
+            "server {url}",
+        );
     }
 }
 
@@ -662,9 +826,9 @@ async fn effective_mcp_servers_preserve_runtime_servers() {
             required: false,
             startup_readiness: Default::default(),
             supports_parallel_tool_calls: false,
-            tool_input_schema_max_bytes: None,
             thread_identity_eligible: false,
             control_endpoint_eligible: false,
+            tool_input_schema_max_bytes: None,
             omit_tools_from: None,
             disabled_reason: None,
             startup_timeout_sec: None,
@@ -694,9 +858,9 @@ async fn effective_mcp_servers_preserve_runtime_servers() {
             required: false,
             startup_readiness: Default::default(),
             supports_parallel_tool_calls: false,
-            tool_input_schema_max_bytes: None,
             thread_identity_eligible: false,
             control_endpoint_eligible: false,
+            tool_input_schema_max_bytes: None,
             omit_tools_from: None,
             disabled_reason: None,
             startup_timeout_sec: None,
@@ -754,130 +918,89 @@ async fn effective_mcp_servers_preserve_runtime_servers() {
     }
 }
 
-/// A status probe owns no thread identity, but it is still hosted by the
-/// app-server process. An eligible provider must receive that process's
-/// endpoint before status reports its tools, just as it does during session
-/// startup.
-#[tokio::test]
-async fn status_snapshot_discloses_the_process_control_endpoint_to_an_eligible_provider() {
-    // Exercise the production gated status path, including its first-poll
-    // authority transfer, without changing the endpoint-disclosure proof.
-    struct StatusWork;
-    impl crate::McpAttemptWork for StatusWork {
-        fn derive_attempt(
-            &self,
-        ) -> Result<Box<dyn crate::McpAttemptWork>, crate::McpAttemptRefused> {
-            Ok(Box::new(Self))
-        }
+struct RefusedThreadlessWork(std::sync::atomic::AtomicUsize);
+
+impl crate::McpAttemptWork for RefusedThreadlessWork {
+    fn derive_attempt(&self) -> Result<Box<dyn crate::McpAttemptWork>, crate::McpAttemptRefused> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(crate::McpAttemptRefused)
     }
-    const ENDPOINT: &str = "unix:///tmp/kcf-status-control.sock";
-    let server = MockServer::start().await;
-    let endpoint_request_received = Arc::new(AtomicBool::new(false));
-    let endpoint_request_observed = Arc::clone(&endpoint_request_received);
-    Mock::given(method("POST"))
-        .and(path("/mcp"))
-        .respond_with(move |request: &Request| {
-            let body: serde_json::Value = request.body_json().expect("valid JSON-RPC request");
-            match body["method"].as_str() {
-                Some("initialize") => ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": body["id"],
-                    "result": {
-                        "protocolVersion": "2025-06-18",
-                        "capabilities": {
-                            "tools": {},
-                            "experimental": {
-                                "codex/control-endpoint": {"versions": [1]}
-                            }
-                        },
-                        "serverInfo": {"name": "status-endpoint-test-server", "version": "1.0.0"},
-                    },
-                })),
-                Some("notifications/initialized") => ResponseTemplate::new(202),
-                Some("codex/control-endpoint") => {
-                    let params = body["params"].as_object().expect("endpoint params object");
-                    assert_eq!(params["version"], serde_json::json!(1));
-                    assert_eq!(params["endpoint"], serde_json::json!(ENDPOINT));
-                    endpoint_request_observed.store(true, Ordering::SeqCst);
-                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                        "jsonrpc": "2.0",
-                        "id": body["id"],
-                        "result": {"version": 1, "accepted": true},
-                    }))
-                }
-                Some("tools/list") => ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": body["id"],
-                    "result": {"tools": []},
-                })),
-                other => panic!("unexpected status MCP method: {other:?}"),
-            }
-        })
-        .mount(&server)
-        .await;
+}
 
-    let codex_home = tempfile::tempdir().expect("tempdir");
-    let mut config = test_mcp_config(codex_home.path().to_path_buf());
-    let mut catalog = ResolvedMcpCatalog::builder();
-    catalog.register(McpServerRegistration::from_config(
-        "eligible-status-provider".to_string(),
-        McpServerConfig {
-            auth: Default::default(),
-            transport: McpServerTransportConfig::StreamableHttp {
-                url: format!("{}/mcp", server.uri()),
-                bearer_token_env_var: None,
-                http_headers: None,
-                env_http_headers: None,
-                http_headers_helper: None,
-            },
-            environment_id: codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(),
-            enabled: true,
-            required: false,
-            supports_parallel_tool_calls: false,
-            thread_identity_eligible: false,
-            control_endpoint_eligible: true,
-            omit_tools_from: None,
-            disabled_reason: None,
-            startup_timeout_sec: None,
-            tool_timeout_sec: None,
-            startup_readiness: Default::default(),
-            tool_input_schema_max_bytes: None,
-            default_tools_approval_mode: None,
-            enabled_tools: None,
-            disabled_tools: None,
-            scopes: None,
-            oauth: None,
-            oauth_resource: None,
-            tools: HashMap::new(),
-        },
-    ));
-    config.mcp_server_catalog = catalog.build();
-
-    let snapshot = collect_mcp_server_status_snapshot_with_detail(
-        &config,
+#[tokio::test]
+async fn threadless_resource_refuses_attempt_derivation_before_runtime_startup() {
+    let home = tempfile::tempdir().unwrap();
+    let work = RefusedThreadlessWork(std::sync::atomic::AtomicUsize::new(0));
+    let result = read_mcp_resource(
+        &test_mcp_config(home.path().to_path_buf()),
+        None,
         None,
         McpRuntimeContext::new(
-            std::sync::Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
-            codex_home.path().to_path_buf(),
+            Arc::new(environment_manager_without_environments()),
+            home.path().to_path_buf(),
         ),
-        ConnectorRuntimeManager::default(),
-        crate::McpToolCatalogCache::default(),
-        McpSnapshotDetail::ToolsAndAuthOnly,
+        Default::default(),
+        Default::default(),
+        "unknown-server",
+        ReadResourceRequestParams::new("test://resource"),
+        crate::McpAttemptAccess::Admitted(&work),
+    )
+    .await;
+    assert!(
+        result
+            .err()
+            .expect("refused attempt")
+            .downcast_ref::<crate::McpAttemptRefused>()
+            .is_some()
+    );
+    assert_eq!(work.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn threadless_status_refuses_attempt_derivation_before_empty_catalog_return() {
+    let home = tempfile::tempdir().unwrap();
+    let config = test_mcp_config(home.path().to_path_buf());
+    let work = RefusedThreadlessWork(std::sync::atomic::AtomicUsize::new(0));
+    let result = collect_mcp_server_status_snapshot_with_detail(
+        &config,
         None,
-        Some(ENDPOINT.to_string()),
-        crate::McpAttemptAccess::Admitted(&StatusWork),
+        None,
+        None,
+        McpRuntimeContext::new(
+            Arc::new(environment_manager_without_environments()),
+            home.path().to_path_buf(),
+        ),
+        Default::default(),
+        Default::default(),
+        McpSnapshotDetail::Full,
+        None,
+        crate::McpAttemptAccess::Admitted(&work),
+    )
+    .await;
+    assert!(
+        result
+            .err()
+            .expect("refused attempt")
+            .downcast_ref::<crate::McpAttemptRefused>()
+            .is_some()
+    );
+    assert_eq!(work.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let unscoped = collect_mcp_server_status_snapshot_with_detail(
+        &config,
+        None,
+        None,
+        None,
+        McpRuntimeContext::new(
+            Arc::new(environment_manager_without_environments()),
+            home.path().to_path_buf(),
+        ),
+        Default::default(),
+        Default::default(),
+        McpSnapshotDetail::Full,
+        None,
+        crate::McpAttemptAccess::Unscoped,
     )
     .await
-    .expect("status snapshot");
-
-    assert!(
-        endpoint_request_received.load(Ordering::SeqCst),
-        "eligible status provider must receive and acknowledge the process control endpoint"
-    );
-    assert!(
-        snapshot
-            .server_infos
-            .contains_key("eligible-status-provider"),
-        "status may report provider tools only after its endpoint acknowledgement"
-    );
+    .expect("standalone empty catalog remains ungated");
+    assert!(unscoped.server_names.is_empty());
 }

@@ -76,6 +76,25 @@ struct RefreshCounter {
 }
 
 impl ModelsManager for RefreshCounter {
+    fn model_catalog_with_origins(
+        &self,
+        strategy: RefreshStrategy,
+        factory: HttpClientFactory,
+    ) -> ModelsManagerFuture<'_, Vec<codex_models_manager::CatalogModel>> {
+        self.inner.model_catalog_with_origins(strategy, factory)
+    }
+
+    fn get_model_info<'a>(
+        &'a self,
+        model: &'a str,
+        config: &'a codex_models_manager::ModelsManagerConfig,
+    ) -> ModelsManagerFuture<'a, codex_models_manager::CatalogModel> {
+        self.inner.get_model_info(model, config)
+    }
+
+    fn ensure_initialized(&self, factory: HttpClientFactory) -> ModelsManagerFuture<'_, ()> {
+        self.inner.ensure_initialized(factory)
+    }
     fn raw_model_catalog(
         &self,
         strategy: RefreshStrategy,
@@ -201,13 +220,14 @@ async fn mailbox_retries_after_reopen_without_an_unrelated_submission(reopen: bo
                 Vec::new(),
                 "retry".into(),
                 /*trigger_turn*/ true,
-            ),
+            )
+            .into(),
             Default::default(),
         )
         .await;
     session.input_queue.completion_wake.notify_one();
     let (sender, receiver) = async_channel::bounded(1);
-    let loop_task = tokio::spawn(super::super::handlers::submission_loop(
+    let loop_task = tokio::spawn(super::super::handlers::submission_loop_with_dispatch(
         Arc::clone(&session),
         context.config.clone(),
         receiver,
@@ -220,6 +240,45 @@ async fn mailbox_retries_after_reopen_without_an_unrelated_submission(reopen: bo
     assert_eq!(models.calls.load(Ordering::SeqCst), 0);
     assert!(session.input_queue.has_pending_mailbox_items().await);
     if reopen {
+        // Make the retry arm take its original hint, then let an unrelated
+        // control dispatch win a select iteration before the host reopens.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while session
+                .input_queue
+                .work_retry
+                .pending
+                .lock()
+                .unwrap()
+                .is_some()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let (reply, result) = tokio::sync::oneshot::channel();
+        sender
+            .send(crate::session::Submission {
+                id: "unrelated-control".into(),
+                op: codex_protocol::protocol::Op::InterruptIfNoPendingInput {
+                    turn_id: "not-an-active-turn".into(),
+                    reply,
+                },
+                trace: None,
+                turn_extension_init: None,
+                parent_turn_id: None,
+                root_turn_id: None,
+                residency_guard: None,
+                message_delivery: None,
+            })
+            .await
+            .unwrap();
+        assert!(
+            !tokio::time::timeout(Duration::from_secs(10), result)
+                .await
+                .unwrap()
+                .unwrap()
+        );
         open.send(true).unwrap();
         tokio::time::timeout(Duration::from_secs(10), start.0.notified())
             .await
@@ -276,7 +335,7 @@ async fn refused_mailbox_start_preserves_mail_without_model_refresh(trigger: boo
     );
     session
         .input_queue
-        .enqueue_mailbox_communication(mail.clone(), Default::default())
+        .enqueue_mailbox_communication(mail.clone().into(), Default::default())
         .await;
     session
         .maybe_start_turn_for_pending_work_with_sub_id("refused".into())
@@ -286,7 +345,9 @@ async fn refused_mailbox_start_preserves_mail_without_model_refresh(trigger: boo
     assert!(session.active_turn.lock().await.is_none());
     assert_eq!(
         session.input_queue.drain_mailbox_input_items().await.0,
-        vec![crate::session::TurnInput::InterAgentCommunication(mail)]
+        vec![crate::session::TurnInput::InterAgentCommunication(
+            mail.into()
+        )]
     );
 }
 
@@ -321,7 +382,7 @@ async fn mailbox_preparation_owns_its_admission(carried: bool) {
     });
     session
         .input_queue
-        .enqueue_mailbox_with_work(mail, Default::default(), work);
+        .enqueue_mailbox_with_work(mail.into(), Default::default(), work);
     let mut start =
         Box::pin(session.maybe_start_turn_for_pending_work_with_sub_id("consumer".into()));
     tokio::time::timeout(Duration::from_secs(10), async {
@@ -368,7 +429,7 @@ async fn installed_mailbox_turn_transfers_fresh_work_to_terminal_custody() {
     );
     session
         .input_queue
-        .enqueue_mailbox_communication(mail, Default::default())
+        .enqueue_mailbox_communication(mail.into(), Default::default())
         .await;
     session
         .maybe_start_turn_for_pending_work_with_sub_id("installed".into())
@@ -528,4 +589,131 @@ async fn realtime_handoff_owns_turn_admission(closed: bool) {
         .task_joins
         .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(5))
         .await;
+}
+
+#[derive(Debug)]
+struct MissingWorkHost(bool);
+impl TurnStartAdmission for MissingWorkHost {
+    fn admit_turn_start(&self) -> Option<Box<dyn Send>> {
+        Some(Box::new(()))
+    }
+    fn requires_account_work(&self) -> bool {
+        self.0
+    }
+}
+
+#[test_case::test_case(true; "required absence refuses before discovery")]
+#[test_case::test_case(false; "ungated absence preserves native wake")]
+#[tokio::test]
+async fn fresh_mailbox_work_requires_a_real_owner_only_under_required_policy(required: bool) {
+    let (mut session, _) = make_session_and_context().await;
+    session.services.host_admission = Some(Arc::new(MissingWorkHost(required)));
+    let models = Arc::new(RefreshCounter {
+        inner: Arc::clone(&session.services.models_manager),
+        calls: AtomicUsize::new(0),
+    });
+    session.services.models_manager = models.clone();
+    let mut builder = codex_extension_api::ExtensionRegistryBuilder::new();
+    builder.turn_lifecycle_contributor(Arc::new(HoldRunningTurn));
+    session.services.extensions = Arc::new(builder.build());
+    let session = Arc::new(session);
+    session
+        .input_queue
+        .enqueue_mailbox_communication(
+            InterAgentCommunication::new(
+                codex_protocol::AgentPath::root(),
+                codex_protocol::AgentPath::root(),
+                Vec::new(),
+                "explicit required/ungated host policy".into(),
+                true,
+            )
+            .into(),
+            Default::default(),
+        )
+        .await;
+    session
+        .maybe_start_turn_for_pending_work_with_sub_id("policy-wake".into())
+        .await;
+    if required {
+        assert_eq!(models.calls.load(Ordering::SeqCst), 0);
+        assert!(session.active_turn.lock().await.is_none());
+        assert!(session.input_queue.has_pending_mailbox_items().await);
+        assert!(session.state.lock().await.last_started_turn_id.is_none());
+    } else {
+        assert_eq!(models.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            session.state.lock().await.last_started_turn_id.as_deref(),
+            Some("policy-wake")
+        );
+        session.close_task_admission().await;
+        session
+            .abort_all_tasks(codex_protocol::protocol::TurnAbortReason::Interrupted)
+            .await;
+    }
+}
+
+#[tokio::test]
+async fn closing_admission_cancels_registration_created_while_closer_waits_for_active_lock() {
+    let (session, _) = make_session_and_context().await;
+    session
+        .services
+        .thread_extension_data
+        .insert(codex_extension_items::sleep::SleepItem {
+            id: "sleep".into(),
+            duration_ms: 1000,
+        });
+    let session = Arc::new(session);
+    session
+        .input_queue
+        .enqueue_mailbox_communication(
+            InterAgentCommunication::new(
+                codex_protocol::AgentPath::root(),
+                codex_protocol::AgentPath::root(),
+                Vec::new(),
+                "reservation in the close-admission lock gap".into(),
+                false,
+            )
+            .into(),
+            Default::default(),
+        )
+        .await;
+    // The real reservation owns active_turn while waiting for previous options.
+    let (reserve, close) = {
+        let state = session.state.lock().await;
+        let mut reserve = Box::pin(session.reserve_pending_work_turn("closing-race"));
+        assert!(
+            std::future::Future::poll(
+                reserve.as_mut(),
+                &mut std::task::Context::from_waker(std::task::Waker::noop())
+            )
+            .is_pending()
+        );
+        // This closer has performed its optimistic cancellation before registration
+        // exists; it is now waiting for that actual reservation's active_turn lock.
+        let mut close = Box::pin(session.close_task_admission());
+        assert!(
+            std::future::Future::poll(
+                close.as_mut(),
+                &mut std::task::Context::from_waker(std::task::Waker::noop())
+            )
+            .is_pending()
+        );
+        drop(state);
+        (reserve, close)
+    };
+    let (_, _, mailbox, work, registration) = tokio::time::timeout(Duration::from_secs(5), reserve)
+        .await
+        .unwrap()
+        .expect("the already-reserving operation returns its owner");
+    tokio::time::timeout(Duration::from_secs(5), close)
+        .await
+        .unwrap();
+    assert!(registration.cancelled().now_or_never().is_some());
+    assert!(session.active_turn.lock().await.is_none());
+    assert!(session.state.lock().await.last_started_turn_id.is_none());
+    drop(work);
+    drop(mailbox);
+    drop(registration);
+    assert!(session.input_queue.has_pending_mailbox_items().await);
+    assert!(!session.input_queue.preparation.is_busy());
 }

@@ -26,6 +26,7 @@ use codex_extension_api::TurnAbortInput;
 use codex_extension_api::TurnCommittedInput;
 use codex_extension_api::TurnErrorInput;
 use codex_extension_api::TurnLifecycleContributor;
+use codex_extension_api::TurnPreparationAccess;
 use codex_extension_api::TurnStartInput;
 use codex_extension_api::TurnStopInput;
 use codex_otel::MetricsClient;
@@ -95,11 +96,9 @@ impl<C> GoalExtension<C> {
             goal_config: Arc::new(goal_config),
         }
     }
-
     async fn clear_continuation_deferral_after_turn(&self, thread_id: ThreadId) {
-        // Preparation can be refused before installation. Only an installed
-        // turn's terminal callback consumes the fork's continuation deferral.
-        // A crash before that callback deliberately leaves the goal deferred.
+        // Preparation may be abandoned. Only an installed turn's terminal
+        // callback consumes the durable fork deferral; a crash keeps it deferred.
         if let Err(err) = self
             .state_dbs
             .thread_goals()
@@ -195,11 +194,32 @@ where
 
     fn on_thread_idle<'a>(&'a self, input: ThreadIdleInput<'a>) -> ExtensionFuture<'a, ()> {
         Box::pin(async move {
+            let work = input.account_work.and_then(|work| {
+                work.map(|work| {
+                    work.derive_operation()
+                        .map_err(|_| codex_protocol::mcp_work::McpAttemptRefused)
+                })
+                .transpose()
+            });
             let Some(runtime) = goal_runtime_handle(input.thread_store) else {
                 return;
             };
 
-            if let Err(err) = runtime.continue_if_idle().await {
+            let accounting = runtime.accounting_state();
+            if let Some(turn_id) = accounting.interrupted_turn_id() {
+                if let Err(err) = runtime
+                    .stop_active_goal_for_turn(&turn_id, ActiveGoalStopReason::EmptyResponse)
+                    .await
+                {
+                    tracing::warn!("failed to stop goal after interrupted empty turns: {err}");
+                }
+                accounting.finish_turn(&turn_id);
+            }
+            // Local interrupted-turn accounting above remains valid on refusal;
+            // automatic account-bound continuation does not.
+            if let Ok(work) = work
+                && let Err(err) = runtime.continue_if_idle_with_work(work.as_deref()).await
+            {
                 tracing::warn!(
                     "failed to continue active goal for idle thread {}: {err}",
                     runtime.thread_id()
@@ -237,12 +257,20 @@ where
     }
 }
 
+// A retained context may be reused; an old prepared snapshot must not publish
+// through a different host preparation even when the textual turn ID matches.
+struct PreparedGoalTurn {
+    accounting: GoalTurnPreparation,
+    resources: Arc<TurnPreparationAccess>,
+}
+
 impl<C> TurnLifecycleContributor for GoalExtension<C>
 where
     C: Send + Sync + 'static,
 {
     fn on_turn_start<'a>(&'a self, input: TurnStartInput<'a>) -> ExtensionFuture<'a, ()> {
         Box::pin(async move {
+            input.turn_store.remove::<PreparedGoalTurn>();
             let Some(runtime) = goal_runtime_handle(input.thread_store) else {
                 return;
             };
@@ -255,7 +283,18 @@ where
                 return;
             };
 
+            let Some(resources) = input.turn_store.get::<TurnPreparationAccess>() else {
+                tracing::warn!("skipping goal preparation: no host preparation owner");
+                return;
+            };
             let accounting = runtime.accounting_state();
+            let Ok(permit) = accounting.turn_start_permit().await else {
+                return;
+            };
+            if resources.retain(input.turn_id, permit).is_err() {
+                tracing::warn!("skipping goal preparation: host preparation ended");
+                return;
+            }
             let mut prepared = accounting.prepare_turn(
                 input.turn_id,
                 input.collaboration_mode.mode,
@@ -265,7 +304,10 @@ where
                 input.collaboration_mode.mode,
                 codex_protocol::config_types::ModeKind::Plan
             ) {
-                input.turn_store.insert(prepared);
+                input.turn_store.insert(PreparedGoalTurn {
+                    accounting: prepared,
+                    resources,
+                });
                 return;
             }
             let Ok(goal) = self
@@ -274,7 +316,10 @@ where
                 .get_thread_goal(runtime.thread_id())
                 .await
             else {
-                input.turn_store.insert(prepared);
+                input.turn_store.insert(PreparedGoalTurn {
+                    accounting: prepared,
+                    resources,
+                });
                 return;
             };
             if let Some(goal) = goal
@@ -286,7 +331,10 @@ where
             {
                 prepared.activate_goal(goal.goal_id, &accounting);
             }
-            input.turn_store.insert(prepared);
+            input.turn_store.insert(PreparedGoalTurn {
+                accounting: prepared,
+                resources,
+            });
         })
     }
 
@@ -294,12 +342,18 @@ where
         let Some(runtime) = goal_runtime_handle(input.thread_store) else {
             return;
         };
-        let Some(prepared) = input.turn_store.remove::<GoalTurnPreparation>() else {
+        let Some(prepared) = input.turn_store.remove::<PreparedGoalTurn>() else {
             return;
         };
+        let Some(current) = input.turn_store.get::<TurnPreparationAccess>() else {
+            return;
+        };
+        if !Arc::ptr_eq(&prepared.resources, &current) {
+            return;
+        }
         runtime
             .accounting_state()
-            .commit_prepared_turn(input.turn_id, &prepared);
+            .commit_prepared_turn(input.turn_id, &prepared.accounting);
     }
 
     fn on_item_completed<'a>(
@@ -330,7 +384,6 @@ where
 
             self.clear_continuation_deferral_after_turn(runtime.thread_id())
                 .await;
-
             let turn_id = input.turn_store.level_id();
             if let Some(expected_goal_id) =
                 runtime.accounting_state().execution_failure_goal(turn_id)
@@ -393,16 +446,18 @@ where
             let Some(runtime) = goal_runtime_handle(input.thread_store) else {
                 return;
             };
-            runtime.accounting_state().reset_empty_responses();
             if !runtime.is_enabled() {
+                runtime.accounting_state().reset_empty_responses();
                 return;
             }
 
             self.clear_continuation_deferral_after_turn(runtime.thread_id())
                 .await;
-
             let turn_id = input.turn_store.level_id();
             input.thread_store.remove::<TurnStartOptions>();
+            if input.reason != codex_protocol::protocol::TurnAbortReason::Interrupted {
+                runtime.accounting_state().reset_empty_responses();
+            }
             if let Err(err) = runtime
                 .account_active_goal_progress(
                     turn_id,
@@ -417,7 +472,17 @@ where
                 );
                 return;
             }
-            runtime.accounting_state().finish_turn(turn_id);
+            let accounting = runtime.accounting_state();
+            match input.reason {
+                codex_protocol::protocol::TurnAbortReason::Interrupted => {
+                    accounting.interrupt_turn(turn_id);
+                }
+                codex_protocol::protocol::TurnAbortReason::Replaced
+                | codex_protocol::protocol::TurnAbortReason::ReviewEnded
+                | codex_protocol::protocol::TurnAbortReason::BudgetLimited => {
+                    accounting.finish_turn(turn_id);
+                }
+            }
         })
     }
 
@@ -584,9 +649,9 @@ where
                 self.metrics.clone(),
             ),
             GoalToolExecutor::create(
-                runtime.thread_id(),
+                &runtime,
+                self.thread_manager.clone(),
                 Arc::clone(&self.state_dbs),
-                runtime.accounting_state(),
                 self.analytics.clone(),
                 self.event_emitter.clone(),
                 self.metrics.clone(),
