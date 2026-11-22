@@ -251,23 +251,32 @@ struct ProcessorShutdownStages {
 
 impl standalone_shutdown::StandaloneStages for ProcessorShutdownStages {
     fn bind_runtimes(&mut self, owner_deadline: tokio::time::Instant) -> BoxFuture<'static, bool> {
-        // Synchronous (no async registry lock): binds every reachable runtime
-        // now. Incomplete if this binding, or the earlier one at intake,
-        // found a runtime whose cleanup had already started in Legacy mode.
         let binding = self
             .processor
             .bind_thread_shutdown_deadlines_now(owner_deadline);
-        let intake = self.processor.intake_thread_binding();
-        for census in std::iter::once(binding).chain(intake) {
-            if !census.is_complete() {
-                warn!(
-                    ?census,
-                    "standalone shutdown: thread cleanup deadline not bound for every runtime"
-                );
-            }
+        if !binding.is_complete() {
+            warn!(
+                ?binding,
+                "standalone shutdown: drain-time runtime binding incomplete"
+            );
+            return futures::future::ready(false).boxed();
         }
-        let clean = binding.is_complete() && intake.is_none_or(|census| census.is_complete());
-        futures::future::ready(clean).boxed()
+        // A competing latch caller can reach this stage before the first
+        // edge finishes (or even starts) its callback. The owner drives this
+        // wait only until its original deadline. Keep the first census even
+        // if a later bind sees no remaining runtime.
+        let mut intake = self.processor.subscribe_intake_thread_binding();
+        async move {
+            let Ok(receipt) = intake.wait_for(Option::is_some).await else {
+                return false;
+            };
+            let clean = receipt.is_some_and(|binding| binding.is_complete());
+            if !clean {
+                warn!(binding = ?*receipt, "standalone shutdown: intake runtime binding incomplete");
+            }
+            clean
+        }
+        .boxed()
     }
 
     fn connections(&mut self, stage_deadline: tokio::time::Instant) -> BoxFuture<'static, bool> {

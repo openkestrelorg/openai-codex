@@ -239,7 +239,7 @@ fn retention_refusal_reason(error: RetentionAuthorityError) -> ThreadRetentionRe
 pub(crate) struct MessageProcessor {
     pub(crate) turn_admission: TurnAdmission,
     intake_shutdown_deadline: OnceLock<tokio::time::Instant>,
-    intake_thread_binding: OnceLock<codex_core::ShutdownDeadlineBinding>,
+    intake_thread_binding: watch::Sender<Option<codex_core::ShutdownDeadlineBinding>>,
     connection_rpc_drain_incomplete: AtomicBool,
     unanswered_after_half_close: std::sync::atomic::AtomicU64,
     user_verification: Arc<crate::user_verification::Service>,
@@ -974,7 +974,7 @@ impl MessageProcessor {
             hosted_mcp_endpoints,
             turn_admission,
             intake_shutdown_deadline: OnceLock::new(),
-            intake_thread_binding: OnceLock::new(),
+            intake_thread_binding: watch::channel(None).0,
             connection_rpc_drain_incomplete: AtomicBool::new(false),
             unanswered_after_half_close: std::sync::atomic::AtomicU64::new(0),
             user_verification,
@@ -1334,7 +1334,7 @@ impl MessageProcessor {
         }
         self.retire_command_exec_sandbox_cleanup(Some(deadline.into_std()));
         let binding = self.bind_thread_shutdown_deadlines_now(deadline);
-        let _ = self.intake_thread_binding.set(binding);
+        self.intake_thread_binding.send_replace(Some(binding));
     }
 
     /// Synchronous thread cleanup-deadline binding (see
@@ -1347,19 +1347,12 @@ impl MessageProcessor {
             .bind_thread_shutdown_deadlines_now(deadline)
     }
 
-    /// The census of the intake binding, if the first edge has been applied.
-    pub(crate) fn intake_thread_binding(&self) -> Option<codex_core::ShutdownDeadlineBinding> {
-        self.intake_thread_binding.get().copied().or_else(|| {
-            // Another intake caller can observe the published deadline while
-            // its synchronous binding is still in progress. Unknown is not
-            // positive proof of a clean census.
-            self.intake_shutdown_deadline
-                .get()
-                .map(|_| codex_core::ShutdownDeadlineBinding {
-                    unavailable: 1,
-                    ..Default::default()
-                })
-        })
+    /// The first edge publishes exactly one census. A late subscriber also
+    /// sees it; a pending receipt is never evidence about runtime custody.
+    pub(crate) fn subscribe_intake_thread_binding(
+        &self,
+    ) -> watch::Receiver<Option<codex_core::ShutdownDeadlineBinding>> {
+        self.intake_thread_binding.subscribe()
     }
 
     /// The original deadline the first shutdown edge bound, if any.

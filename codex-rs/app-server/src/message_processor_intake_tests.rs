@@ -30,7 +30,13 @@ async fn real_processor_intake_closes_admission_and_latches_existing_cleanup_own
         processor.command_exec_processor.sandbox_cleanup_deadline(),
         Some(first.into_std())
     );
-    assert!(processor.intake_thread_binding().unwrap().is_complete());
+    assert!(
+        processor
+            .subscribe_intake_thread_binding()
+            .borrow()
+            .unwrap()
+            .is_complete()
+    );
     processor.begin_shutdown_at_intake(first + Duration::from_secs(30));
     assert_eq!(processor.intake_shutdown_deadline(), Some(first));
     assert_eq!(
@@ -82,8 +88,7 @@ async fn registered_intake_callback_keeps_only_weak_processor_custody() {
     processor.clear_runtime_references();
 }
 
-#[tokio::test]
-async fn published_intake_deadline_without_binding_receipt_is_not_clean() {
+async fn binding_fixture() -> (TempDir, crate::ProcessorShutdownStages) {
     let home = TempDir::new().unwrap();
     let config = Arc::new(
         codex_core::config::ConfigBuilder::default()
@@ -95,21 +100,138 @@ async fn published_intake_deadline_without_binding_receipt_is_not_clean() {
     );
     let auth = codex_login::AuthManager::shared_from_config(config.as_ref(), false)
         .await
-        .expect("initialize fixture auth manager");
+        .unwrap();
     let (processor, _outgoing) =
         super::message_processor_tracing_tests::build_test_processor(config, auth).await;
-    let first = tokio::time::Instant::now() + Duration::from_secs(35);
-    processor.intake_shutdown_deadline.set(first).unwrap();
-    let pending = processor
-        .intake_thread_binding()
-        .expect("published intake must have a census state");
-    assert_eq!(pending.unavailable, 1);
-    assert!(!pending.is_complete());
+    let stages = crate::ProcessorShutdownStages {
+        processor,
+        background_progress: Default::default(),
+        connections: Vec::new(),
+        cleanup: None,
+        thread_retirement: None,
+        expiry: codex_app_server_transport::OwnerExpiry::never(),
+    };
+    (home, stages)
+}
+
+async fn finish_binding_fixture(stages: crate::ProcessorShutdownStages) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     assert_eq!(
-        processor.shutdown_models_refresh_worker_until(first).await,
+        stages
+            .processor
+            .shutdown_models_refresh_worker_until(deadline)
+            .await,
         crate::models_refresh_worker::ModelsRefreshShutdown::Joined
     );
-    processor.clear_runtime_references();
+    stages.processor.clear_runtime_references();
+}
+
+#[tokio::test]
+async fn bind_stage_waits_for_the_first_edge_census() {
+    use crate::standalone_shutdown::StandaloneStages;
+    let (_home, mut stages) = binding_fixture().await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(35);
+    // The latch has published its deadline. Poll before the callback starts
+    // and again between its deadline and receipt publications.
+    let mut bind = stages.bind_runtimes(deadline);
+    assert!(futures::poll!(&mut bind).is_pending());
+    stages
+        .processor
+        .intake_shutdown_deadline
+        .set(deadline)
+        .unwrap();
+    let observed = futures::poll!(&mut bind);
+    assert!(
+        observed.is_pending(),
+        "premature bind verdict: {observed:?}"
+    );
+    let census = stages
+        .processor
+        .bind_thread_shutdown_deadlines_now(deadline);
+    assert!(census.is_complete());
+    stages
+        .processor
+        .intake_thread_binding
+        .send_replace(Some(census));
+    assert_eq!(futures::poll!(bind), std::task::Poll::Ready(true));
+    // The same first-edge receipt is also visible if publication wins.
+    assert_eq!(
+        futures::poll!(stages.bind_runtimes(deadline)),
+        std::task::Poll::Ready(true)
+    );
+    finish_binding_fixture(stages).await;
+}
+
+#[tokio::test]
+async fn unproven_intake_receipt_stays_incomplete_after_clean_drain_census() {
+    use crate::standalone_shutdown::StandaloneShutdownOwner;
+    use crate::standalone_shutdown::StandaloneStages;
+    use codex_core::ShutdownDeadlineBinding;
+    for census in [
+        ShutdownDeadlineBinding {
+            legacy_cleanup_started: 1,
+            ..Default::default()
+        },
+        ShutdownDeadlineBinding {
+            unavailable: 1,
+            ..Default::default()
+        },
+    ] {
+        let (_home, mut stages) = binding_fixture().await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(35);
+        stages
+            .processor
+            .intake_shutdown_deadline
+            .set(deadline)
+            .unwrap();
+        let mut bind = stages.bind_runtimes(deadline);
+        assert!(futures::poll!(&mut bind).is_pending());
+        stages
+            .processor
+            .intake_thread_binding
+            .send_replace(Some(census));
+        let mut owner = StandaloneShutdownOwner::new(deadline, stages.expiry.clone());
+        let clean = owner.drive("bind_runtimes", deadline, bind).await.unwrap();
+        assert!(!clean);
+        owner.record("bind_runtimes", clean);
+        assert_eq!(
+            owner.exit_report().unproven,
+            Some(("incomplete_stage", "bind_runtimes"))
+        );
+        assert!(owner.exit_report().into_shutdown_result().is_err());
+        finish_binding_fixture(stages).await;
+    }
+}
+
+#[tokio::test]
+async fn missing_intake_receipt_exhausts_original_deadline_and_late_success_cannot_clear_it() {
+    use crate::standalone_shutdown::StandaloneShutdownOwner;
+    use crate::standalone_shutdown::StandaloneStages;
+    let (_home, mut stages) = binding_fixture().await;
+    tokio::time::pause();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(35);
+    stages
+        .processor
+        .intake_shutdown_deadline
+        .set(deadline)
+        .unwrap();
+    let mut owner = StandaloneShutdownOwner::new(deadline, stages.expiry.clone());
+    let mut drive =
+        Box::pin(owner.drive("bind_runtimes", deadline, stages.bind_runtimes(deadline)));
+    assert!(futures::poll!(&mut drive).is_pending());
+    tokio::time::advance(Duration::from_secs(35)).await;
+    assert_eq!(drive.await, None);
+    stages
+        .processor
+        .intake_thread_binding
+        .send_replace(Some(Default::default()));
+    assert_eq!(
+        owner.exit_report().unproven,
+        Some(("timed_out_stage", "bind_runtimes"))
+    );
+    assert!(owner.exit_report().into_shutdown_result().is_err());
+    tokio::time::resume();
+    finish_binding_fixture(stages).await;
 }
 
 #[tokio::test]
